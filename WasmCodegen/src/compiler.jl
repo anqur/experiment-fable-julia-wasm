@@ -18,6 +18,12 @@ struct HostCall
     key::Any    # e.g. (:sizeof, String)
 end
 
+"""Placeholder `global.get` immediate for a materialized host-constant object,
+patched to the final global index at assembly."""
+struct ValueGlobal
+    key::Int    # registration index into mc.valueglobals
+end
+
 struct Offload
     key::Any                   # MethodInstance, or a builtin HostCall key
     func::Any                  # the callable (singleton instance)
@@ -53,13 +59,22 @@ mutable struct ModuleCompiler
                                                   #   (for Union{Nothing,T})
     eh_used::Bool                                 # some function has try/catch
     interp::WasmInterp                            # inference w/ the overlay table
+    hostconsts::Vector{Any}                       # Symbol/String literals, as
+                                                  # imported externref globals
+    hostconst_ids::IdDict{Any,Int}
+    valueglobals::Vector{Any}                     # mutable constant objects
+                                                  # (Dicts, Vectors, Memorys),
+                                                  # materialized as wasm globals
+    valueglobal_ids::IdDict{Any,Int}
 end
 ModuleCompiler() = ModuleCompiler(WasmModule(), Core.MethodInstance[],
                                   Dict(), Dict(), Dict(), Offload[], Dict(),
                                   Core.MethodInstance[], Dict(),
                                   SubType[], IdDict{Any,GCStructInfo}(),
                                   IdDict{Any,Int}(), IdDict{Any,Int}(),
-                                  IdDict{Any,Int}(), false, WasmInterp())
+                                  IdDict{Any,Int}(), false, WasmInterp(),
+                                  Any[], IdDict{Any,Int}(),
+                                  Any[], IdDict{Any,Int}())
 
 # Types with special runtime layouts that must not lower as plain GC structs.
 const _SPECIAL_LAYOUT = Any[String, Symbol, Module, DataType, Core.MethodInstance,
@@ -131,7 +146,13 @@ function union_box_info(mc::ModuleCompiler, @nospecialize U)
     return (gc_box!(mc, other), other)
 end
 
-"""Storage type for a struct field of Julia type `T` (packed sub-words)."""
+"""
+Storage type for a struct field of Julia type `T` (packed sub-words).
+Field types with no wasm lowering (e.g. `VersionNumber.prerelease`'s vararg
+tuple) are *erased* to `anyref`: writes coerce (boxing scalars, converting
+externrefs), reads of such fields remain unsupported and fail loudly at the
+use site — which is exactly right for fields the compiled code never touches.
+"""
 function field_storage(mc::ModuleCompiler, @nospecialize T)
     T === Bool && return I8
     r = scalar_repr(T)
@@ -142,9 +163,47 @@ function field_storage(mc::ModuleCompiler, @nospecialize T)
         r.bits == 16 && return I16
         return r.vt
     end
-    vt = valtype_for(mc, T)
+    vt = try
+        valtype_for(mc, T)
+    catch err
+        err isa CompileError || rethrow()
+        return RefType(true, AnyHT)   # erased field
+    end
     vt === nothing && throw(CompileError("ghost field type $T should be skipped"))
     return vt
+end
+
+"""Push `ref` coerced to `anyref` (for writes into erased fields)."""
+function emit_value_anyref!(fc, @nospecialize ref)
+    Tsrc = widen(argtype(fc, ref))
+    if isghost(Tsrc)
+        emit!(fc, ref_null(AnyHT))
+        return
+    end
+    vt = valtype_for(fc.mc, Tsrc)
+    if vt isa NumType
+        emit_value!(fc, ref)
+        emit!(fc, struct_new(gc_box!(fc.mc, Tsrc)))
+    elseif vt == ExternRefT
+        emit_value!(fc, ref)
+        emit!(fc, Inst(:any_convert_extern))
+    elseif vt isa RefType
+        emit_value!(fc, ref)   # every wasm-GC ref we produce is <: anyref
+    else
+        throw(CompileError("cannot store a $Tsrc into an anyref-erased field"))
+    end
+end
+
+"""Is this field stored erased (its Julia type has no direct lowering)?"""
+function _erased_field(mc::ModuleCompiler, @nospecialize FT)
+    st = field_storage(mc, FT)
+    st == RefType(true, AnyHT) || return false
+    vt = try
+        valtype_for(mc, FT)
+    catch
+        return true
+    end
+    return vt != RefType(true, AnyHT)
 end
 
 """Register (or look up) the WasmGC struct lowering of `T`."""
@@ -165,7 +224,12 @@ function gc_struct!(mc::ModuleCompiler, @nospecialize T)
     for i in 1:n
         FT = ftypes[i]
         isghost(FT) && continue
-        st = field_storage(mc, FT)
+        st = try
+            field_storage(mc, FT)
+        catch err
+            err isa CompileError || rethrow()
+            throw(CompileError("field $(fieldname(T, i))::$FT of $T: $(err.msg)"))
+        end
         # `const` fields of mutable structs are wasm-immutable too, so the
         # validator rejects any struct.set we might erroneously emit for them
         # (defense in depth; emit_setfield! already traps on const fields).
@@ -376,8 +440,31 @@ function argtype(fc::FuncCompiler, @nospecialize ref)
     return typeof(ref)
 end
 
+"""
+Instruction sink for building constant expressions (wasm global initializers).
+Shares the emission helpers with FuncCompiler via `emit!` and `.mc`. Inside a
+sink, nested mutable objects are materialized inline (the parent owns them);
+at function level they become shared value-globals instead.
+"""
+struct ConstSink
+    mc::ModuleCompiler
+    body::Vector{Inst}
+end
+emit!(s::ConstSink, insts::Inst...) = append!(s.body, insts)
+
+"""Intern a mutable host constant; returns its `ValueGlobal` placeholder."""
+function register_valueglobal!(mc::ModuleCompiler, @nospecialize v)
+    idx = get(mc.valueglobal_ids, v, nothing)
+    if idx === nothing
+        push!(mc.valueglobals, v)
+        idx = length(mc.valueglobals) - 1
+        mc.valueglobal_ids[v] = idx
+    end
+    return ValueGlobal(idx)
+end
+
 """Emit a constant for a Julia value."""
-function emit_const!(fc::FuncCompiler, @nospecialize v)
+function emit_const!(fc, @nospecialize v)
     T = typeof(v)
     if isghost(T)
         return
@@ -402,6 +489,35 @@ function emit_const!(fc::FuncCompiler, @nospecialize v)
         emit!(fc, f64_const(v))
     elseif v isa Float32
         emit!(fc, f32_const(v))
+    elseif isprimitivetype(T) && !(T <: Ptr) && sizeof(T) <= 8
+        # unknown primitive type (Kind, enum storage, ...): emit its bits
+        sz = sizeof(T)
+        if sz == 1
+            emit!(fc, i32_const(Int32(reinterpret(UInt8, v))))
+        elseif sz == 2
+            emit!(fc, i32_const(Int32(reinterpret(UInt16, v))))
+        elseif sz == 4
+            emit!(fc, i32_const(reinterpret(Int32, v)))
+        else
+            emit!(fc, i64_const(reinterpret(Int64, v)))
+        end
+    elseif T isa DataType && T <: GenericMemory && isconcretetype(T)
+        if fc isa ConstSink
+            arr = gc_array!(fc.mc, T)
+            elT = T.parameters[2]
+            for x in v
+                emit_const_field!(fc, x, elT)
+            end
+            emit!(fc, array_new_fixed(arr, length(v)))
+        else
+            emit!(fc, Inst(:global_get, (register_valueglobal!(fc.mc, v),)))
+        end
+    elseif T isa DataType && T <: Core.GenericMemoryRef && isconcretetype(T)
+        # fresh ref into a (nested) copy of its memory; offset preserved
+        mref = gc_memref!(fc.mc, T)
+        sink = fc isa ConstSink ? fc : fc   # memrefs are immutable; inline
+        emit_const!(fc, getfield(v, :mem))
+        emit!(fc, i32_const(Int32(Base.memoryrefoffset(v) - 1)), struct_new(mref))
     elseif is_gc_struct(T) && !ismutabletype(T)
         # immutable struct/tuple constant: materialize field by field
         info = gc_struct!(fc.mc, T)
@@ -411,13 +527,65 @@ function emit_const!(fc::FuncCompiler, @nospecialize v)
             emit_const_field!(fc, getfield(v, k), FT)
         end
         emit!(fc, struct_new(info.typeidx))
+    elseif is_gc_struct(T) && ismutabletype(T)
+        if fc isa ConstSink
+            # nested object owned by the enclosing constant: materialize inline
+            info = gc_struct!(fc.mc, T)
+            for k in 1:fieldcount(T)
+                FT = info.fieldtypes[k]
+                isghost(FT) && continue
+                isdefined(v, k) ||
+                    throw(CompileError("constant with undefined field: $T"))
+                emit_const_field!(fc, getfield(v, k), FT)
+            end
+            emit!(fc, struct_new(info.typeidx))
+        else
+            # shared object: one wasm global per host object (identity preserved)
+            emit!(fc, Inst(:global_get, (register_valueglobal!(fc.mc, v),)))
+        end
+    elseif (vtc = try valtype_for(fc.mc, T) catch; nothing end) == ExternRefT
+        # host-resident literal (Symbol, String, ...): read the imported
+        # externref global bound to this exact value at instantiation
+        emit!(fc, global_get(register_hostconst!(fc.mc, v)))
     else
         throw(CompileError("unsupported constant $v::$T"))
     end
 end
 
-"""Emit a constant in a field context of declared type `FT` (boxes/nulls unions)."""
-function emit_const_field!(fc::FuncCompiler, @nospecialize(v), @nospecialize(FT))
+"""Intern a host literal; returns its imported-global index."""
+function register_hostconst!(mc::ModuleCompiler, @nospecialize v)
+    idx = get(mc.hostconst_ids, v, nothing)
+    idx === nothing || return idx
+    push!(mc.hostconsts, v)
+    idx = length(mc.hostconsts) - 1
+    mc.hostconst_ids[v] = idx
+    return idx
+end
+
+"""Emit a constant in a field context of declared type `FT` (boxes/nulls unions,
+coerces values of anyref-erased fields)."""
+function emit_const_field!(fc, @nospecialize(v), @nospecialize(FT))
+    if _erased_field(fc.mc, FT)
+        T = typeof(v)
+        if isghost(T)
+            emit!(fc, ref_null(AnyHT))
+        elseif scalar_repr(T) !== nothing
+            emit_const!(fc, v)
+            emit!(fc, struct_new(gc_box!(fc.mc, T)))
+        else
+            # erased fields are never readable from wasm: constants that cannot
+            # materialize (e.g. Strings) become null tombstones
+            n0 = length(fc.body)
+            try
+                emit_const!(fc, v)
+            catch err
+                err isa CompileError || rethrow()
+                resize!(fc.body, n0)
+                emit!(fc, ref_null(AnyHT))
+            end
+        end
+        return
+    end
     vt = valtype_for(fc.mc, FT)
     vt === nothing && return
     if vt isa RefType
@@ -467,6 +635,20 @@ values flowing into a nullable-ref context become `ref.null` (e.g. a literal
 function emit_value_typed!(fc::FuncCompiler, @nospecialize(ref), @nospecialize(T))
     vt = valtype_for(fc.mc, T)
     vt === nothing && return            # ghost context: no value at all
+    if vt isa NumType
+        # boxed Union{Nothing,scalar} flowing into a refined scalar context:
+        # unbox (the value is provably non-null here)
+        Tsrc = widen(argtype(fc, ref))
+        if Tsrc isa Union
+            bi = union_box_info(fc.mc, Tsrc)
+            if bi !== nothing
+                emit_value!(fc, ref)
+                emit!(fc, struct_get(bi[1], 0))
+                emit_norm!(fc, T)
+                return
+            end
+        end
+    end
     if vt isa RefType
         Tsrc = widen(argtype(fc, ref))
         if isghost(Tsrc)
@@ -753,6 +935,26 @@ function emit_call!(fc::FuncCompiler, i::Int, ex::Expr)
         return emit_memoryrefget!(fc, i, args)
     elseif f === Core.memoryrefset!
         return emit_memoryrefset!(fc, i, args)
+    elseif f === Core.memoryrefunset!
+        # clear the slot (GC hygiene): write the element default
+        RT = argtype(fc, args[1])
+        mref = gc_memref!(fc.mc, RT)
+        MT = fieldtype(RT, :mem)
+        arr = gc_array!(fc.mc, MT)
+        st = field_storage(fc.mc, MT.parameters[2])
+        r = scratch_local!(fc, RefType(true, HeapType(mref)))
+        emit_value!(fc, args[1])
+        emit!(fc, local_tee(r), struct_get(mref, 0),
+              local_get(r), struct_get(mref, 1))
+        if st isa RefType
+            emit!(fc, ref_null(st.ht))
+        elseif st isa PackedType
+            emit!(fc, i32_const(0))
+        else
+            emit!(fc, _const(st, 0))
+        end
+        emit!(fc, array_set(arr), local_get(r))
+        return true
     elseif f === Core.memoryrefoffset
         RT = argtype(fc, args[1])
         mref = gc_memref!(fc.mc, RT)
@@ -896,7 +1098,7 @@ function emit_invoke!(fc::FuncCompiler, i::Int, ex::Expr)
     isghost(sig.parameters[1]) ||
         throw(CompileError("invoke of non-singleton callable $(sig.parameters[1])"))
     ps = collect(Any, sig.parameters)
-    length(ps) == length(ex.args) - 1 ||
+    (length(ps) == length(ex.args) - 1 && !any(Base.isvarargtype, ps)) ||
         throw(CompileError("vararg invoke of $(mi) unsupported"))
     for (k, ref) in enumerate(ex.args[3:end])
         emit_value_typed!(fc, ref, ps[k+1])
@@ -907,8 +1109,9 @@ function emit_invoke!(fc::FuncCompiler, i::Int, ex::Expr)
     # the call-site statement type can be wider (e.g. `Any` for unused results).
     rt_callee = ci isa Core.CodeInstance ? widen(ci.rettype) : widen(method_ir(fc.mc, mi)[2])
     if rt_callee === Union{}
-        emit!(fc, unreachable())
-        return false
+        # the callee always throws: this is a (catchable) program end point
+        emit_trap_or_throw!(fc)
+        return :dead
     end
     return valtype_for(fc.mc, rt_callee) !== nothing
 end
@@ -966,6 +1169,9 @@ function _const_fieldidx(@nospecialize(To), @nospecialize k)
 end
 
 function emit_getfield!(fc::FuncCompiler, i::Int, args)
+    # ghost result (e.g. dynamic getfield on an all-Nothing NamedTuple from
+    # kwarg plumbing): no value to produce, nothing to evaluate
+    isghost(widen(type_at(fc, i))) && return true
     To = strip_nothing(argtype(fc, args[1]))
     if To isa DataType && To <: GenericMemory
         k = _const_fieldidx(To, args[2])
@@ -986,6 +1192,42 @@ function emit_getfield!(fc::FuncCompiler, i::Int, args)
     end
     is_gc_struct(To) || throw(CompileError("getfield on unsupported type $To"))
     info = gc_struct!(fc.mc, To)
+    kref = args[2]
+    kref isa QuoteNode && (kref = kref.value)
+    if !(kref isa Union{Symbol,Integer}) && To <: Union{Tuple,NamedTuple}
+        # dynamic index into a homogeneous tuple: bounds check + if-chain
+        n = fieldcount(To)
+        (n > 0 && allequal(info.fieldtypes)) ||
+            throw(CompileError("dynamic getfield on heterogeneous $To"))
+        FT = info.fieldtypes[1]
+        vt = valtype_for(fc.mc, FT)
+        reft = RefType(true, HeapType(info.typeidx))
+        o = scratch_local!(fc, reft)
+        ix = scratch_local!(fc, I64)
+        emit_value!(fc, args[1])
+        emit!(fc, local_set(o))
+        emit_value!(fc, args[2])
+        emit!(fc, local_tee(ix), i64_const(1), Inst(:i64_lt_s),
+              local_get(ix), i64_const(n), Inst(:i64_gt_s), Inst(:i32_or), if_())
+        emit_trap_or_throw!(fc)
+        emit!(fc, end_())
+        st = field_storage(fc.mc, FT)
+        getk(k) = st isa PackedType ?
+            ((FT !== Bool && scalar_repr(FT).signed) ?
+             struct_get_s(info.typeidx, info.fieldmap[k]) :
+             struct_get_u(info.typeidx, info.fieldmap[k])) :
+            struct_get(info.typeidx, info.fieldmap[k])
+        for k in 1:n-1
+            emit!(fc, local_get(ix), i64_const(k), Inst(:i64_eq), if_(vt))
+            emit!(fc, local_get(o), getk(k))
+            emit!(fc, else_())
+        end
+        emit!(fc, local_get(o), getk(n))
+        for _ in 1:n-1
+            emit!(fc, end_())
+        end
+        return true
+    end
     k = _const_fieldidx(To, args[2])
     FT = info.fieldtypes[k]
     isghost(FT) && return true   # ghost field: no value
@@ -1020,7 +1262,11 @@ function emit_setfield!(fc::FuncCompiler, i::Int, args)
     FT = info.fieldtypes[k]
     if !isghost(FT)
         emit_value!(fc, args[1])
-        emit_value_typed!(fc, args[3], FT)
+        if _erased_field(fc.mc, FT)
+            emit_value_anyref!(fc, args[3])
+        else
+            emit_value_typed!(fc, args[3], FT)
+        end
         emit!(fc, struct_set(info.typeidx, info.fieldmap[k]))
     end
     # setfield! evaluates to the assigned value; re-emit it (pure: ssa/arg/const)
@@ -1035,7 +1281,13 @@ function emit_new!(fc::FuncCompiler, i::Int, ex::Expr)
     length(ex.args) - 1 == length(info.fieldtypes) ||
         throw(CompileError("partially-initialized :new of $TT"))
     for (k, ref) in enumerate(ex.args[2:end])
-        emit_value_typed!(fc, ref, info.fieldtypes[k])
+        FT = info.fieldtypes[k]
+        isghost(FT) && continue
+        if _erased_field(fc.mc, FT)
+            emit_value_anyref!(fc, ref)
+        else
+            emit_value_typed!(fc, ref, FT)
+        end
     end
     emit!(fc, struct_new(info.typeidx))
     return true
@@ -1103,6 +1355,14 @@ function emit_stmt!(fc::FuncCompiler, b::Int, i::Int)
         end
         return true
     end
+    if ex.head === :throw_undef_if_not
+        # if !cond throw UndefVarError (catchable inside try regions)
+        emit_value!(fc, ex.args[2])
+        emit!(fc, Inst(:i32_eqz), if_())
+        emit_throwpoint!(fc, b)
+        emit!(fc, end_())
+        return true
+    end
     if ex.head === :call && haskey(fc.ssapair, i)
         fcallee = resolve_callee(fc, ex.args[1])
         kind, signed = CHECKED_PAIR[Symbol(string(fcallee))]
@@ -1122,7 +1382,9 @@ function emit_stmt!(fc::FuncCompiler, b::Int, i::Int)
                 r = emit_call!(fc, i, ex)
                 r === :novalue ? false : !isghost(rt)
             elseif ex.head === :invoke
-                emit_invoke!(fc, i, ex)
+                r = emit_invoke!(fc, i, ex)
+                r === :dead && return false   # callee always throws
+                r
             else
                 emit_new!(fc, i, ex)
                 true
@@ -1383,6 +1645,7 @@ struct WasmCompilation
     bytes::Vector{UInt8}
     entry::String
     offloads::Vector{Offload}
+    hostconsts::Vector{Pair{String,Any}}   # import name => Julia value
 end
 
 """
@@ -1408,9 +1671,11 @@ function compile_wasm(@nospecialize(f), @nospecialize(argtypes::Type{<:Tuple});
         mc.status[cur] === :pending || continue
         try
             compile_function(mc, cur)
-        catch err
-            err isa CompileError || rethrow()
-            cur === mi && rethrow()   # the entry function itself must compile
+        catch err0
+            err0 isa CompileError || rethrow()
+            err = occursin("[while compiling", err0.msg) ? err0 :
+                  CompileError(err0.msg * " [while compiling $(cur)]")
+            cur === mi && throw(err)   # the entry function itself must compile
             try
                 offload!(mc, cur, err)
             catch err2
@@ -1420,6 +1685,43 @@ function compile_wasm(@nospecialize(f), @nospecialize(argtypes::Type{<:Tuple});
                 mc.failures[cur] = err2
             end
         end
+    end
+
+    # materialize mutable host constants as wasm globals (may register more
+    # GC types, host constants, and further value globals)
+    vg_inits = Vector{Inst}[]
+    vg_deps = Vector{Vector{Int}}()
+    let i = 0
+        while i < length(mc.valueglobals)
+            i += 1
+            sink = ConstSink(mc, Inst[])
+            emit_const!(sink, mc.valueglobals[i])
+            push!(vg_inits, sink.body)
+            deps = Int[]
+            for inst in sink.body
+                if inst.op === :global_get && inst.imm[1] isa ValueGlobal
+                    push!(deps, (inst.imm[1]::ValueGlobal).key)
+                end
+            end
+            push!(vg_deps, deps)
+        end
+    end
+    # topological order: dependencies first
+    nvg = length(vg_inits)
+    vg_order = Int[]
+    vg_state = fill(0, nvg)   # 0 unvisited, 1 visiting, 2 done
+    function vg_visit(k)
+        vg_state[k+1] == 2 && return
+        vg_state[k+1] == 1 && throw(CompileError("cyclic constant graph"))
+        vg_state[k+1] = 1
+        for d in vg_deps[k+1]
+            vg_visit(d)
+        end
+        vg_state[k+1] = 2
+        push!(vg_order, k)
+    end
+    for k in 0:nvg-1
+        vg_visit(k)
     end
 
     # prune to functions reachable from the entry; collect live offloads
@@ -1485,6 +1787,12 @@ function compile_wasm(@nospecialize(f), @nospecialize(argtypes::Type{<:Tuple});
                     FuncType(ValType[_sym_vt(s) for s in off.params],
                              ValType[_sym_vt(s) for s in off.results]))
     end
+    hostconsts = Pair{String,Any}[]
+    for (k, v) in enumerate(mc.hostconsts)
+        nm = "const_$(k-1)"
+        push!(mc.wmod.imports, Import("julia", nm, GlobalType(ExternRefT, false)))
+        push!(hostconsts, nm => v)
+    end
     wrapped = [off for off in offloads if union_box_info(mc, off.rettype) !== nothing]
     for (k, off) in enumerate(wrapped)
         # calls to this offload target the wrapper instead of the raw import
@@ -1493,6 +1801,17 @@ function compile_wasm(@nospecialize(f), @nospecialize(argtypes::Type{<:Tuple});
     fidx = Dict{Core.MethodInstance,Int}()
     for (k, m) in enumerate(live)
         fidx[m] = nimports + length(wrapped) + k - 1
+    end
+    # value-global final indices: after the imported host-constant globals
+    vgmap = Dict{Int,Int}()
+    for (pos, k) in enumerate(vg_order)
+        vgmap[k] = length(hostconsts) + pos - 1
+    end
+    for k in vg_order
+        init = vg_inits[k+1]
+        patch_valueglobals!(init, vgmap)
+        vt = valtype_for(mc, typeof(mc.valueglobals[k+1]))
+        push!(mc.wmod.globals, Global(GlobalType(vt, false), init))
     end
     for (k, off) in enumerate(wrapped)
         importidx = findfirst(o -> o === off, offloads) - 1
@@ -1505,11 +1824,12 @@ function compile_wasm(@nospecialize(f), @nospecialize(argtypes::Type{<:Tuple});
         func = mc.bodies[m]
         func.typeidx = addtype!(mc.wmod, mc.sigs[m])
         patch_calls!(func.body, fidx, offidx)
+        patch_valueglobals!(func.body, vgmap)
         push!(mc.wmod.funcs, func)
     end
     push!(mc.wmod.exports, Export(name, :func, fidx[mi]))
     bytes = encode(mc.wmod)
-    return WasmCompilation(mc.wmod, bytes, name, offloads)
+    return WasmCompilation(mc.wmod, bytes, name, offloads, hostconsts)
 end
 
 """
@@ -1553,6 +1873,13 @@ function patch_calls!(body::Vector{Inst}, fidx::Dict{Core.MethodInstance,Int},
             idx = haskey(fidx, mi) ? fidx[mi] : offidx[mi]
             body[k] = Inst(:call, (UInt32(idx),))
         end
+    end
+end
+
+function patch_valueglobals!(body::Vector{Inst}, vgmap::Dict{Int,Int})
+    for (k, inst) in enumerate(body)
+        inst.op === :global_get && inst.imm[1] isa ValueGlobal || continue
+        body[k] = Inst(:global_get, (UInt32(vgmap[(inst.imm[1]::ValueGlobal).key]),))
     end
 end
 

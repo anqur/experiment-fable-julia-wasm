@@ -33,8 +33,25 @@ const _SCALAR_REPRS = IdDict{Type,ScalarRepr}(
     Float32 => ScalarRepr(F32, 32, true,  true),
 )
 
-"""Scalar representation for a Julia type, or `nothing` if not a scalar."""
-scalar_repr(@nospecialize T) = get(_SCALAR_REPRS, T, nothing)
+"""
+Scalar representation for a Julia type, or `nothing` if not a scalar.
+Unknown primitive types (e.g. JuliaSyntax.Kind, enums' underlying bits) are
+represented as unsigned integers of their width — their operations arrive via
+`reinterpret`/`bitcast` to ordinary integer types, which carry the semantics.
+`Ptr` is deliberately excluded (host pointers must not flow into wasm).
+"""
+function scalar_repr(@nospecialize T)
+    r = get(_SCALAR_REPRS, T, nothing)
+    r !== nothing && return r
+    if T isa DataType && isprimitivetype(T) && !(T <: Ptr)
+        sz = sizeof(T)
+        sz == 1 && return ScalarRepr(I32, 8, false, false)
+        sz == 2 && return ScalarRepr(I32, 16, false, false)
+        sz == 4 && return ScalarRepr(I32, 32, false, false)
+        sz == 8 && return ScalarRepr(I64, 64, false, false)
+    end
+    return nothing
+end
 
 """
 The type value `X` when `T` is exactly `Type{X}`, else `nothing`. Robust to
@@ -93,6 +110,13 @@ function from_wire(@nospecialize(T), v)
     T === Char && return reinterpret(Char, UInt32(reinterpret(UInt32, Int32(v))))
     r = scalar_repr(T)
     r.isfloat && return T(v)
+    if !haskey(_SCALAR_REPRS, T)
+        # unknown primitive type: reinterpret from its width's unsigned bits
+        r.bits == 8 && return reinterpret(T, (v % UInt8))
+        r.bits == 16 && return reinterpret(T, (v % UInt16))
+        r.bits == 32 && return reinterpret(T, (v % UInt32))
+        return reinterpret(T, (v % UInt64))
+    end
     # integers arrive as Int32/Int64; wrap to the logical width/signedness
     return v % T
 end
@@ -104,6 +128,13 @@ function to_wire(@nospecialize(T), v)
     r = scalar_repr(T)
     r === nothing && throw(CompileError("unsupported boundary type $T"))
     r.isfloat && return T(v)
+    if !haskey(_SCALAR_REPRS, T)
+        # unknown primitive type: ship its bits zero-extended
+        r.bits == 8 && return Int32(reinterpret(UInt8, v))
+        r.bits == 16 && return Int32(reinterpret(UInt16, v))
+        r.bits == 32 && return reinterpret(Int32, v)
+        return reinterpret(Int64, v)
+    end
     r.vt == I64 && return v isa UInt64 ? reinterpret(Int64, v) : Int64(v)
     return v isa UInt32 ? reinterpret(Int32, v) : Int32(v)
 end

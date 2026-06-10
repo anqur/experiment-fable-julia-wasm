@@ -319,6 +319,42 @@ _reg!(:cttz_int) do fc, rt, args
     end
     emit_norm!(fc, rt)
 end
+_reg!(:bswap_int) do fc, rt, args
+    # no wasm byte-swap op: shift/mask ladder at the logical width
+    T, r = _intty(fc, args[1])
+    vt = r.vt
+    x = scratch_local!(fc, vt)
+    emit_value!(fc, args[1])
+    r.bits < 32 && emit_zeroext!(fc, T)
+    emit!(fc, local_set(x))
+    if r.bits == 16
+        emit!(fc, local_get(x), i32_const(8), Inst(:i32_shl),
+              i32_const(0xff00), Inst(:i32_and),
+              local_get(x), i32_const(8), Inst(:i32_shr_u),
+              Inst(:i32_or))
+    elseif r.bits == 8
+        emit!(fc, local_get(x))
+    else
+        masks = vt == I64 ?
+            [(8, 0x00FF00FF00FF00FF), (16, 0x0000FFFF0000FFFF), (32, nothing)] :
+            [(8, UInt64(0x00FF00FF)), (16, nothing)]
+        for (sh, mask) in masks
+            if mask === nothing   # final half-width swap: pure rotate
+                emit!(fc, local_get(x), _const(vt, sh), Inst(Symbol(_p(vt), "_rotl")),
+                      local_set(x))
+            else
+                emit!(fc, local_get(x), _const(vt, mask), _op(vt, "and"),
+                      _const(vt, sh), _op(vt, "shl"),
+                      local_get(x), _const(vt, sh), _op(vt, "shr_u"),
+                      _const(vt, mask), _op(vt, "and"),
+                      _op(vt, "or"), local_set(x))
+            end
+        end
+        emit!(fc, local_get(x))
+    end
+    emit_norm!(fc, rt)
+end
+
 _reg!(:ctpop_int) do fc, rt, args
     T, r = _intty(fc, args[1])
     emit_value!(fc, args[1])

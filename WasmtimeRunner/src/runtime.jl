@@ -505,6 +505,37 @@ function define_func!(f, linker::Linker, mod::String, name::String,
     return nothing
 end
 
+"""
+    define_global!(linker, store, mod, name, value)
+
+Define an immutable `externref` global import holding a host Julia value
+(used for host-constant tables: Symbol/String literals referenced by
+compiled code). The global owns its root; `value === nothing` defines null.
+"""
+function define_global!(linker::Linker, store::Store, mod::String, name::String,
+                        @nospecialize(value))
+    Base.@lock store.lock begin
+        ctx = store.context
+        val = to_cval(ctx, :externref, value)
+        vt = ccall((:wasm_valtype_new, libwasmtime), Ptr{Cvoid}, (UInt8,), WASM_EXTERNREF)
+        gt = ccall((:wasm_globaltype_new, libwasmtime), Ptr{Cvoid},
+                   (Ptr{Cvoid}, UInt8), vt, 0)   # consumes vt; 0 = immutable
+        g = Ref(CRef())
+        err = ccall((:wasmtime_global_new, libwasmtime), Ptr{Cvoid},
+                    (Ptr{Cvoid}, Ptr{Cvoid}, Ref{CVal}, Ref{CRef}), ctx, gt, Ref(val), g)
+        ccall((:wasm_globaltype_delete, libwasmtime), Cvoid, (Ptr{Cvoid},), gt)
+        _unroot_val(val)   # the global holds its own root
+        check_error(err)
+        ext = Ref(CExtern(UInt8(WASMTIME_EXTERN_GLOBAL), 0, 0, 0, union_ref(g[])))
+        err2 = ccall((:wasmtime_linker_define, libwasmtime), Ptr{Cvoid},
+                     (Ptr{Cvoid}, Ptr{Cvoid}, Ptr{UInt8}, Csize_t, Ptr{UInt8}, Csize_t,
+                      Ref{CExtern}),
+                     linker.ptr, ctx, mod, sizeof(mod), name, sizeof(name), ext)
+        check_error(err2)
+    end
+    return nothing
+end
+
 mutable struct WasmGlobal
     global_::CRef   # wasmtime_global_t has the same 24-byte layout
     store::Store

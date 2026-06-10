@@ -17,6 +17,9 @@ function wasm_callable(f, argtypes::Type{<:Tuple})
     for (mod, name, params, results, thunk) in offload_imports(comp)
         define_func!(thunk, lk, mod, name, collect(Symbol, params), collect(Symbol, results))
     end
+    for (name, v) in comp.hostconsts
+        define_global!(lk, store, "julia", name, v)
+    end
     inst = instantiate(lk, store, CompiledModule(ENGINE, comp.bytes))
     wf = inst[comp.entry]
     argts = collect(argtypes.parameters)

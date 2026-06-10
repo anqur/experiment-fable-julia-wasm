@@ -30,7 +30,7 @@ include("runtime.jl")
 
 export Engine, Store, CompiledModule, Linker, Instance,
        WasmFunc, WasmGlobal, WasmMemory, ExternRef,
-       define_func!, instantiate, exports, validate_module, context,
+       define_func!, define_global!, instantiate, exports, validate_module, context,
        WasmtimeError, WasmTrap, store_gc!
 
 end # module WasmtimeRunner

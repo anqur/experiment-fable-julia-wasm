@@ -34,9 +34,69 @@ Base.Experimental.@overlay WASM_MT @noinline Base.codeunit(s::String, i::Int64) 
 Base.Experimental.@overlay WASM_MT @noinline Base.ncodeunits(s::String) =
     (Base.inferencebarrier(0))::Int64
 
+# utf8proc-backed character predicates (C calls in Base)
+Base.Experimental.@overlay WASM_MT @noinline Base.is_id_start_char(c::Char) =
+    (Base.inferencebarrier(false))::Bool
+
+Base.Experimental.@overlay WASM_MT @noinline Base.is_id_char(c::Char) =
+    (Base.inferencebarrier(false))::Bool
+
+Base.Experimental.@overlay WASM_MT @noinline Base.Unicode.category_code(c::Char) =
+    (Base.inferencebarrier(Int32(0)))::Int32
+
 Base.Experimental.@overlay WASM_MT @noinline function Base.unsafe_copyto!(
         dest::MemoryRef{T}, src::MemoryRef{T}, n::Int64) where {T}
     return (Base.inferencebarrier(dest))::MemoryRef{T}
+end
+
+# --- semantic overlays ----------------------------------------------------------
+# Unlike the stubs above, these bodies are real Julia implementations that the
+# compiler lowers like any other code; they replace pointer-aliasing tricks
+# with wasm-expressible equivalents (valid because Strings are immutable).
+
+Base.Experimental.@overlay WASM_MT function Base.unsafe_wrap(::Type{Vector{UInt8}},
+                                                             s::String)
+    n = ncodeunits(s)
+    v = Vector{UInt8}(undef, n)
+    i = 1
+    while i <= n
+        @inbounds v[i] = codeunit(s, i)
+        i += 1
+    end
+    return v
+end
+
+# memchr-backed byte search: plain Julia scan over codeunit hostcalls
+Base.Experimental.@overlay WASM_MT function Base.findnext(
+        pred::Base.Fix2{typeof(==),UInt8}, a::Base.CodeUnits{UInt8,String}, i::Int64)
+    n = ncodeunits(a.s)
+    i < 1 && throw(BoundsError(a, i))
+    i > n + 1 && throw(BoundsError(a, i))
+    j = i
+    while j <= n
+        codeunit(a.s, j) == pred.x && return j
+        j += 1
+    end
+    return nothing
+end
+
+# Grapheme-break detection (utf8proc, stateful via Ref{Int32}): route through a
+# scalar-only helper that must NOT compile (the non-const global read pins it
+# to the host; otherwise the overlay below would recurse into it).
+_HOST_ONLY::Bool = true
+
+@noinline function _grapheme_break_packed(c1::Char, c2::Char, state::Int32)
+    _HOST_ONLY || return Int64(0)
+    r = Ref(state)
+    b = Base.Unicode.isgraphemebreak!(r, c1, c2)
+    return (Int64(b) << 32) | Int64(reinterpret(UInt32, r[]))
+end
+
+Base.Experimental.@overlay WASM_MT function Base.Unicode.isgraphemebreak!(
+        state::Ref{Int32}, c1::AbstractChar, c2::AbstractChar)
+    packed = _grapheme_break_packed(Char(c1), Char(c2), state[])
+    state[] = reinterpret(Int32, UInt32(packed & 0xffffffff))
+    return (packed >> 32) != 0
 end
 
 # --- interception registry ------------------------------------------------------
@@ -64,6 +124,12 @@ function _register_intercepts!()
         InterceptSpec(:hostcall, Base.codeunit, nothing)
     INTERCEPTS[_overlay_method(Base.ncodeunits, Tuple{String})] =
         InterceptSpec(:hostcall, Base.ncodeunits, nothing)
+    INTERCEPTS[_overlay_method(Base.is_id_start_char, Tuple{Char})] =
+        InterceptSpec(:hostcall, Base.is_id_start_char, nothing)
+    INTERCEPTS[_overlay_method(Base.is_id_char, Tuple{Char})] =
+        InterceptSpec(:hostcall, Base.is_id_char, nothing)
+    INTERCEPTS[_overlay_method(Base.Unicode.category_code, Tuple{Char})] =
+        InterceptSpec(:hostcall, c -> Int32(Base.Unicode.category_code(c)), nothing)
     INTERCEPTS[_overlay_method(Base.unsafe_copyto!,
                                Tuple{MemoryRef{T},MemoryRef{T},Int64} where {T})] =
         InterceptSpec(:custom, Base.unsafe_copyto!, emit_memref_copy!)
