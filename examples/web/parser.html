@@ -43,23 +43,21 @@
   .monaco-editor .tok-error { background: #d73a49; color: #ffffff !important; }
   /* range tint when a tree-outline node is clicked */
   .monaco-editor .tree-pick { background: rgba(255, 211, 61, .45); border-radius: 3px; }
-  /* tree mode: 2D bounding boxes drawn into monaco's scrolled content */
+  /* tree mode: 2D bounding boxes drawn into monaco's scrolled content as
+     SVG paths (notched polygons — boxes hug mid-line starts/ends) */
   #treeboxes { position: absolute; top: 0; left: 0; pointer-events: none; }
-  .bb {
-    position: absolute; box-sizing: border-box; border-radius: 4px;
-    border: 1.5px solid; pointer-events: none;
-  }
-  .b0 { border-color: #d64545; background: rgba(214,69,69,.045); }
-  .b1 { border-color: #d88a1e; background: rgba(216,138,30,.045); }
-  .b2 { border-color: #b09a12; background: rgba(196,176,21,.055); }
-  .b3 { border-color: #3f9b3c; background: rgba(63,155,60,.045); }
-  .b4 { border-color: #2f7fc1; background: rgba(47,127,193,.045); }
-  .b5 { border-color: #8a5bc7; background: rgba(138,91,199,.045); }
-  .bb-err { border: 2px solid #d73a49; background: rgba(215,58,73,.10); }
+  svg.bb { position: absolute; pointer-events: none; overflow: visible; }
+  .bb path { stroke-width: 1.5; }
+  .b0 path { stroke: #d64545; fill: rgba(214,69,69,.045); }
+  .b1 path { stroke: #d88a1e; fill: rgba(216,138,30,.045); }
+  .b2 path { stroke: #b09a12; fill: rgba(196,176,21,.055); }
+  .b3 path { stroke: #3f9b3c; fill: rgba(63,155,60,.045); }
+  .b4 path { stroke: #2f7fc1; fill: rgba(47,127,193,.045); }
+  .b5 path { stroke: #8a5bc7; fill: rgba(138,91,199,.045); }
+  .bb-err path { stroke: #d73a49; stroke-width: 2; fill: rgba(215,58,73,.10); }
   /* leaf tokens: light neutral boxes so the colored structure dominates */
-  .bb-leaf {
-    border: 1px solid rgba(31,35,40,.28); background: rgba(31,35,40,.025);
-    border-radius: 3px;
+  .bb-leaf path {
+    stroke: rgba(31,35,40,.28); stroke-width: 1; fill: rgba(31,35,40,.025);
   }
   #tree-wrap {
     flex: 1 1 26rem; min-width: 22rem; max-height: 40rem; overflow: auto;
@@ -358,17 +356,39 @@ function renderBoxes() {
   function rectOf(e) {
     const s = model.getPositionAt(b2c[e.lo - 1]);
     const en = model.getPositionAt(Math.max(b2c[e.hi], b2c[e.lo - 1]));
-    let left = pxAt(s.lineNumber, s.column);
-    let right = pxAt(en.lineNumber, en.column);
+    const sx = pxAt(s.lineNumber, s.column);   // start x on the first line
+    const ex = pxAt(en.lineNumber, en.column); // end x on the last line
+    let left = sx, right = ex;
     if (en.lineNumber > s.lineNumber) {
       left = Math.min(left, cached.minIndentPx(s.lineNumber + 1, en.lineNumber));
       right = Math.max(right, cached.maxWidthPx(s.lineNumber, en.lineNumber - 1));
     }
     return {
-      left, right,
+      s, en, sx, ex, left, right,
       top: editor.getTopForLineNumber(s.lineNumber) + vinset,
       bottom: editor.getTopForLineNumber(en.lineNumber) + lineH - vinset,
     };
+  }
+  // SVG path through `pts` (content coords, origin-shifted), corners rounded
+  const rectPts = (l, t, r, b) =>
+    [{ x: l, y: t }, { x: r, y: t }, { x: r, y: b }, { x: l, y: b }];
+  function roundedPath(pts, r, ox, oy) {
+    const n = pts.length;
+    let d = "";
+    for (let i = 0; i < n; i++) {
+      const p0 = pts[(i + n - 1) % n], p1 = pts[i], p2 = pts[(i + 1) % n];
+      const l1 = Math.hypot(p1.x - p0.x, p1.y - p0.y);
+      const l2 = Math.hypot(p2.x - p1.x, p2.y - p1.y);
+      const rr = Math.min(r, l1 / 2, l2 / 2);
+      const ax = p1.x - (l1 ? ((p1.x - p0.x) / l1) * rr : 0) - ox;
+      const ay = p1.y - (l1 ? ((p1.y - p0.y) / l1) * rr : 0) - oy;
+      const bx = p1.x + (l2 ? ((p2.x - p1.x) / l2) * rr : 0) - ox;
+      const by = p1.y + (l2 ? ((p2.y - p1.y) / l2) * rr : 0) - oy;
+      d += `${i ? "L" : "M"}${ax.toFixed(2)} ${ay.toFixed(2)}` +
+           `Q${(p1.x - ox).toFixed(2)} ${(p1.y - oy).toFixed(2)} ` +
+           `${bx.toFixed(2)} ${by.toFixed(2)}`;
+    }
+    return d + "Z";
   }
 
   const out = [];
@@ -389,35 +409,88 @@ function renderBoxes() {
 
   const spacey = (c) =>
     c === undefined || c === " " || c === "\n" || c === "\t";
+  const SVGNS = "http://www.w3.org/2000/svg";
   for (const e of out) {
     if (e.b < e.a && !e.err) continue;   // zero-width: only errors marked
     const u = rectOf(e);
     const pad = Math.min(e.boxh, 3) + 1;
-    // horizontal outset only into whitespace: a single-line box knows
-    // exactly which characters flank it — when the neighbor is a glyph
-    // (e.g. the $ before an interpolation's parens, or adjacent tokens in
-    // z^2), the edge stays flush so neighboring boxes share one seam
-    const oneLine = u.bottom - u.top < 1.5 * lineH;
-    let padL = !oneLine || spacey(text[b2c[e.lo - 1] - 1]) ? pad : 0;
-    const padR = !oneLine || spacey(text[b2c[e.hi]]) ? pad : 0;
+    const multi = u.en.lineNumber > u.s.lineNumber;
+    // horizontal outset only into whitespace: when the flanking character
+    // is a glyph (e.g. the $ before an interpolation's parens, or adjacent
+    // tokens in z^2), the edge stays flush so neighboring boxes share one
+    // seam. For multi-line boxes the outer left/right edges abut varied
+    // lines (outset freely); the start/end notch edges use the check.
+    const padS = spacey(text[b2c[e.lo - 1] - 1]) ? pad : 0;
+    const padE = spacey(text[b2c[e.hi]]) ? pad : 0;
+    let padL = multi ? pad : padS;
+    const padR = multi ? pad : padE;
     // content space is clipped at x=0 (the line-number margin starts there):
     // column-1 boxes can only outset into what's actually available
     padL = Math.min(padL, Math.max(u.left, 0));
-    const d = document.createElement("div");
-    d.className = e.err ? "bb bb-err" : e.leaf ? "bb bb-leaf" : `bb b${e.depth % 6}`;
-    d.title = e.leaf ? e.name : `[${e.name}]`;
-    d.dataset.node = e.node._id;
-    const left = u.left - padL;
-    const top = u.top - pad;
-    const width = Math.max(u.right - u.left, 3) + padL + padR;
-    const height = u.bottom - u.top + 2 * pad;
-    d.style.left = left + "px";
-    d.style.top = top + "px";
-    d.style.width = width + "px";
-    d.style.height = height + "px";
-    layer.appendChild(d);
-    drawnBoxes.push({ left, top, right: left + width, bottom: top + height,
-                      id: e.node._id });
+    const Lp = u.left - padL;
+    const Tp = u.top - pad;
+    const Rp = Math.max(u.right, u.left + 3) + padR;
+    const Bp = u.bottom + pad;
+    // notches: where the node starts mid-line at a deeper indent than its
+    // continuation (or ends before content further right above), cut the
+    // unoccupied corner out of the box instead of overextending
+    let notchTL = null;
+    let notchBR = null;
+    let subpaths = null;
+    let pts = null;
+    if (multi) {
+      const xs = Math.max(u.sx - padS, 0);
+      const xe = u.ex + padE;
+      const yLid1 = editor.getTopForLineNumber(u.s.lineNumber + 1) + vinset - pad;
+      const yLid2 = editor.getTopForLineNumber(u.en.lineNumber) + vinset - pad;
+      const wantTL = xs > Lp + 2;
+      const wantBR = xe < Rp - 2;
+      if (wantTL && wantBR && u.en.lineNumber === u.s.lineNumber + 1 && xs > xe - 4) {
+        // two rows whose occupied spans don't overlap horizontally: the
+        // notched polygon would self-intersect — draw one box per row
+        subpaths = [rectPts(xs, Tp, Rp, yLid1), rectPts(Lp, yLid2, xe, Bp)];
+        notchTL = { x: xs, y: yLid1 };
+        notchBR = { x: xe, y: yLid2 };
+      } else {
+        pts = [];
+        if (wantTL) {
+          pts.push({ x: xs, y: Tp });
+          notchTL = { x: xs, y: yLid1 };
+        } else {
+          pts.push({ x: Lp, y: Tp });
+        }
+        pts.push({ x: Rp, y: Tp });
+        if (wantBR) {
+          pts.push({ x: Rp, y: yLid2 }, { x: xe, y: yLid2 }, { x: xe, y: Bp });
+          notchBR = { x: xe, y: yLid2 };
+        } else {
+          pts.push({ x: Rp, y: Bp });
+        }
+        pts.push({ x: Lp, y: Bp });
+        if (wantTL) pts.push({ x: Lp, y: yLid1 }, { x: xs, y: yLid1 });
+      }
+    } else {
+      pts = rectPts(Lp, Tp, Rp, Bp);
+    }
+    const d = subpaths
+      ? subpaths.map((p) => roundedPath(p, 4, Lp, Tp)).join("")
+      : roundedPath(pts, 4, Lp, Tp);
+    const svg = document.createElementNS(SVGNS, "svg");
+    svg.setAttribute("class",
+      e.err ? "bb bb-err" : e.leaf ? "bb bb-leaf" : `bb b${e.depth % 6}`);
+    svg.dataset.node = e.node._id;
+    svg.style.left = Lp + "px";
+    svg.style.top = Tp + "px";
+    svg.style.width = (Rp - Lp) + "px";
+    svg.style.height = (Bp - Tp) + "px";
+    const path = document.createElementNS(SVGNS, "path");
+    path.setAttribute("d", d);
+    const title = document.createElementNS(SVGNS, "title");
+    title.textContent = e.leaf ? e.name : `[${e.name}]`;
+    svg.append(title, path);
+    layer.appendChild(svg);
+    drawnBoxes.push({ left: Lp, top: Tp, right: Rp, bottom: Bp,
+                      notchTL, notchBR, id: e.node._id });
   }
 }
 
@@ -712,7 +785,11 @@ editor.onMouseDown((e) => {
   const y = be.clientY - rect.top + editor.getScrollTop();
   let hit = null;
   for (const b of drawnBoxes) {
-    if (x >= b.left && x <= b.right && y >= b.top && y <= b.bottom) hit = b;
+    if (x >= b.left && x <= b.right && y >= b.top && y <= b.bottom &&
+        !(b.notchTL && x < b.notchTL.x && y < b.notchTL.y) &&
+        !(b.notchBR && x > b.notchBR.x && y > b.notchBR.y)) {
+      hit = b;
+    }
   }
   if (hit !== null) {
     suppressCursorSync = true;   // the click's cursor event must not override
