@@ -68,35 +68,43 @@ export function renderTokensHTML(tokens, bytes, dec, kindName, TOMBSTONE) {
   return html;
 }
 
-// Mode 2: nested bounding boxes around interior parse-tree nodes,
-// depth-cycled colors; error nodes (and error leaf tokens) in red
-export function renderBoxesHTML(roots, bytes, dec, kindName, srcLen) {
-  const text = (a, b) => (b < a ? "" : esc(dec.decode(bytes.subarray(a - 1, b))));
+// Mode 2: 2D bounding boxes around parse-tree nodes. This collects the flat
+// paint-order list (parents before children, so deeper boxes draw on top);
+// the page measures each byte range with a DOM Range and draws
+// absolutely-positioned rectangles. `height` is the node's distance to its
+// deepest boxed descendant — used to outset enclosing boxes so chains of
+// nodes with identical extents stay distinguishable.
+export function collectBoxes(roots, kindName) {
+  const out = [];
   function rec(node, depth) {
     const name = kindName(node.head & 0xffff);
-    const isErr = isErrName(name);
+    const err = isErrName(name);
     if (node.leaf) {
-      const t = text(node.a, node.b);
-      return isErr ? `<span class="nb nb-err" title="${esc(name)}">${t}</span>` : t;
+      if (err) out.push({ a: node.a, b: node.b, depth, height: 0, err, name });
+      return 0;
     }
-    let out = "";
-    let pos = node.a;
-    for (const c of node.children) {
-      if (c.a > pos) out += text(pos, c.a - 1);
-      out += rec(c, depth + 1);
-      pos = Math.max(pos, c.b + 1);
-    }
-    if (pos <= node.b) out += text(pos, node.b);
-    const cls = isErr ? "nb nb-err" : `nb b${depth % NCOLORS}`;
-    return `<span class="${cls}" title="[${esc(name)}]">${out}</span>`;
+    const entry = { a: node.a, b: node.b, depth, height: 0, err,
+                    name: `[${name}]` };
+    out.push(entry);
+    let h = 0;
+    for (const c of node.children) h = Math.max(h, rec(c, depth + 1) + 1);
+    entry.height = h;
+    return h;
   }
-  let html = "";
-  let pos = 1;
-  for (const r of roots) {
-    if (r.a > pos) html += text(pos, r.a - 1);
-    html += rec(r, 0);
-    pos = Math.max(pos, r.b + 1);
+  for (const r of roots) rec(r, 0);
+  return out;
+}
+
+// map[byteOffset] = JS char (UTF-16 code unit) offset, for translating the
+// parser's 1-based UTF-8 byte ranges into DOM Range endpoints
+export function byteToCharMap(text) {
+  const map = [0];
+  let chars = 0;
+  for (const ch of text) {
+    const cp = ch.codePointAt(0);
+    const n8 = cp < 0x80 ? 1 : cp < 0x800 ? 2 : cp < 0x10000 ? 3 : 4;
+    chars += ch.length;
+    for (let k = 1; k <= n8; k++) map.push(chars);
   }
-  if (pos <= srcLen) html += text(pos, srcLen);
-  return html;
+  return map;
 }

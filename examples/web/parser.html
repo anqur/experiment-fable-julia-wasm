@@ -45,19 +45,19 @@
   .c4 { background: #c5e8f7; } .c5 { background: #e4d5f7; }
   span[data-tok] { border-radius: 3px; }
   .tok-error { background: #d73a49; color: #ffffff; }
-  /* tree mode: nested bounding boxes, depth-cycled. box-shadow instead of
-     border so the text metrics stay identical to the textarea overlay */
-  .nb {
-    border-radius: 3px;
-    box-decoration-break: clone; -webkit-box-decoration-break: clone;
+  /* tree mode: 2D bounding boxes (absolutely positioned rectangles measured
+     from DOM ranges, drawn behind the text), depth-cycled colors */
+  .bb {
+    position: absolute; box-sizing: border-box; border-radius: 4px;
+    border: 1.5px solid; pointer-events: none;
   }
-  .b0 { box-shadow: inset 0 0 0 1px #d64545; background: rgba(214,69,69,.05); }
-  .b1 { box-shadow: inset 0 0 0 1px #d88a1e; background: rgba(216,138,30,.05); }
-  .b2 { box-shadow: inset 0 0 0 1px #b09a12; background: rgba(196,176,21,.06); }
-  .b3 { box-shadow: inset 0 0 0 1px #3f9b3c; background: rgba(63,155,60,.05); }
-  .b4 { box-shadow: inset 0 0 0 1px #2f7fc1; background: rgba(47,127,193,.05); }
-  .b5 { box-shadow: inset 0 0 0 1px #8a5bc7; background: rgba(138,91,199,.05); }
-  .nb-err { box-shadow: inset 0 0 0 2px #d73a49; background: rgba(215,58,73,.10); }
+  .b0 { border-color: #d64545; background: rgba(214,69,69,.045); }
+  .b1 { border-color: #d88a1e; background: rgba(216,138,30,.045); }
+  .b2 { border-color: #b09a12; background: rgba(196,176,21,.055); }
+  .b3 { border-color: #3f9b3c; background: rgba(63,155,60,.045); }
+  .b4 { border-color: #2f7fc1; background: rgba(47,127,193,.045); }
+  .b5 { border-color: #8a5bc7; background: rgba(138,91,199,.045); }
+  .bb-err { border: 2px solid #d73a49; background: rgba(215,58,73,.10); }
   #tree-wrap {
     flex: 1 1 26rem; min-width: 22rem; max-height: 40rem; overflow: auto;
     border: 1px solid #d0d7de; border-radius: 8px; background: #ffffff;
@@ -114,7 +114,8 @@ s = "interpolate: $(mandel(0.3 + 0.5im))"
 <script type="module">
 import { instantiateParser } from "./parser_host.mjs";
 import { KINDS } from "./parser_meta.js";
-import { esc, buildTree, renderTokensHTML, renderBoxesHTML } from "./tree_render.mjs";
+import { esc, buildTree, renderTokensHTML, collectBoxes, byteToCharMap }
+  from "./tree_render.mjs";
 
 const input = document.getElementById("input");
 const highlight = document.getElementById("highlight");
@@ -155,15 +156,52 @@ function renderNode(node, bytes, dec) {
 }
 
 let mode = "tokens";
-let cached = null;   // { ev, bytes, roots } for re-rendering on mode toggle
+let cached = null;   // { ev, text, bytes, roots } for re-render on toggle/resize
+
+// 2D boxes: plain text goes into the layer, each node's byte range is
+// measured with a DOM Range (its bounding rect spans the node's full
+// multi-line extent), and rectangles are drawn behind the text — parents
+// first, enclosing boxes outset by tree height so coincident extents nest
+// visibly
+function renderBoxesMode() {
+  const { text, roots } = cached;
+  highlight.replaceChildren();
+  const boxdiv = document.createElement("div");
+  const span = document.createElement("span");
+  span.textContent = text + "\n";
+  highlight.append(boxdiv, span);
+  const tnode = span.firstChild;
+  const b2c = byteToCharMap(text);
+  const preRect = highlight.getBoundingClientRect();
+  const range = document.createRange();
+  for (const box of collectBoxes(roots, kindName)) {
+    const cs = b2c[box.a - 1];
+    const ce = Math.max(b2c[box.b], cs);
+    if (ce === cs && !box.err) continue;   // zero-width: only errors marked
+    range.setStart(tnode, cs);
+    range.setEnd(tnode, ce);
+    const r = range.getBoundingClientRect();
+    const pad = Math.min(box.height, 4) + 1;
+    const d = document.createElement("div");
+    d.className = box.err ? "bb bb-err" : `bb b${box.depth % 6}`;
+    d.title = box.name;
+    d.style.left = (r.left - preRect.left + highlight.scrollLeft - pad) + "px";
+    d.style.top = (r.top - preRect.top + highlight.scrollTop - pad) + "px";
+    d.style.width = (Math.max(r.width, 3) + 2 * pad) + "px";
+    d.style.height = (r.height + 2 * pad) + "px";
+    boxdiv.appendChild(d);
+  }
+}
 
 function renderHighlight() {
   if (!cached) return;
-  const { ev, bytes, roots } = cached;
-  const dec = new TextDecoder();
-  highlight.innerHTML = (mode === "tokens"
-    ? renderTokensHTML(ev.tokens, bytes, dec, kindName, TOMBSTONE)
-    : renderBoxesHTML(roots, bytes, dec, kindName, bytes.length)) + "\n";
+  if (mode === "tokens") {
+    const { ev, bytes } = cached;
+    highlight.innerHTML =
+      renderTokensHTML(ev.tokens, bytes, new TextDecoder(), kindName, TOMBSTONE) + "\n";
+  } else {
+    renderBoxesMode();
+  }
 }
 
 function render() {
@@ -180,7 +218,7 @@ function render() {
   }
   const dt = (performance.now() - t0).toFixed(1);
   const roots = buildTree(ev.tokens, ev.nodes, TOMBSTONE);
-  cached = { ev, bytes, roots };
+  cached = { ev, text, bytes, roots };
   renderHighlight();
   treeEl.innerHTML = roots.map((r) => renderNode(r, bytes, dec)).join("");
   status.textContent =
@@ -197,6 +235,8 @@ for (const r of document.querySelectorAll('input[name="hlmode"]')) {
     renderHighlight();
   });
 }
+// box positions depend on line wrapping: re-measure when the editor resizes
+new ResizeObserver(() => { mode === "tree" && renderHighlight(); }).observe(input);
 render();
 </script>
 </body>
