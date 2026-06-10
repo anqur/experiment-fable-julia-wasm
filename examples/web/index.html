@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Julia lexer — compiled to WebAssembly</title>
+<style>
+  :root { color-scheme: dark; }
+  body {
+    margin: 0; padding: 2rem; background: #14161a; color: #cdd3de;
+    font-family: system-ui, sans-serif;
+  }
+  h1 { font-size: 1.2rem; font-weight: 600; }
+  h1 .wasm { color: #654ff0; }
+  p.sub { color: #8a93a3; font-size: .85rem; max-width: 60rem; }
+  #status { font-size: .8rem; color: #8a93a3; margin-bottom: .75rem; }
+  #editor-wrap {
+    position: relative; max-width: 60rem;
+    border: 1px solid #2a2f3a; border-radius: 8px; background: #0e1013;
+  }
+  #highlight, #input {
+    box-sizing: border-box; width: 100%; min-height: 22rem; margin: 0;
+    padding: 1rem; border: 0;
+    font: 14px/1.55 ui-monospace, "JuliaMono", "SF Mono", Menlo, Consolas, monospace;
+    white-space: pre-wrap; word-break: break-all; overflow-wrap: anywhere;
+    tab-size: 4;
+  }
+  #highlight {
+    position: absolute; inset: 0; pointer-events: none; color: #cdd3de;
+    overflow: hidden;
+  }
+  #input {
+    position: relative; background: transparent; color: transparent;
+    caret-color: #e6edf3; resize: vertical; outline: none; display: block;
+  }
+  .tok-keyword    { color: #c678dd; font-weight: 600; }
+  .tok-identifier { color: #e6edf3; }
+  .tok-number     { color: #d19a66; }
+  .tok-string     { color: #98c379; }
+  .tok-comment    { color: #5f6b7d; font-style: italic; }
+  .tok-operator   { color: #56b6c2; }
+  .tok-macro      { color: #61afef; }
+  .tok-punct      { color: #abb2bf; }
+  .tok-error      { background: #5c1a1a; color: #ff8080; border-radius: 2px; }
+  .tok-ws         {}
+  /* token boundary visualization */
+  span[data-tok] { box-shadow: inset -1px 0 0 0 #2f3540; }
+  #tokens {
+    max-width: 60rem; margin-top: 1rem; font: 12px ui-monospace, monospace;
+    color: #8a93a3; white-space: pre-wrap;
+  }
+</style>
+</head>
+<body>
+<h1>JuliaSyntax lexer, compiled Julia&nbsp;IR&nbsp;→&nbsp;<span class="wasm">WebAssembly</span></h1>
+<p class="sub">
+  The actual <code>JuliaSyntax.Tokenize</code> lexer — compiled from Julia's
+  optimized IR to WasmGC (no manual port; unicode tables run in-wasm via
+  UnicodeNext). Type Julia code below; token boundaries come from the wasm
+  module running in your browser. Vertical ticks mark token boundaries.
+</p>
+<div id="status">loading lexer.wasm…</div>
+<div id="editor-wrap">
+  <pre id="highlight" aria-hidden="true"></pre>
+  <textarea id="input" spellcheck="false">function mandel(z::Complex)
+    c = z
+    for n in 1:80
+        abs2(z) ≥ 4.0 && return n - 1
+        z = z^2 + c   # escape-time iteration
+    end
+    return 80
+end
+
+s = "interpolate: $(mandel(0.3 + 0.5im))"
+@show s</textarea>
+</div>
+<div id="tokens"></div>
+<script type="module">
+import { instantiateLexer } from "./lexer_host.mjs";
+import { KINDS } from "./lexer_meta.js";
+
+const input = document.getElementById("input");
+const highlight = document.getElementById("highlight");
+const tokensEl = document.getElementById("tokens");
+const status = document.getElementById("status");
+
+const esc = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;");
+
+let lexer = null;
+try {
+  const bytes = await (await fetch("./lexer.wasm")).arrayBuffer();
+  lexer = await instantiateLexer(bytes);
+  status.textContent = "lexer.wasm instantiated — lexing locally in your browser";
+} catch (e) {
+  status.textContent = "failed to load lexer.wasm: " + e + " (browser needs WasmGC: Chrome 119+/Firefox 120+/Safari 18.4+)";
+  throw e;
+}
+
+function render() {
+  const text = input.value;
+  const enc = new TextEncoder();
+  const bytes = enc.encode(text);
+  const dec = new TextDecoder();
+  let t0 = performance.now();
+  let tokens;
+  try {
+    tokens = lexer.lex(text).tokens;
+  } catch (e) {
+    status.textContent = "lexer trapped: " + e;
+    return;
+  }
+  const dt = (performance.now() - t0).toFixed(1);
+  let html = "";
+  const counts = {};
+  for (const [kind, a, b] of tokens) {
+    const [name, cls] = KINDS[kind] ?? [String(kind), "tok-punct"];
+    counts[name] = (counts[name] ?? 0) + 1;
+    if (name === "EndMarker") continue;
+    const piece = dec.decode(bytes.subarray(a, b + 1));   // 0-based start, inclusive end
+    html += `<span class="${cls}" data-tok="${name}" title="${name}">${esc(piece)}</span>`;
+  }
+  highlight.innerHTML = html + "\n";
+  status.textContent = `${tokens.length} tokens in ${dt} ms (wasm)`;
+  tokensEl.textContent = tokens
+    .map(([k, a, b]) => `${(KINDS[k] ?? [k])[0]}[${a}-${b}]`)
+    .join("  ");
+}
+
+input.addEventListener("input", render);
+input.addEventListener("scroll", () => {
+  highlight.scrollTop = input.scrollTop;
+});
+render();
+</script>
+</body>
+</html>

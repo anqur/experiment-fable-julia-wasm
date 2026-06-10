@@ -468,6 +468,32 @@ struct ConstSink
 end
 emit!(s::ConstSink, insts::Inst...) = append!(s.body, insts)
 
+"""Raw little-endian bytes of a numeric-element host Memory, matching the wasm
+array element storage (i8/i16 packed, i32/i64/f32/f64, Char as raw bits)."""
+function _const_bytes(st, @nospecialize(elT), v)
+    io = IOBuffer()
+    for x in v
+        if st isa PackedType
+            if st == I8
+                write(io, x isa Bool ? UInt8(x) : reinterpret(UInt8, x))
+            else
+                write(io, htol(reinterpret(UInt16, x)))
+            end
+        elseif st == I32
+            bits = x isa Char ? reinterpret(UInt32, x) :
+                   elT === Float32 ? reinterpret(UInt32, x) : reinterpret(UInt32, x)
+            write(io, htol(bits))
+        elseif st == F32
+            write(io, htol(reinterpret(UInt32, x)))
+        elseif st == F64
+            write(io, htol(reinterpret(UInt64, x)))
+        else
+            write(io, htol(reinterpret(UInt64, x)))
+        end
+    end
+    return take!(io)
+end
+
 """Intern a mutable host constant; returns its `ValueGlobal` placeholder."""
 function register_valueglobal!(mc::ModuleCompiler, @nospecialize v)
     idx = get(mc.valueglobal_ids, v, nothing)
@@ -521,10 +547,23 @@ function emit_const!(fc, @nospecialize v)
         if fc isa ConstSink
             arr = gc_array!(fc.mc, T)
             elT = T.parameters[2]
-            for x in v
-                emit_const_field!(fc, x, elT)
+            st = field_storage(fc.mc, elT)
+            n = length(v)
+            if !(st isa RefType) && n > 64
+                # large numeric table: passive data segment + array.new_data
+                # (engines cap array.new_fixed operand counts, e.g. V8 at 10k)
+                bytes = _const_bytes(st, elT, v)
+                push!(fc.mc.wmod.datas, Data(bytes))
+                dataidx = length(fc.mc.wmod.datas) - 1
+                emit!(fc, i32_const(0), i32_const(n), array_new_data(arr, dataidx))
+            else
+                n > 9000 &&
+                    throw(CompileError("constant ref-array too large to materialize: $n"))
+                for x in v
+                    emit_const_field!(fc, x, elT)
+                end
+                emit!(fc, array_new_fixed(arr, n))
             end
-            emit!(fc, array_new_fixed(arr, length(v)))
         else
             emit!(fc, Inst(:global_get, (register_valueglobal!(fc.mc, v),)))
         end
@@ -1859,16 +1898,22 @@ function compile_wasm(@nospecialize(f), @nospecialize(argtypes::Type{<:Tuple});
     for (k, m) in enumerate(live)
         fidx[m] = nimports + length(wrapped) + k - 1
     end
-    # value-global final indices: after the imported host-constant globals
+    # value-global final indices: after the imported host-constant globals.
+    # The globals are mutable and null-initialized; a start function
+    # materializes them in dependency order (init code may use the full
+    # instruction set, e.g. array.new_data from passive data segments).
     vgmap = Dict{Int,Int}()
     for (pos, k) in enumerate(vg_order)
         vgmap[k] = length(hostconsts) + pos - 1
     end
+    startbody = Inst[]
     for k in vg_order
         init = vg_inits[k+1]
         patch_valueglobals!(init, vgmap)
         vt = valtype_for(mc, typeof(mc.valueglobals[k+1]))
-        push!(mc.wmod.globals, Global(GlobalType(vt, false), init))
+        push!(mc.wmod.globals, Global(GlobalType(vt, true), [ref_null(vt.ht)]))
+        append!(startbody, init)
+        push!(startbody, Inst(:global_set, (UInt32(vgmap[k]),)))
     end
     for (k, off) in enumerate(wrapped)
         importidx = findfirst(o -> o === off, offloads) - 1
@@ -1883,6 +1928,12 @@ function compile_wasm(@nospecialize(f), @nospecialize(argtypes::Type{<:Tuple});
         patch_calls!(func.body, fidx, offidx)
         patch_valueglobals!(func.body, vgmap)
         push!(mc.wmod.funcs, func)
+    end
+    if !isempty(startbody)
+        sf = Func(addtype!(mc.wmod, FuncType(ValType[], ValType[])),
+                  ValType[], startbody, "__init_constants")
+        push!(mc.wmod.funcs, sf)
+        mc.wmod.start = UInt32(nimports + length(wrapped) + length(live))
     end
     push!(mc.wmod.exports, Export(name, :func, fidx[mi]))
     bytes = encode(mc.wmod)
