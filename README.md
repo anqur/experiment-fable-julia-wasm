@@ -79,9 +79,10 @@ Every layer is differentially tested:
 
 ## Toolchain notes
 
-- `tools/wasmtime-c-api/` — vendored wasmtime v45.0.1 C API (lib + headers).
-  `WasmtimeRunner` prefers the `Wasmtime_jll` package automatically once the
-  freshly-merged build ([Yggdrasil#13929](https://github.com/JuliaPackaging/Yggdrasil/pull/13929))
-  reaches the General registry; `ENV["WASMTIME_LIB"]` overrides both.
+- `tools/wasmtime-c-api/` — vendored wasmtime v45.0.1 C API (lib + headers),
+  deliberately preferred over the registered `Wasmtime_jll` (currently v39,
+  ABI-incompatible with the verified v45 contracts). Flip the preference once
+  the v45 build ([Yggdrasil#13929](https://github.com/JuliaPackaging/Yggdrasil/pull/13929))
+  registers; `ENV["WASMTIME_LIB"]` overrides everything.
 - `tools/wasm-tools-dist/` — `wasm-tools` 1.251 (validator/printer/fuzzer).
 - Run `julia --project=/workspace` for a dev environment with all packages.
