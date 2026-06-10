@@ -35,19 +35,19 @@ Monorepo of three layered Julia packages compiling Julia to WebAssembly-with-GC:
 
 ## Pending / watch
 
-- `Wasmtime_jll` is registered at v39, which is ABI-incompatible with this
-  code (verified against v45). The vendored v45 C API is deliberately
-  preferred. When the v45.0.1 JLL lands (Yggdrasil PR 13929), flip
-  `_find_libwasmtime` to prefer the JLL and re-run the runner suite.
+- `Wasmtime_jll` v45.0.1 is a hard dependency (compat "45"). NOTE: the
+  pkg-server registry snapshot lagged GitHub; the depot uses a Git-cloned
+  General registry (`JULIA_PKG_SERVER=""` flavor) — keep that in mind when
+  resolving.
 - Next compiler layers, in rough order:
   1. **Custom `AbstractInterpreter`** with overlay methods so a small set of
      pointer-based Base primitives (`codeunit(::String,…)`, `pointer`,
      `unsafe_copyto!(::Memory…)`, `MemoryRef.ptr_or_offset` consumers) are
      intercepted *before inlining* and routed to hostcalls / GC-array ops.
      This is what blocks `parse`, full `sort!` (ScratchQuickSort), `push!`.
-  2. try/catch → wasm-EH: per-basic-block `try_table` inside the dispatcher
-     targeting the innermost Julia handler; one exception tag carrying anyref;
-     explicit check+throw for trapping ops inside protected regions.
+  2. Exception-value binding (`catch e`): materialize exception objects as
+     the tag payload (GC structs / externref via any.convert_extern), and
+     propagate exceptions across compiled-function call boundaries.
   3. Structured relooping to replace the dispatcher loop (perf).
   4. Dynamic dispatch via funcref tables.
 - Known documented latitudes (not bugs): `muladd` may differ from native fma

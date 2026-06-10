@@ -9,34 +9,18 @@ calling exports, defining host functions backed by arbitrary Julia callables,
 and binding Julia values into wasm as `externref`s — the basis for differential
 testing of Julia-compiled wasm against native execution.
 
-Library resolution order: `ENV["WASMTIME_LIB"]`, the vendored wasmtime v45
-C API under `/workspace/tools/wasmtime-c-api`, then the `Wasmtime_jll` package
-as a last resort.
+Library resolution order: `ENV["WASMTIME_LIB"]`, then `Wasmtime_jll` (pinned
+to v45: src/abi.jl and the ownership/threading contracts in src/runtime.jl are
+verified against wasmtime v45.0.1 specifically).
 """
 module WasmtimeRunner
 
 using Libdl
+using Wasmtime_jll: Wasmtime_jll
 
 function _find_libwasmtime()
     haskey(ENV, "WASMTIME_LIB") && return ENV["WASMTIME_LIB"]
-    # Prefer the vendored v45 library: src/abi.jl and the ownership/threading
-    # contracts in src/runtime.jl are verified against wasmtime v45.0.1
-    # specifically. The currently-registered Wasmtime_jll is v39, whose C API
-    # differs in load-bearing ways (wasmtime_context_gc returns void instead
-    # of an error pointer, exnref globals abort the process, ...), so it is
-    # only a fallback for environments without the vendored copy.
-    vendored = "/workspace/tools/wasmtime-c-api/lib/libwasmtime.so"
-    isfile(vendored) && return vendored
-    jllid = Base.identify_package("Wasmtime_jll")
-    if jllid !== nothing
-        try
-            jll = Base.require(jllid)
-            return jll.libwasmtime::String
-        catch
-        end
-    end
-    error("libwasmtime not found: set ENV[\"WASMTIME_LIB\"], place the wasmtime " *
-          "C API at $vendored, or install Wasmtime_jll")
+    return Wasmtime_jll.libwasmtime::String
 end
 
 const libwasmtime = _find_libwasmtime()
