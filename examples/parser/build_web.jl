@@ -1,13 +1,13 @@
 # Build the parser web demo artifacts: parser.wasm + parser_meta.js
 # (host-constant table, import names, kind names/classes) + expected event
 # streams for the node-side differential check.
-using WasmCodegen, JuliaSyntax
+using WasmCodegen
 include(joinpath(@__DIR__, "parsedemo.jl"))
 
 webdir = normpath(joinpath(@__DIR__, "..", "web"))
 mkpath(webdir)
 
-comp = compile_wasm(parse_into, Tuple{String})
+comp = compile_wasm(parse_into, Tuple{String,Int64})
 write(joinpath(webdir, "parser.wasm"), comp.bytes)
 println("parser.wasm: ", length(comp.bytes), " bytes, ",
         length(comp.offloads), " imports, ", length(comp.hostconsts), " consts")
@@ -117,14 +117,19 @@ function json_str(s::String)
     return String(take!(buf))
 end
 
+# version-sensitive entries pin specific syntax versions
+vcases = [("import A as B", 5), ("import A as B", 6),
+          ("public foo, bar", 5), ("public foo, bar", 11),
+          ("module A\nend", 12), ("module A\nend", 14),
+          ("typegroup struct A end end", 14)]
 open(joinpath(webdir, "expected_events.json"), "w") do io
-    entries = map(corpus) do src
-        toks, rngs = native_events(src)
-        "{\"src\": $(json_str(src)), \"tokens\": [" *
-            join(("[$a,$b,$c]" for (a, b, c) in toks), ",") *
-            "], \"nodes\": [" *
-            join(("[$a,$b,$c]" for (a, b, c) in rngs), ",") * "]}"
+    entry(src, v) = begin
+        evs = native_events(src, v)
+        "{\"src\": $(json_str(src)), \"v\": $v, \"events\": [" *
+            join(("[$a,$b,$c]" for (a, b, c) in evs), ",") * "]}"
     end
+    entries = vcat([entry(src, 14) for src in corpus],
+                   [entry(src, v) for (src, v) in vcases])
     println(io, "[", join(entries, ",\n"), "]")
 end
 println("wrote parser_meta.js + expected_events.json")

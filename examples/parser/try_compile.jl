@@ -2,7 +2,7 @@
 using WasmCodegen
 include(joinpath(@__DIR__, "parsedemo.jl"))
 try
-    comp = compile_wasm(parse_into, Tuple{String})
+    comp = compile_wasm(parse_into, Tuple{String,Int64})
     println("COMPILED offloads=", length(comp.offloads),
             " funcs=", length(comp.wmod.funcs),
             " consts=", length(comp.hostconsts),

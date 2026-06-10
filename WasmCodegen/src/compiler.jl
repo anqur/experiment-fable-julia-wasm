@@ -401,7 +401,9 @@ function mi_signature(mc::ModuleCompiler, mi::Core.MethodInstance, @nospecialize
     sig = Base.unwrap_unionall(mi.specTypes)
     argts = collect(Any, sig.parameters)
     params = ValType[]
-    for T in argts[2:end]
+    # the callable itself is a parameter when it carries data (closures);
+    # singleton functions are ghosts and contribute nothing
+    for T in argts
         vt = valtype_for(mc, T)
         vt === nothing && continue
         push!(params, vt)
@@ -1402,15 +1404,16 @@ function emit_invoke!(fc::FuncCompiler, i::Int, ex::Expr)
         emit_trap_or_throw!(fc)
         return :dead
     end
-    # evaluate arguments (skipping the function-value slot) typed against the
-    # callee signature, so e.g. `nothing` literals become ref.null
+    # evaluate arguments typed against the callee signature, so e.g.
+    # `nothing` literals become ref.null. A data-carrying callable (closure)
+    # is itself the first argument; singleton functions are ghosts.
     sig = Base.unwrap_unionall(mi.specTypes)
-    isghost(sig.parameters[1]) ||
-        throw(CompileError("invoke of non-singleton callable $(sig.parameters[1])"))
     ps = collect(Any, sig.parameters)
     if length(ps) != length(ex.args) - 1 || any(Base.isvarargtype, ps)
         # vararg callee (e.g. print_to_string in string interpolation): offload
         # with a signature specialized to THIS call site's concrete arg list
+        isghost(ps[1]) ||
+            throw(CompileError("vararg invoke of closure $(ps[1]) unsupported"))
         rt_c = ex.args[1] isa Core.CodeInstance ?
                widen((ex.args[1]::Core.CodeInstance).rettype) :
                widen(method_ir(fc.mc, mi)[2])
@@ -1439,6 +1442,9 @@ function emit_invoke!(fc::FuncCompiler, i::Int, ex::Expr)
             mi, ps = mi2, respec
         end
     end
+    # a data-carrying callable (closure over GC state) is itself the first
+    # argument; singleton functions are ghosts and emit nothing
+    isghost(ps[1]) || emit_value_typed!(fc, ex.args[2], ps[1])
     for (k, ref) in enumerate(ex.args[3:end])
         emit_value_typed!(fc, ref, ps[k+1])
     end
@@ -1984,8 +1990,8 @@ function compile_function(mc::ModuleCompiler, mi::Core.MethodInstance)
     nfixed = mi.def.isva ? nargs - 1 : nargs
     for n in 1:nfixed
         T = widen(ir.argtypes[n])
-        n == 1 && !isghost(T) &&
-            throw(CompileError("closure callee with fields: $T"))
+        # n == 1 is the callable itself: a wasm param when it carries data
+        # (closures over GC state); ghost for singleton functions
         vt = valtype_for(mc, T)
         vt === nothing && continue
         push!(params, vt)

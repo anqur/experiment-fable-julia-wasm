@@ -1,14 +1,17 @@
 # The full-JuliaSyntax-parser-to-wasm stress test.
 #
-# `parse_into(src)` runs the complete recursive-descent parser
+# `parse_into(src, vminor)` runs the complete recursive-descent parser
 # (JuliaSyntax.parse! over a ParseStream) inside wasm and streams out the
-# parser's native output representation:
-#   emit_token(kind | flags<<16, orig_kind | ws<<16, next_byte)
-#   emit_node(kind | flags<<16, first_token, last_token)
-# The green tree is a pure host-side reconstruction of these events
-# (exactly what JuliaSyntax.build_tree does). Returns ntokens + nranges.
+# parser's native output representation — the post-order RawGreenNode array:
+#   emit_node(kind | flags<<16, byte_span, node_span_or_orig_kind)
+# (flags bit 7 = non-terminal; for terminals the third value is orig_kind).
+# The green tree is a pure host-side reconstruction of these events, exactly
+# mirroring JuliaSyntax's GreenTreeCursor. Returns the number of events.
 
-using JuliaSyntax
+# Compile the LATEST parser: the JuliaSyntax vendored into Base (it moved
+# in-tree), which carries the new 1.14 syntax gates (typegroup, labeled
+# break/continue, module VERSION markers) ahead of the standalone releases.
+const JuliaSyntax = Base.JuliaSyntax
 using WasmCodegen: WASM_MT, _hb_reset, _hb_push, _hb_parse_f64, _hb_parse_f32,
                    _hb_status
 
@@ -41,17 +44,10 @@ Base.Experimental.@overlay WASM_MT function JuliaSyntax.parse_float_literal(
     return (x, st == Int32(0) ? :ok : st == Int32(1) ? :underflow : :overflow)
 end
 
-const TOKEN_SINK = Ref{Vector{NTuple{3,Int64}}}(NTuple{3,Int64}[])
 const NODE_SINK = Ref{Vector{NTuple{3,Int64}}}(NTuple{3,Int64}[])
 
-# NOT const: pins the emitters to the host (see lexer demo)
+# NOT const: pins the emitter to the host (see lexer demo)
 SINK_GUARD::Bool = true
-
-@noinline function emit_token(a::Int64, b::Int64, c::Int64)
-    SINK_GUARD || return nothing
-    push!(TOKEN_SINK[], (a, b, c))
-    return nothing
-end
 
 @noinline function emit_node(a::Int64, b::Int64, c::Int64)
     SINK_GUARD || return nothing
@@ -63,29 +59,28 @@ _head_bits(h::JuliaSyntax.SyntaxHead) =
     Int64(reinterpret(UInt16, JuliaSyntax.kind(h))) |
     (Int64(JuliaSyntax.flags(h)) << 16)
 
-function parse_into(src::String)
-    ps = JuliaSyntax.ParseStream(src)
+_node_event(n::JuliaSyntax.RawGreenNode) =
+    (_head_bits(getfield(n, :head)),
+     Int64(getfield(n, :byte_span)),
+     Int64(getfield(n, :node_span_or_orig_kind)))
+
+# `vminor` selects the Julia syntax version v1.<vminor> (JuliaSyntax gates
+# parsing differences at 1.6/1.7/1.8/1.11/1.12/1.14)
+function parse_into(src::String, vminor::Int64)
+    ps = JuliaSyntax.ParseStream(src; version=VersionNumber(1, Int(vminor), 0))
     JuliaSyntax.parse!(ps; rule=:all)
-    for t in ps.tokens
-        emit_token(_head_bits(t.head),
-                   Int64(reinterpret(UInt16, t.orig_kind)) |
-                       (Int64(t.preceding_whitespace) << 16),
-                   Int64(t.next_byte))
+    out = ps.output
+    i = 2                          # output[1] is the cursor sentinel
+    while i <= length(out)
+        ev = _node_event(@inbounds out[i])
+        emit_node(ev[1], ev[2], ev[3])
+        i += 1
     end
-    for r in ps.ranges
-        emit_node(_head_bits(r.head), Int64(r.first_token), Int64(r.last_token))
-    end
-    return length(ps.tokens) * 1000000 + length(ps.ranges)
+    return Int64(length(out) - 1)
 end
 
-function native_events(src::String)
-    ps = JuliaSyntax.ParseStream(src)
+function native_events(src::String, vminor::Integer=14)
+    ps = JuliaSyntax.ParseStream(src; version=VersionNumber(1, Int(vminor), 0))
     JuliaSyntax.parse!(ps; rule=:all)
-    toks = [(_head_bits(t.head),
-             Int64(reinterpret(UInt16, t.orig_kind)) |
-                 (Int64(t.preceding_whitespace) << 16),
-             Int64(t.next_byte)) for t in ps.tokens]
-    rngs = [(_head_bits(r.head), Int64(r.first_token), Int64(r.last_token))
-            for r in ps.ranges]
-    return toks, rngs
+    return [_node_event(n) for n in ps.output[2:end]]
 end

@@ -4,7 +4,7 @@
 using WasmCodegen, WasmtimeRunner
 include(joinpath(@__DIR__, "parsedemo.jl"))
 
-comp = compile_wasm(parse_into, Tuple{String})
+comp = compile_wasm(parse_into, Tuple{String,Int64})
 println("module: ", length(comp.bytes), " bytes, ", length(comp.wmod.funcs),
         " funcs, ", length(comp.offloads), " offloads, ",
         length(comp.hostconsts), " host consts")
@@ -25,11 +25,10 @@ wf = inst[comp.entry]
 codec = string_codec(inst)
 WasmCodegen.string_bridge[] = codec
 
-function wasm_events(src::String)
-    empty!(TOKEN_SINK[])
+function wasm_events(src::String, vminor::Integer=14)
     empty!(NODE_SINK[])
-    wf(codec.fromstring(src))
-    return copy(TOKEN_SINK[]), copy(NODE_SINK[])
+    wf(codec.fromstring(src), Int64(vminor))
+    return copy(NODE_SINK[])
 end
 
 corpus = [
@@ -92,25 +91,51 @@ for src in corpus
         (sprint(showerror, e),)
     end
     if isequal(nat, was)
-        println("ok   ", length(nat[1]), " tokens, ", length(nat[2]),
-                " nodes: ", repr(first(src, 40)))
+        println("ok   ", length(nat), " events: ", repr(first(src, 40)))
     else
         global fails += 1
         println("FAIL ", repr(src))
-        if length(was) == 1
+        if was isa Tuple
             println("  wasm error: ", was[1])
         else
-            for (what, a, b) in (("token", nat[1], was[1]), ("node", nat[2], was[2]))
-                length(a) == length(b) ||
-                    println("  $what count: native ", length(a), " vs wasm ", length(b))
-                for (k, (x, y)) in enumerate(zip(a, b))
-                    isequal(x, y) ||
-                        (println("  first $what diff at ", k, ": ", x, " vs ", y); break)
-                end
+            length(nat) == length(was) ||
+                println("  event count: native ", length(nat), " vs wasm ", length(was))
+            for (k, (x, y)) in enumerate(zip(nat, was))
+                isequal(x, y) ||
+                    (println("  first diff at ", k, ": ", x, " vs ", y); break)
             end
         end
     end
 end
 println(fails == 0 ? "\nPARSER MATCHES NATIVE on all $(length(corpus)) inputs." :
         "\n$fails inputs disagree")
-exit(fails == 0 ? 0 : 1)
+
+# version-sensitive constructs across every syntax-version boundary
+# JuliaSyntax gates: 1.6, 1.7, 1.8, 1.11, 1.12, 1.14
+vcorpus = [
+    "import A as B",                       # 1.6
+    "@m{T}",                               # 1.6
+    "x .&& y",                             # 1.7
+    "[1 2;;; 3 4]",                        # 1.7
+    "struct S\n  const f\nend",            # 1.8
+    "try f() catch e; else g() end",       # 1.8
+    "[;;]",                                # 1.8
+    "public foo, bar",                     # 1.11
+    "function @f(x) end",                  # 1.12
+    "typegroup struct A end end",          # 1.14
+    "for i in 1:2\n  break outer\nend",    # 1.14 labeled break
+    "module A\nend",                       # 1.14 invisible VERSION token
+]
+vfails = 0
+for v in (5, 6, 7, 8, 11, 12, 14), src in vcorpus
+    nat = native_events(src, v)
+    was = wasm_events(src, v)
+    if !isequal(nat, was)
+        global vfails += 1
+        println("VFAIL v1.$v ", repr(src))
+    end
+end
+println(vfails == 0 ?
+        "VERSION MATRIX MATCHES NATIVE ($(length(vcorpus)) inputs × 7 versions)." :
+        "$vfails version cases disagree")
+exit(fails + vfails == 0 ? 0 : 1)

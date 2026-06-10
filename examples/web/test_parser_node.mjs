@@ -1,11 +1,11 @@
 // V8 differential check: run the wasm parser under Node and compare full
-// event streams (tokens + tree ranges) against the native streams recorded
-// by examples/parser/build_web.jl.
+// event streams (post-order RawGreenNode events) against the native streams
+// recorded by examples/parser/build_web.jl, across syntax versions.
 import { readFile } from "node:fs/promises";
 import { instantiateParser } from "./parser_host.mjs";
 import { KINDS } from "./parser_meta.js";
-import { buildTree, renderTokensHTML, collectBoxes, byteToCharMap }
-  from "./tree_render.mjs";
+import { buildTree, tokensFromEvents, renderTokensHTML, collectBoxes,
+         byteToCharMap } from "./tree_render.mjs";
 
 const dir = new URL(".", import.meta.url).pathname;
 const wasmBytes = await readFile(dir + "parser.wasm");
@@ -19,20 +19,21 @@ for (const [id, [nm]] of Object.entries(KINDS))
   if (nm === "TOMBSTONE") TOMBSTONE = Number(id);
 
 // the token highlighter must reproduce the source text exactly once markup
-// is stripped (the layer overlays the textarea, so any drift in text content
-// would misalign the editor); the 2D-box helpers must produce parents-first
-// boxes with in-bounds byte ranges that translate cleanly to char offsets
+// is stripped (the layer overlays the editor, so any drift in text content
+// would misalign it); the box helpers must produce parents-first boxes with
+// in-bounds byte ranges that translate cleanly to char offsets
 const stripped = (html) =>
   html.replace(/<[^>]*>/g, "").replace(/&lt;/g, "<").replace(/&amp;/g, "&");
-function renderRoundTrip(src, ev) {
+function renderRoundTrip(src, events) {
   const bytes = new TextEncoder().encode(src);
   const dec = new TextDecoder();
-  const roots = buildTree(ev.tokens, ev.nodes, TOMBSTONE);
-  const toks = renderTokensHTML(ev.tokens, bytes, dec, kindName, TOMBSTONE);
+  const tokens = tokensFromEvents(events);
+  const toks = renderTokensHTML(tokens, bytes, dec, kindName);
   if (stripped(toks) !== src) return false;
   const b2c = byteToCharMap(src);
   if (b2c.length !== bytes.length + 1 || b2c[bytes.length] !== src.length)
     return false;
+  const roots = buildTree(events, bytes.length, TOMBSTONE);
   const boxes = collectBoxes(roots, kindName);
   const open = []; // paint order must be a valid nesting walk
   for (const box of boxes) {
@@ -48,26 +49,23 @@ function renderRoundTrip(src, ev) {
 }
 
 let fails = 0;
-for (const { src, tokens, nodes } of expected) {
-  const got = parser.parse(src);
-  const okT = JSON.stringify(got.tokens) === JSON.stringify(tokens);
-  const okN = JSON.stringify(got.nodes) === JSON.stringify(nodes);
-  if (okT && okN && !renderRoundTrip(src, got)) {
+for (const { src, v, events } of expected) {
+  const got = parser.parse(src, v);
+  const ok = JSON.stringify(got.events) === JSON.stringify(events);
+  if (ok && !renderRoundTrip(src, got.events)) {
     fails++;
-    console.log(`FAIL render round-trip: ${JSON.stringify(src)}`);
-  } else if (okT && okN) {
-    console.log(`ok   ${tokens.length} tokens, ${nodes.length} nodes: ${JSON.stringify(src.slice(0, 40))}`);
+    console.log(`FAIL render round-trip (v1.${v}): ${JSON.stringify(src)}`);
+  } else if (ok) {
+    console.log(`ok   ${events.length} events (v1.${v}): ${JSON.stringify(src.slice(0, 40))}`);
   } else {
     fails++;
-    console.log(`FAIL ${JSON.stringify(src)}`);
-    for (const [what, exp, act] of [["token", tokens, got.tokens], ["node", nodes, got.nodes]]) {
-      if (exp.length !== act.length)
-        console.log(`  ${what} count: native ${exp.length} vs wasm ${act.length}`);
-      for (let i = 0; i < Math.min(exp.length, act.length); i++) {
-        if (JSON.stringify(exp[i]) !== JSON.stringify(act[i])) {
-          console.log(`  first ${what} diff at ${i + 1}: ${JSON.stringify(exp[i])} vs ${JSON.stringify(act[i])}`);
-          break;
-        }
+    console.log(`FAIL v1.${v} ${JSON.stringify(src)}`);
+    if (events.length !== got.events.length)
+      console.log(`  event count: native ${events.length} vs wasm ${got.events.length}`);
+    for (let i = 0; i < Math.min(events.length, got.events.length); i++) {
+      if (JSON.stringify(events[i]) !== JSON.stringify(got.events[i])) {
+        console.log(`  first diff at ${i + 1}: ${JSON.stringify(events[i])} vs ${JSON.stringify(got.events[i])}`);
+        break;
       }
     }
   }
