@@ -203,43 +203,68 @@ _reg!((fc, rt, args) -> emit_binop!(fc, "mul", rt, args), :mul_int)
 _reg!((fc, rt, args) -> emit_binop!(fc, "and", rt, args; norm=false), :and_int)
 _reg!((fc, rt, args) -> emit_binop!(fc, "or", rt, args; norm=false), :or_int)
 _reg!((fc, rt, args) -> emit_binop!(fc, "xor", rt, args), :xor_int)
-_reg!((fc, rt, args) -> emit_binop!(fc, "div_s", rt, args), :sdiv_int)
-_reg!(:checked_sdiv_int) do fc, rt, args
-    T, r = _intty(fc, args[1])
-    if !r.isfloat && r.signed && r.bits < 32
-        # i32.div_s only traps for the 32-bit typemin/-1 pair. The sub-word
-        # overflow (typemin(T) ÷ -1, which must raise DivideError in Julia)
-        # computes -typemin at i32 width and would silently wrap back to
-        # typemin under renormalization — guard it explicitly.
-        lo = Int32(r.bits == 8 ? -128 : -32768)
-        sa = scratch_local!(fc, I32)
-        sb = scratch_local!(fc, I32)
-        emit_value!(fc, args[1]); emit!(fc, local_set(sa))
-        emit_value!(fc, args[2]); emit!(fc, local_set(sb))
-        emit!(fc, local_get(sb), i32_const(-1), Inst(:i32_eq),
-              local_get(sa), i32_const(lo), Inst(:i32_eq), Inst(:i32_and), if_())
-        emit!(fc, unreachable(), end_())
-        emit!(fc, local_get(sa), local_get(sb), _op(I32, "div_s"))
-        emit_norm!(fc, rt)
+"""A Julia error point: catchable tag-throw inside try regions, trap outside."""
+function emit_trap_or_throw!(fc)
+    if fc.protected
+        emit!(fc, ref_null(AnyHT), throw_(0))
     else
-        # 32/64-bit overflow and ÷0 trap natively in wasm div_s
-        emit_binop!(fc, "div_s", rt, args)
+        emit!(fc, unreachable())
     end
 end
-# rem never overflows (typemin % -1 == 0 both natively and in wasm rem_s)
-_reg!((fc, rt, args) -> emit_binop!(fc, "rem_s", rt, args), :srem_int, :checked_srem_int)
 
-function _unsigned_divrem(name)
-    (fc, rt, args) -> begin
-        T, r = _intty(fc, args[1])
-        emit_value!(fc, args[1]); emit_zeroext!(fc, T)
-        emit_value!(fc, args[2]); emit_zeroext!(fc, T)
-        emit!(fc, _op(r.vt, name))
-        emit_norm!(fc, rt)
+"""
+Division/remainder with Julia's error semantics. Outside protected regions the
+native wasm traps (÷0, and typemin÷-1 for div_s at storage width) suffice;
+inside try/catch the conditions are guarded explicitly so they raise the
+catchable exception tag. Sub-word signed div overflow is always guarded (wasm
+computes at i32 width and would silently wrap under renormalization).
+"""
+function emit_div!(fc, rt, args, name::String, signed::Bool)
+    T, r = _intty(fc, args[1])
+    vt = r.vt
+    need_ovf = name == "div_s" && r.signed && (r.bits < 32 || fc.protected)
+    need_zero = fc.protected
+    if !(need_ovf || need_zero)
+        if signed
+            emit_binop!(fc, name, rt, args)
+        else
+            emit_value!(fc, args[1]); emit_zeroext!(fc, T)
+            emit_value!(fc, args[2]); emit_zeroext!(fc, T)
+            emit!(fc, _op(vt, name))
+            emit_norm!(fc, rt)
+        end
+        return
     end
+    sa = scratch_local!(fc, vt)
+    sb = scratch_local!(fc, vt)
+    emit_value!(fc, args[1]); signed || emit_zeroext!(fc, T); emit!(fc, local_set(sa))
+    emit_value!(fc, args[2]); signed || emit_zeroext!(fc, T); emit!(fc, local_set(sb))
+    if need_zero
+        emit!(fc, local_get(sb), _op(vt, "eqz"), if_())
+        emit_trap_or_throw!(fc)
+        emit!(fc, end_())
+    end
+    if need_ovf
+        lo = r.bits == 64 ? typemin(Int64) : r.bits == 32 ? Int64(typemin(Int32)) :
+             r.bits == 16 ? Int64(-32768) : Int64(-128)
+        emit!(fc, local_get(sb), _const(vt, -1), _op(vt, "eq"),
+              local_get(sa), _const(vt, lo), _op(vt, "eq"), Inst(:i32_and), if_())
+        emit_trap_or_throw!(fc)
+        emit!(fc, end_())
+    end
+    emit!(fc, local_get(sa), local_get(sb), _op(vt, name))
+    emit_norm!(fc, rt)
 end
-_reg!(_unsigned_divrem("div_u"), :udiv_int, :checked_udiv_int)
-_reg!(_unsigned_divrem("rem_u"), :urem_int, :checked_urem_int)
+
+_reg!((fc, rt, args) -> emit_div!(fc, rt, args, "div_s", true),
+      :sdiv_int, :checked_sdiv_int)
+# rem never overflows (typemin % -1 == 0 both natively and in wasm rem_s)
+_reg!((fc, rt, args) -> emit_div!(fc, rt, args, "rem_s", true),
+      :srem_int, :checked_srem_int)
+_reg!((fc, rt, args) -> emit_div!(fc, rt, args, "div_u", false),
+      :udiv_int, :checked_udiv_int)
+_reg!((fc, rt, args) -> emit_div!(fc, rt, args, "rem_u", false),
+      :urem_int, :checked_urem_int)
 
 _reg!(:neg_int) do fc, rt, args
     T, r = _intty(fc, args[1])

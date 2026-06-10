@@ -51,15 +51,18 @@ node examples/run_wasm.mjs /tmp/fib.wasm fib 20
   fields), mutable structs keep identity (`===` is `ref.eq`),
   `Union{Nothing,T}` becomes a nullable ref (`=== nothing` is `ref.is_null`) —
   enough for linked data structures
-- Julia exceptions ↔ wasm traps (`÷0`, overflow on conversion, explicit
-  throws trap at the equivalent program point)
+- **try/catch/finally via wasm-EH**: per-block `try_table` routing to the
+  innermost Julia handler; `÷0`, `typemin÷-1`, out-of-bounds, and explicit
+  throws are catchable inside `try` (and trap at the equivalent point outside)
 - **offloading**: untranslatable callees with scalar signatures become
   `"julia"` imports; `offload_imports(comp)` yields thunks the embedder binds
   (see `WasmCodegen/test/runtests.jl`), letting any frontier of the stack run
   in wasm while the rest stays native — the basis for differential testing
 
-Not yet: `Memory{T}`/`Array` (planned: GC arrays), `String`, abstract/union
-fields, dynamic dispatch, try/catch lowering to wasm-EH, closures as values.
+Not yet: binding the caught exception value (`catch e` with `e` used),
+exception propagation across compiled-function boundaries, `String` internals
+(byte access is pointer-based; needs an AbstractInterpreter overlay — strings
+flow as externrefs today), abstract/union fields, dynamic dispatch, closures.
 
 ## Testing strategy
 

@@ -51,12 +51,13 @@ mutable struct ModuleCompiler
     gcinfo::IdDict{Any,GCStructInfo}
     gcarrays::IdDict{Any,Int}                     # Memory{T} -> array typeidx
     gcmemrefs::IdDict{Any,Int}                    # MemoryRef{T} -> struct typeidx
+    eh_used::Bool                                 # some function has try/catch
 end
 ModuleCompiler() = ModuleCompiler(WasmModule(), Core.MethodInstance[],
                                   Dict(), Dict(), Dict(), Offload[], Dict(),
                                   Core.MethodInstance[], Dict(),
                                   SubType[], IdDict{Any,GCStructInfo}(),
-                                  IdDict{Any,Int}(), IdDict{Any,Int}())
+                                  IdDict{Any,Int}(), IdDict{Any,Int}(), false)
 
 # Types with special runtime layouts that must not lower as plain GC structs.
 const _SPECIAL_LAYOUT = Any[String, Symbol, Module, DataType, Core.MethodInstance,
@@ -299,6 +300,10 @@ mutable struct FuncCompiler
     scratch_used::Dict{ValType,Int}
     ssapair::Dict{Int,Tuple{Int,Int}}   # ssa idx -> (value, flag) locals for
                                         # checked-arithmetic tuple results
+    handlers::Vector{Tuple{Int,Int}}    # per block: innermost (catch_dest, enter_block),
+                                        # (0, 0) when unprotected
+    upsilons::Dict{Int,Tuple{Int,Int}}  # upsilon stmt idx -> (PhiC local, PhiC stmt idx)
+    protected::Bool                     # currently emitting inside a try region
 end
 
 emit!(fc::FuncCompiler, insts::Inst...) = append!(fc.body, insts)
@@ -411,6 +416,66 @@ function resolve_callee(fc::FuncCompiler, @nospecialize ref)
         return nothing
     end
     return ref
+end
+
+"""
+Compute, per basic block, the innermost enclosing exception handler as a
+`(catch_dest, enter_block)` pair (or `(0, 0)`), by propagating handler stacks
+along CFG edges. `EnterNode` terminators push; `:leave` statements pop.
+"""
+function compute_handlers!(fc::FuncCompiler)
+    ir = fc.ir
+    nblocks = length(ir.cfg.blocks)
+    fc.handlers = fill((0, 0), nblocks)
+    stacks = Vector{Union{Nothing,Vector{Tuple{Int,Int}}}}(nothing, nblocks)
+    stacks[1] = Tuple{Int,Int}[]
+    work = [1]
+    any_handler = false
+    while !isempty(work)
+        b = pop!(work)
+        S = stacks[b]::Vector{Tuple{Int,Int}}
+        fc.handlers[b] = isempty(S) ? (0, 0) : S[end]
+        any_handler |= !isempty(S)
+        out = copy(S)
+        rng = ir.cfg.blocks[b].stmts
+        term = stmt_at(fc, last(rng))
+        for i in rng
+            s = stmt_at(fc, i)
+            if s isa Expr && s.head === :leave
+                npop = count(a -> a !== nothing, s.args)
+                for _ in 1:npop
+                    isempty(out) && throw(CompileError("unbalanced :leave"))
+                    pop!(out)
+                end
+                # statements after the leave run unprotected; with per-block
+                # try_table granularity that is only sound if they cannot throw
+                for j in (i+1):last(rng)
+                    sj = stmt_at(fc, j)
+                    sj isa Union{Nothing,Core.GotoNode,Core.GotoIfNot,
+                                 Core.ReturnNode,Core.PhiNode,Core.PiNode,
+                                 Core.UpsilonNode} && continue
+                    sj isa Expr && sj.head in (:leave, :pop_exception,
+                                               :code_coverage_effect, :meta) && continue
+                    throw(CompileError("statement after :leave in the same block"))
+                end
+            end
+        end
+        for succ in ir.cfg.blocks[b].succs
+            S2 = out
+            if term isa Core.EnterNode
+                # fallthrough enters the protected region; the catch edge
+                # keeps the outer stack
+                S2 = succ == term.catch_dest ? out : vcat(out, [(term.catch_dest, b)])
+            end
+            if stacks[succ] === nothing
+                stacks[succ] = S2
+                push!(work, succ)
+            elseif stacks[succ] != S2
+                throw(CompileError("inconsistent handler stacks at block $succ"))
+            end
+        end
+    end
+    return any_handler
 end
 
 """Does the rest of basic block `b` (from stmt `i`) inevitably throw?"""
@@ -593,7 +658,7 @@ function emit_memorynew!(fc::FuncCompiler, i::Int, args)
     n = scratch_local!(fc, I64)
     emit_value!(fc, args[2])
     emit!(fc, local_tee(n), i64_const(typemax(Int32)), Inst(:i64_gt_u), if_())
-    emit!(fc, unreachable())     # negative or absurd size: Julia throws
+    emit_trap_or_throw!(fc)      # negative or absurd size: Julia throws
     emit!(fc, end_())
     emit!(fc, local_get(n), Inst(:i32_wrap_i64), array_new_default(arr))
     return true
@@ -633,7 +698,7 @@ function emit_memoryrefnew!(fc::FuncCompiler, i::Int, args)
     # trap unless 0 <= newidx <= len (one-past-end refs are legal, access traps)
     emit!(fc, local_get(mem), array_len(),
           Inst(:i64_extend_i32_u), Inst(:i64_gt_u), if_())
-    emit!(fc, unreachable())
+    emit_trap_or_throw!(fc)
     emit!(fc, end_())
     emit!(fc, local_get(mem),
           local_get(ix), Inst(:i32_wrap_i64), struct_new(mref))
@@ -809,6 +874,16 @@ function emit_stmt!(fc::FuncCompiler, b::Int, i::Int)
 
     s === nothing && return true
     s isa Core.PhiNode && return true                  # handled on edges
+    s isa Core.PhiCNode && return true                 # value lives in its local
+    if s isa Core.UpsilonNode
+        # writes the corresponding PhiC's local (exception-edge dataflow)
+        if haskey(fc.upsilons, i) && isdefined(s, :val)
+            loc, phicidx = fc.upsilons[i]
+            emit_value_typed!(fc, s.val, type_at(fc, phicidx))
+            emit!(fc, local_set(loc))
+        end
+        return true
+    end
     if s isa Core.PiNode
         fc.ssalocal[i] >= 0 || return true
         Tto = type_at(fc, i)
@@ -833,9 +908,12 @@ function emit_stmt!(fc::FuncCompiler, b::Int, i::Int)
 
     ex = s::Expr
     if ex.head in (:code_coverage_effect, :meta, :inbounds, :loopinfo,
-                   :gc_preserve_begin, :gc_preserve_end, :aliasscope, :popaliasscope)
+                   :gc_preserve_begin, :gc_preserve_end, :aliasscope, :popaliasscope,
+                   :leave, :pop_exception)
         return true
     end
+    ex.head === :the_exception &&
+        throw(CompileError("binding the exception value is not yet supported"))
     if ex.head === :boundscheck
         if fc.ssalocal[i] >= 0
             emit!(fc, i32_const(1), local_set(fc.ssalocal[i]))
@@ -850,9 +928,10 @@ function emit_stmt!(fc::FuncCompiler, b::Int, i::Int)
         return true
     end
     if ex.head === :call || ex.head === :invoke || ex.head === :new
-        # statements that cannot return: evaluate as a trap point
+        # statements that cannot return: throw (catchable) inside protected
+        # regions, trap otherwise
         if rt === Union{}
-            emit!(fc, unreachable())
+            emit_throwpoint!(fc, b)
             return false
         end
         pushed = try
@@ -867,9 +946,9 @@ function emit_stmt!(fc::FuncCompiler, b::Int, i::Int)
             end
         catch err
             err isa CompileError || rethrow()
-            # if this block inevitably throws later, trapping here is sound
+            # if this block inevitably throws later, raising here is sound
             if block_throws_after(fc, b, i)
-                emit!(fc, unreachable())
+                emit_throwpoint!(fc, b)
                 return false
             end
             rethrow()
@@ -886,10 +965,24 @@ function emit_stmt!(fc::FuncCompiler, b::Int, i::Int)
         return true
     end
     if block_throws_after(fc, b, i)
-        emit!(fc, unreachable())
+        emit_throwpoint!(fc, b)
         return false
     end
     throw(CompileError("unsupported statement at %$i: $(ex.head)"))
+end
+
+"""
+A point where Julia would raise an exception: throw the module's exception tag
+(catchable by an enclosing handler in the same function) when the block is
+protected, else trap. The exception *value* is not materialized yet (payload
+is null); handlers that bind it are rejected at `:the_exception`.
+"""
+function emit_throwpoint!(fc::FuncCompiler, b::Int)
+    if fc.handlers[b][1] != 0
+        emit!(fc, ref_null(AnyHT), throw_(0))
+    else
+        emit!(fc, unreachable())
+    end
 end
 
 """Emit the phi moves for the edge `src -> dst` (parallel-copy via the stack)."""
@@ -928,6 +1021,29 @@ function emit_return!(fc::FuncCompiler, node::Core.ReturnNode)
 end
 
 function emit_block!(fc::FuncCompiler, b::Int)
+    h, eb = fc.handlers[b]
+    fc.protected = h != 0
+    if h != 0
+        # protected region: wrap the block in a try_table whose catch routes
+        # to the innermost Julia handler via the dispatcher
+        emit!(fc, block(RefType(true, AnyHT)))
+        emit!(fc, try_table(nothing, [Catch(0x00, 0, 0)]))
+        fc.depth += 2
+    end
+    _emit_block_body!(fc, b)
+    fc.protected = false
+    if h != 0
+        fc.depth -= 2
+        emit!(fc, end_())          # try_table (body always branches away)
+        emit!(fc, unreachable())
+        emit!(fc, end_())          # catch target: payload on stack
+        emit!(fc, drop())          # exception value binding unsupported (v1)
+        emit_phi_moves!(fc, eb, h) # catch-header phis see the enter edge
+        emit_goto!(fc, h)
+    end
+end
+
+function _emit_block_body!(fc::FuncCompiler, b::Int)
     blk = fc.ir.cfg.blocks[b]
     rng = blk.stmts
     for i in rng
@@ -936,6 +1052,12 @@ function emit_block!(fc::FuncCompiler, b::Int)
         if s isa Core.GotoNode
             emit_phi_moves!(fc, b, s.label)
             emit_goto!(fc, s.label)
+            return
+        elseif s isa Core.EnterNode
+            isdefined(s, :scope) && s.scope !== nothing &&
+                throw(CompileError("scoped :enter (try with scope) unsupported"))
+            emit_phi_moves!(fc, b, b + 1)
+            emit_goto!(fc, b + 1)
             return
         elseif s isa Core.GotoIfNot
             fall, dest = b + 1, s.dest
@@ -971,7 +1093,8 @@ function compile_function(mc::ModuleCompiler, mi::Core.MethodInstance)
 
     fc = FuncCompiler(mc, ir, rettype, 0, fill(-1, nargs), Int[], ValType[],
                       Inst[], 0, -1, Dict{ValType,Vector{Int}}(), Dict{ValType,Int}(),
-                      Dict{Int,Tuple{Int,Int}}())
+                      Dict{Int,Tuple{Int,Int}}(), Tuple{Int,Int}[],
+                      Dict{Int,Tuple{Int,Int}}(), false)
 
     # parameter layout
     params = ValType[]
@@ -1022,6 +1145,22 @@ function compile_function(mc::ModuleCompiler, mi::Core.MethodInstance)
         fc.ssalocal[i] = newlocal!(fc, vt)
     end
     fc.nextlocal = newlocal!(fc, I32)
+
+    # exception-handler regions and upsilon -> PhiC local routing
+    if compute_handlers!(fc)
+        mc.eh_used = true
+    end
+    for i in 1:nst
+        s = stmt_at(fc, i)
+        s isa Core.PhiCNode || continue
+        loc = fc.ssalocal[i]
+        loc >= 0 || continue
+        for k in 1:length(s.values)
+            isassigned(s.values, k) || continue
+            v = s.values[k]
+            v isa Core.SSAValue && (fc.upsilons[v.id] = (loc, i))
+        end
+    end
 
     nblocks = length(ir.cfg.blocks)
     # entry blocks have no phis by construction
@@ -1146,6 +1285,12 @@ function compile_wasm(@nospecialize(f), @nospecialize(argtypes::Type{<:Tuple});
     # GC struct types occupy indices [0, N) as a single rec group, registered
     # before any function-signature types
     isempty(mc.gctypes) || push!(mc.wmod.types, RecGroup(mc.gctypes))
+
+    # the module-wide Julia exception tag (anyref payload), tag index 0
+    if mc.eh_used
+        tagft = addtype!(mc.wmod, FuncType(ValType[RefType(true, AnyHT)], ValType[]))
+        push!(mc.wmod.tags, TagType(tagft))
+    end
 
     # assign final indices: offload imports first, then compiled funcs
     nimports = length(offloads)

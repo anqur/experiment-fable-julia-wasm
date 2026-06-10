@@ -663,3 +663,62 @@ end
     trc64(x) = trunc(Int64, x)
     @difftest trc64 Tuple{Float64} [(2.9,), (-2.9,), (NaN,), (1e300,)]
 end
+
+# --- try/catch/finally via wasm exception handling ------------------------------
+
+function safediv(a::Int64, b::Int64)
+    try
+        return a ÷ b
+    catch
+        return Int64(-999)
+    end
+end
+function nested_try(n::Int64)
+    acc = 0
+    for i in 1:n
+        try
+            acc += i == 3 ? error("three") : i
+        catch
+            acc += 100
+        end
+    end
+    return acc
+end
+function finallyfn(n::Int64)
+    acc = 0
+    try
+        acc = n * 2
+        n > 5 && throw(ArgumentError("big"))
+        acc += 1
+    finally
+        acc += 1000
+    end
+    return acc
+end
+function safeidx(i::Int64)
+    m = Memory{Int64}(undef, 3)
+    for k in 1:3; m[k] = 10k; end
+    try
+        return m[i]
+    catch
+        return Int64(-1)
+    end
+end
+function tryphi(n::Int64)
+    local x
+    try
+        x = n > 0 ? n * 2 : error("neg")
+        x += 1
+    catch
+        x = -n
+    end
+    return x
+end
+
+@testset "try/catch via wasm-EH" begin
+    @difftest safediv Tuple{Int64,Int64} [(7, 2), (7, 0), (typemin(Int64), -1), (0, 5)]
+    @difftest nested_try Tuple{Int64} [(0,), (2,), (5,), (10,)]
+    @difftest finallyfn Tuple{Int64} [(1,), (5,), (10,)]
+    @difftest safeidx Tuple{Int64} [(1,), (3,), (0,), (99,), (typemin(Int64),)]
+    @difftest tryphi Tuple{Int64} [(5,), (-3,), (0,)]
+end
