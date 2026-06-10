@@ -21,32 +21,21 @@
   #modebar input { accent-color: #654ff0; margin-right: .3rem; }
   #panes { display: flex; gap: 1rem; align-items: flex-start; flex-wrap: wrap; }
   #editor-wrap {
-    position: relative; flex: 1 1 30rem; min-width: 24rem;
+    flex: 1 1 34rem; min-width: 26rem;
     border: 1px solid #d0d7de; border-radius: 8px; background: #ffffff;
-  }
-  #highlight, #input {
-    box-sizing: border-box; width: 100%; min-height: 26rem; margin: 0;
-    padding: 1rem; border: 0;
-    font: 14px/1.7 ui-monospace, "JuliaMono", "SF Mono", Menlo, Consolas, monospace;
-    white-space: pre-wrap; word-break: break-all; overflow-wrap: anywhere;
-    tab-size: 4;
-  }
-  #highlight {
-    position: absolute; inset: 0; pointer-events: none; color: #1f2328;
     overflow: hidden;
   }
-  #input {
-    position: relative; background: transparent; color: transparent;
-    caret-color: #1f2328; resize: vertical; outline: none; display: block;
-  }
-  /* token mode: one light color per token, cycling */
-  .c0 { background: #ffd6d6; } .c1 { background: #ffe7b8; }
-  .c2 { background: #fdf3a9; } .c3 { background: #c9f2c5; }
-  .c4 { background: #c5e8f7; } .c5 { background: #e4d5f7; }
-  span[data-tok] { border-radius: 3px; }
-  .tok-error { background: #d73a49; color: #ffffff; }
-  /* tree mode: 2D bounding boxes (absolutely positioned rectangles measured
-     from DOM ranges, drawn behind the text), depth-cycled colors */
+  #editor { height: 30rem; }
+  /* token mode: one light color per token, cycling (monaco inline decorations) */
+  .monaco-editor .c0 { background: #ffd6d6; border-radius: 3px; }
+  .monaco-editor .c1 { background: #ffe7b8; border-radius: 3px; }
+  .monaco-editor .c2 { background: #fdf3a9; border-radius: 3px; }
+  .monaco-editor .c3 { background: #c9f2c5; border-radius: 3px; }
+  .monaco-editor .c4 { background: #c5e8f7; border-radius: 3px; }
+  .monaco-editor .c5 { background: #e4d5f7; border-radius: 3px; }
+  .monaco-editor .tok-error { background: #d73a49; color: #ffffff !important; }
+  /* tree mode: 2D bounding boxes drawn into monaco's scrolled content */
+  #treeboxes { position: absolute; top: 0; left: 0; pointer-events: none; }
   .bb {
     position: absolute; box-sizing: border-box; border-radius: 4px;
     border: 1.5px solid; pointer-events: none;
@@ -100,9 +89,24 @@
   <label><input type="radio" name="hlmode" value="tree">parse-tree boxes</label>
 </div>
 <div id="panes">
-  <div id="editor-wrap">
-    <pre id="highlight" aria-hidden="true"></pre>
-    <textarea id="input" spellcheck="false">function mandel(z::Complex)
+  <div id="editor-wrap"><div id="editor"></div></div>
+  <div id="tree-wrap"><ul id="tree"></ul></div>
+</div>
+<script type="module">
+import { instantiateParser } from "./parser_host.mjs";
+import { KINDS } from "./parser_meta.js";
+import { esc, buildTree, byteToCharMap, isErrName, isExtentSkipName,
+         isDelimName } from "./tree_render.mjs";
+
+const treeEl = document.getElementById("tree");
+const status = document.getElementById("status");
+
+const kindName = (id) => (KINDS[id] ?? [String(id)])[0];
+let TOMBSTONE = -1;
+for (const [id, [nm]] of Object.entries(KINDS))
+  if (nm === "TOMBSTONE") TOMBSTONE = Number(id);
+
+const SAMPLE = `function mandel(z::Complex)
     c = z
     for n in 1:80
         abs2(z) ≥ 4.0 && return n - 1
@@ -111,26 +115,48 @@
     return 80
 end
 
-s = "interpolate: $(mandel(0.3 + 0.5im))"
-@show s</textarea>
-  </div>
-  <div id="tree-wrap"><ul id="tree"></ul></div>
-</div>
-<script type="module">
-import { instantiateParser } from "./parser_host.mjs";
-import { KINDS } from "./parser_meta.js";
-import { esc, buildTree, renderTokensHTML, byteToCharMap, isErrName,
-         isExtentSkipName, isDelimName } from "./tree_render.mjs";
+s = "interpolate: \$(mandel(0.3 + 0.5im))"
+@show s`;
 
-const input = document.getElementById("input");
-const highlight = document.getElementById("highlight");
-const treeEl = document.getElementById("tree");
-const status = document.getElementById("status");
+// --- monaco (CDN AMD loader) -------------------------------------------------
+const MONACO = "https://cdn.jsdelivr.net/npm/monaco-editor@0.52.2/min/vs";
+self.MonacoEnvironment = {
+  getWorkerUrl: () => URL.createObjectURL(new Blob(
+    [`self.MonacoEnvironment={baseUrl:'${MONACO}/'};importScripts('${MONACO}/base/worker/workerMain.js');`],
+    { type: "text/javascript" })),
+};
+await new Promise((res, rej) => {
+  const s = document.createElement("script");
+  s.src = MONACO + "/loader.js";
+  s.onload = res;
+  s.onerror = rej;
+  document.head.append(s);
+});
+require.config({ paths: { vs: MONACO } });
+await new Promise((res) => require(["vs/editor/editor.main"], res));
 
-const kindName = (id) => (KINDS[id] ?? [String(id)])[0];
-let TOMBSTONE = -1;
-for (const [id, [nm]] of Object.entries(KINDS))
-  if (nm === "TOMBSTONE") TOMBSTONE = Number(id);
+const editor = monaco.editor.create(document.getElementById("editor"), {
+  value: SAMPLE,
+  language: "plaintext",        // our wasm parser does the highlighting
+  theme: "vs",
+  fontFamily: 'ui-monospace, "JuliaMono", "SF Mono", Menlo, Consolas, monospace',
+  fontSize: 14,
+  lineHeight: 24,
+  minimap: { enabled: false },
+  wordWrap: "off",
+  scrollBeyondLastLine: false,
+  renderLineHighlight: "none",
+  guides: { indentation: false },
+  folding: false,
+  occurrencesHighlight: "off",
+  selectionHighlight: false,
+  matchBrackets: "never",
+  unicodeHighlight: { ambiguousCharacters: false },
+  padding: { top: 10, bottom: 10 },
+  automaticLayout: true,
+});
+const model = editor.getModel();
+const decorations = editor.createDecorationsCollection([]);
 
 let parser = null;
 try {
@@ -145,7 +171,7 @@ try {
 function renderNode(node, bytes, dec) {
   const kind = node.head & 0xffff;
   const name = kindName(kind);
-  const isErr = name.startsWith("Error") || name === "error";
+  const isErr = isErrName(name);
   const isTrivia = name === "Whitespace" || name === "NewlineWs" || name === "Comment";
   const range = `<span class="range">[${node.a}:${node.b}]</span>`;
   if (node.leaf) {
@@ -161,32 +187,73 @@ function renderNode(node, bytes, dec) {
 }
 
 let mode = "tokens";
-let cached = null;   // { ev, text, bytes, roots } for re-render on toggle/resize
+let cached = null;   // { ev, text, bytes, b2c, roots }
 
-// 2D boxes: plain text goes into the layer; each non-trivia leaf token is
-// measured once with a DOM Range, and every interior node's box is the
-// UNION of its descendant leaf rects (a single multi-line Range would
-// include full intermediate line boxes and leading indentation, bloating
-// the box). Rectangles are drawn behind the text — parents painted first,
-// enclosing boxes outset by tree height so coincident extents nest visibly.
-function renderBoxesMode() {
-  const { text, roots } = cached;
-  highlight.replaceChildren();
-  const boxdiv = document.createElement("div");
-  const span = document.createElement("span");
-  span.textContent = text + "\n";
-  highlight.append(boxdiv, span);
-  const tnode = span.firstChild;
-  const b2c = byteToCharMap(text);
-  const preRect = highlight.getBoundingClientRect();
-  const range = document.createRange();
-  const measure = (a, b) => {       // 1-based inclusive byte range
-    const cs = b2c[a - 1];
-    range.setStart(tnode, cs);
-    range.setEnd(tnode, Math.max(b2c[b], cs));
-    const r = range.getBoundingClientRect();
-    return { left: r.left, top: r.top, right: r.right, bottom: r.bottom };
-  };
+// --- token mode: monaco inline decorations -----------------------------------
+function tokenDecorations() {
+  const { ev, b2c } = cached;
+  const out = [];
+  let ci = 0;
+  for (let i = 2; i <= ev.tokens.length; i++) {
+    const [head, , nextByte] = ev.tokens[i - 1];
+    const kind = head & 0xffff;
+    const name = kindName(kind);
+    const a = ev.tokens[i - 2][2], b = nextByte - 1;
+    if (kind === TOMBSTONE || name === "EndMarker" || b < a) continue;
+    const isWs = name === "Whitespace" || name === "NewlineWs";
+    let cls = "";
+    if (isErrName(name)) cls = "tok-error";
+    else if (!isWs) cls = "c" + (ci++ % 6);
+    if (!cls) continue;
+    const s = model.getPositionAt(b2c[a - 1]);
+    const e = model.getPositionAt(b2c[b]);
+    out.push({
+      range: new monaco.Range(s.lineNumber, s.column, e.lineNumber, e.column),
+      options: { inlineClassName: cls, hoverMessage: { value: name } },
+    });
+  }
+  return out;
+}
+
+// --- tree mode: 2D boxes in monaco's scrolled content -------------------------
+function boxLayer() {
+  const host = editor.getDomNode().querySelector(".lines-content");
+  let layer = host.querySelector("#treeboxes");
+  if (!layer) {
+    layer = document.createElement("div");
+    layer.id = "treeboxes";
+    host.appendChild(layer);
+  }
+  return layer;
+}
+
+// content-space rect of a byte range (1-based inclusive); multi-line ranges
+// union their per-line extents (tokens only — boxes union these further).
+// Vertically inset from the full line box toward the glyph ink, so boxes on
+// consecutive lines don't touch (outsets re-expand them by nesting depth).
+function measureRange(a, b) {
+  const { b2c } = cached;
+  const lineH = editor.getOption(monaco.editor.EditorOption.lineHeight);
+  const fontSize = editor.getOption(monaco.editor.EditorOption.fontSize);
+  const vinset = Math.max(Math.floor((lineH - fontSize) / 2) - 1, 0);
+  const s = model.getPositionAt(b2c[a - 1]);
+  const e = model.getPositionAt(Math.max(b2c[b], b2c[a - 1]));
+  let left = Infinity, right = -Infinity;
+  for (let ln = s.lineNumber; ln <= e.lineNumber; ln++) {
+    const c1 = ln === s.lineNumber ? s.column : 1;
+    const c2 = ln === e.lineNumber ? e.column : model.getLineMaxColumn(ln);
+    left = Math.min(left, editor.getOffsetForColumn(ln, c1));
+    right = Math.max(right, editor.getOffsetForColumn(ln, c2));
+  }
+  return { left, right,
+           top: editor.getTopForLineNumber(s.lineNumber) + vinset,
+           bottom: editor.getTopForLineNumber(e.lineNumber) + lineH - vinset };
+}
+
+function renderBoxes() {
+  const { text, b2c, roots } = cached;
+  const layer = boxLayer();
+  layer.replaceChildren();
   const union = (u, v) =>
     v === null ? u : u === null ? { ...v } : {
       left: Math.min(u.left, v.left), top: Math.min(u.top, v.top),
@@ -198,7 +265,7 @@ function renderBoxesMode() {
     const err = isErrName(name);
     if (node.leaf) {
       if (isExtentSkipName(name) && !err) return { h: 0, u: null, lo: 0, hi: 0 };
-      const u = measure(node.a, node.b);
+      const u = measureRange(node.a, node.b);
       if (err) {
         entries.push({ u: { ...u }, depth, height: 0, err, name,
                        lo: node.a, hi: node.b });
@@ -226,7 +293,7 @@ function renderBoxesMode() {
     entry.height = h;
     if (u === null) {
       // all-trivia node (e.g. an empty block): fall back to its full range
-      u = node.b >= node.a ? measure(node.a, node.b) : null;
+      u = node.b >= node.a ? measureRange(node.a, node.b) : null;
       lo = node.a;
       hi = node.b;
     }
@@ -236,7 +303,7 @@ function renderBoxesMode() {
     return { h, u, lo, hi };
   }
   for (const r of roots) rec(r, 0);
-  const lineH = parseFloat(getComputedStyle(highlight).lineHeight);
+  const lineH = editor.getOption(monaco.editor.EditorOption.lineHeight);
   const spacey = (c) =>
     c === undefined || c === " " || c === "\n" || c === "\t";
   for (const e of entries) {
@@ -244,34 +311,35 @@ function renderBoxesMode() {
     const pad = Math.min(e.height, 3) + 1;
     // horizontal outset only into whitespace: a single-line box knows
     // exactly which characters flank it — when the neighbor is a glyph
-    // (e.g. the $ before an interpolation's parens), keep the edge tight
+    // (e.g. the $ before an interpolation's parens, or adjacent tokens in
+    // z^2), the edge stays flush so neighboring boxes share one seam
     const oneLine = e.u.bottom - e.u.top < 1.5 * lineH;
-    const padL = !oneLine || spacey(text[b2c[e.lo - 1] - 1]) ? pad : 1;
-    const padR = !oneLine || spacey(text[b2c[e.hi]]) ? pad : 1;
+    const padL = !oneLine || spacey(text[b2c[e.lo - 1] - 1]) ? pad : 0;
+    const padR = !oneLine || spacey(text[b2c[e.hi]]) ? pad : 0;
     const d = document.createElement("div");
     d.className = e.err ? "bb bb-err" : e.leaf ? "bb bb-leaf" : `bb b${e.depth % 6}`;
     d.title = e.name;
-    d.style.left = (e.u.left - preRect.left + highlight.scrollLeft - padL) + "px";
-    d.style.top = (e.u.top - preRect.top + highlight.scrollTop - pad) + "px";
+    d.style.left = (e.u.left - padL) + "px";
+    d.style.top = (e.u.top - pad) + "px";
     d.style.width = (Math.max(e.u.right - e.u.left, 3) + padL + padR) + "px";
     d.style.height = (e.u.bottom - e.u.top + 2 * pad) + "px";
-    boxdiv.appendChild(d);
+    layer.appendChild(d);
   }
 }
 
-function renderHighlight() {
+function applyHighlight() {
   if (!cached) return;
   if (mode === "tokens") {
-    const { ev, bytes } = cached;
-    highlight.innerHTML =
-      renderTokensHTML(ev.tokens, bytes, new TextDecoder(), kindName, TOMBSTONE) + "\n";
+    boxLayer().replaceChildren();
+    decorations.set(tokenDecorations());
   } else {
-    renderBoxesMode();
+    decorations.set([]);
+    renderBoxes();
   }
 }
 
 function render() {
-  const text = input.value;
+  const text = model.getValue();
   const bytes = new TextEncoder().encode(text);
   const dec = new TextDecoder();
   const t0 = performance.now();
@@ -284,25 +352,22 @@ function render() {
   }
   const dt = (performance.now() - t0).toFixed(1);
   const roots = buildTree(ev.tokens, ev.nodes, TOMBSTONE);
-  cached = { ev, text, bytes, roots };
-  renderHighlight();
+  cached = { ev, text, bytes, b2c: byteToCharMap(text), roots };
+  applyHighlight();
   treeEl.innerHTML = roots.map((r) => renderNode(r, bytes, dec)).join("");
   status.textContent =
     `${ev.tokens.length} tokens, ${ev.nodes.length} tree nodes in ${dt} ms (wasm)`;
 }
 
-input.addEventListener("input", render);
-input.addEventListener("scroll", () => {
-  highlight.scrollTop = input.scrollTop;
-});
+editor.onDidChangeModelContent(render);
+// box geometry depends on layout (font load, container resize)
+editor.onDidLayoutChange(() => { mode === "tree" && applyHighlight(); });
 for (const r of document.querySelectorAll('input[name="hlmode"]')) {
   r.addEventListener("change", () => {
     mode = r.value;
-    renderHighlight();
+    applyHighlight();
   });
 }
-// box positions depend on line wrapping: re-measure when the editor resizes
-new ResizeObserver(() => { mode === "tree" && renderHighlight(); }).observe(input);
 render();
 </script>
 </body>
