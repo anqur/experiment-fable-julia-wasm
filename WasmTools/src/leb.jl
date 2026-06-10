@@ -28,35 +28,52 @@ function write_sleb(io::IO, x::Integer)
     end
 end
 
-"""Read an unsigned LEB128 of at most `maxbits` bits."""
+"""
+Read an unsigned LEB128 of at most `maxbits` bits. Per the spec, the encoding
+may use at most `ceil(maxbits/7)` bytes and any unused bits of the final byte
+must be zero.
+"""
 function read_uleb(io::IO, maxbits::Integer=64)
     result = UInt64(0)
     shift = 0
+    nmax = 7 * cld(maxbits, 7)   # total payload bits in ceil(maxbits/7) bytes
     while true
+        shift < nmax || throw(MalformedError("unsigned LEB128 too long"))
         b = read(io, UInt8)
         result |= UInt64(b & 0x7f) << shift
         shift += 7
         if (b & 0x80) == 0
-            shift > maxbits + 7 && throw(MalformedError("unsigned LEB128 too long"))
-            result < (maxbits >= 64 ? typemax(UInt64) : UInt64(1) << maxbits) ||
-                maxbits >= 64 || throw(MalformedError("unsigned LEB128 exceeds $maxbits bits"))
+            # Unused bits of the final byte must be zero.
+            shift > maxbits && b >> (maxbits - shift + 7) != 0 &&
+                throw(MalformedError("unsigned LEB128 exceeds $maxbits bits"))
             return result
         end
-        shift > 70 && throw(MalformedError("unsigned LEB128 too long"))
     end
 end
 
-"""Read a signed LEB128 of at most `maxbits` bits (e.g. 32, 33, 64)."""
-function read_sleb(io::IO, maxbits::Integer=64)
-    result = Int64(0)
-    shift = 0
-    local b::UInt8
-    while true
+"""
+Read a signed LEB128 of at most `maxbits` bits whose first byte `b0` has
+already been consumed. Enforces the spec limits: at most `ceil(maxbits/7)`
+bytes, and the unused bits of the final byte must be a sign extension.
+"""
+function read_sleb_first(io::IO, b0::UInt8, maxbits::Integer)
+    result = Int64(b0 & 0x7f)
+    shift = 7
+    nmax = 7 * cld(maxbits, 7)
+    b = b0
+    while (b & 0x80) != 0
+        shift < nmax || throw(MalformedError("signed LEB128 too long"))
         b = read(io, UInt8)
         result |= Int64(b & 0x7f) << shift
         shift += 7
-        (b & 0x80) == 0 && break
-        shift > 70 && throw(MalformedError("signed LEB128 too long"))
+    end
+    if shift > maxbits
+        # The final byte carries `used` value bits; the bits above them must
+        # all equal the sign bit (the topmost value bit).
+        used = maxbits - shift + 7
+        sign = (b >> (used - 1)) & 0x01
+        (b & 0x7f) >> used == (sign == 0x01 ? 0x7f >> used : 0x00) ||
+            throw(MalformedError("signed LEB128 exceeds $maxbits bits"))
     end
     # Sign-extend from the final group.
     if shift < 64 && (b & 0x40) != 0
@@ -64,6 +81,9 @@ function read_sleb(io::IO, maxbits::Integer=64)
     end
     return result
 end
+
+"""Read a signed LEB128 of at most `maxbits` bits (e.g. 32, 33, 64)."""
+read_sleb(io::IO, maxbits::Integer=64) = read_sleb_first(io, read(io, UInt8), maxbits)
 
 read_u32(io::IO) = UInt32(read_uleb(io, 32))
 read_s33(io::IO) = read_sleb(io, 33)

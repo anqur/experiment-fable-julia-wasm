@@ -4,6 +4,7 @@ function read_name_str(io::IO)
     len = read_uleb(io, 32)
     bytes = read(io, len)
     length(bytes) == len || throw(MalformedError("truncated name"))
+    isvalid(String, bytes) || throw(MalformedError("malformed UTF-8 name"))
     return String(bytes)
 end
 
@@ -15,7 +16,12 @@ end
 const _NUMTYPE_BYTES = (0x7F, 0x7E, 0x7D, 0x7C, 0x7B)
 const _ABSHT_BYTES = (0x69, 0x6A, 0x6B, 0x6C, 0x6D, 0x6E, 0x6F, 0x70, 0x71, 0x72, 0x73, 0x74)
 
-read_heaptype(io::IO) = HeapType(read_s33(io))
+function read_heaptype(io::IO)
+    code = read_s33(io)
+    code >= 0 || haskey(ABSTRACT_HEAPTYPE_NAMES, code) ||
+        throw(MalformedError("invalid heap type $code"))
+    return HeapType(code)
+end
 
 """Finish reading a valtype whose first byte `b` has been consumed."""
 function read_valtype_first(io::IO, b::UInt8)
@@ -79,23 +85,6 @@ end
 
 read_globaltype(io::IO) = GlobalType(read_valtype(io), read(io, UInt8) != 0)
 
-"""Read a signed LEB whose first byte has already been consumed."""
-function read_sleb_first(io::IO, b0::UInt8, maxbits::Integer)
-    result = Int64(b0 & 0x7f)
-    shift = 7
-    b = b0
-    while (b & 0x80) != 0
-        b = read(io, UInt8)
-        result |= Int64(b & 0x7f) << shift
-        shift += 7
-        shift > 70 && throw(MalformedError("signed LEB128 too long"))
-    end
-    if shift < 64 && (b & 0x40) != 0
-        result |= -(Int64(1) << shift)
-    end
-    return result
-end
-
 function read_blocktype(io::IO)
     b = read(io, UInt8)
     b == 0x40 && return nothing
@@ -108,6 +97,7 @@ end
 
 function read_memarg(io::IO)
     align = read_u32(io)
+    align < 0x80 || throw(MalformedError("malformed memarg alignment flags"))
     memidx = UInt32(0)
     if align & (UInt32(1) << 6) != 0
         align &= ~(UInt32(1) << 6)
@@ -127,8 +117,6 @@ function read_imm(io::IO, kind::Symbol)
     kind === :memarg && return read_memarg(io)
     kind === :blocktype && return read_blocktype(io)
     kind === :heaptype && return read_heaptype(io)
-    kind === :reftype && return (rt = read_valtype(io); rt isa RefType ? rt :
-        throw(MalformedError("expected reftype")))
     kind === :valtypevec && return read_vec(read_valtype, io)
     kind === :u8 && return read(io, UInt8)
     kind === :catchvec && return read_vec(io) do io
@@ -216,7 +204,9 @@ function read_elem(io::IO)
         end
         init = read_vec(read_expr, io)
     end
-    return Elem(mode, tableidx, offset, reftype, init)
+    return Elem(mode, tableidx, offset, reftype, init,
+                (flag & 0x04) != 0,                       # exprform
+                mode === :active && (flag & 0x02) != 0)   # explicit_tableidx
 end
 
 function read_data(io::IO)
@@ -257,6 +247,10 @@ end
 
 function read_name_custom!(io::IO, m::WasmModule)
     nimports = numfuncimports(m)
+    # Parse fully before mutating `m`, so a malformed name section leaves the
+    # module untouched (the caller then preserves it as an opaque custom section).
+    importnames = Dict{UInt32,String}()
+    funcnames = Dict{Int,String}()
     while !eof(io)
         subid = read(io, UInt8)
         sublen = read_uleb(io, 32)
@@ -268,12 +262,18 @@ function read_name_custom!(io::IO, m::WasmModule)
             for _ in 1:n
                 idx = Int(read_u32(sio))
                 name = read_name_str(sio)
-                if idx >= nimports && idx - nimports < length(m.funcs)
-                    m.funcs[idx-nimports+1].name = name
+                if idx < nimports
+                    importnames[UInt32(idx)] = name
+                elseif idx - nimports < length(m.funcs)
+                    funcnames[idx-nimports] = name
                 end
             end
         end
         # other name subsections (module/local/type names) are dropped for now
+    end
+    merge!(m.funcnames, importnames)
+    for (i, name) in funcnames
+        m.funcs[i+1].name = name
     end
 end
 
@@ -285,12 +285,24 @@ Parse a wasm binary. Inverse of [`encode`](@ref) (function names from the
 """
 function decode(bytes::AbstractVector{UInt8})
     io = IOBuffer(bytes isa Vector{UInt8} ? bytes : Vector{UInt8}(bytes))
+    try
+        return _decode(io)
+    catch e
+        # The spec classifies truncation as malformedness ("unexpected end").
+        e isa EOFError && throw(MalformedError("unexpected end of input"))
+        rethrow()
+    end
+end
+
+function _decode(io::IO)
     magic = read(io, 4)
     magic == UInt8[0x00, 0x61, 0x73, 0x6D] || throw(MalformedError("bad magic"))
     version = read(io, 4)
     version == UInt8[0x01, 0x00, 0x00, 0x00] || throw(MalformedError("unsupported version"))
     m = WasmModule()
     lastid = -1
+    sawcode = false
+    datacount = nothing
     while !eof(io)
         id = read(io, UInt8)
         size = read_uleb(io, 32)
@@ -307,7 +319,13 @@ function decode(bytes::AbstractVector{UInt8})
             name = read_name_str(s)
             rest = read(s)
             if name == "name"
-                read_name_custom!(IOBuffer(rest), m)
+                try
+                    read_name_custom!(IOBuffer(rest), m)
+                catch
+                    # Per spec, errors in custom-section data must not
+                    # invalidate the module; keep the section opaquely.
+                    push!(m.customs, CustomSection(name, rest))
+                end
             else
                 push!(m.customs, CustomSection(name, rest))
             end
@@ -350,6 +368,7 @@ function decode(bytes::AbstractVector{UInt8})
         elseif id == 9
             m.elems = read_vec(read_elem, s)
         elseif id == 10
+            sawcode = true
             n = read_uleb(s, 32)
             n == length(m.funcs) || throw(MalformedError(
                 "code section count $n does not match function section $(length(m.funcs))"))
@@ -357,7 +376,7 @@ function decode(bytes::AbstractVector{UInt8})
         elseif id == 11
             m.datas = read_vec(read_data, s)
         elseif id == 12
-            read_uleb(s, 32)   # datacount; checked implicitly by section 11
+            datacount = read_uleb(s, 32)
         elseif id == 13
             m.tags = read_vec(s) do io
                 read(io, UInt8) == 0x00 || throw(MalformedError("invalid tag attribute"))
@@ -369,5 +388,9 @@ function decode(bytes::AbstractVector{UInt8})
         id in (0, 10) || eof(s) || throw(MalformedError("trailing bytes in section $id"))
         id == 10 && !eof(s) && throw(MalformedError("trailing bytes in code section"))
     end
+    isempty(m.funcs) || sawcode ||
+        throw(MalformedError("function section without code section"))
+    datacount === nothing || datacount == length(m.datas) || throw(MalformedError(
+        "data count section ($datacount) disagrees with data section ($(length(m.datas)))"))
     return m
 end

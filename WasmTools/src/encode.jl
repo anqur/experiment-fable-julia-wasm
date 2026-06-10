@@ -6,9 +6,11 @@ end
 Base.showerror(io::IO, e::MalformedError) = print(io, "MalformedError: ", e.msg)
 
 function write_name(io::IO, s::AbstractString)
-    bytes = codeunits(s)
-    write_uleb(io, length(bytes))
-    write(io, bytes)
+    str = String(s)
+    isvalid(String, str) ||
+        throw(ArgumentError("name is not valid UTF-8: $(repr(str))"))
+    write_uleb(io, ncodeunits(str))
+    write(io, codeunits(str))
 end
 
 function write_vec(f, io::IO, v)
@@ -98,17 +100,18 @@ function write_blocktype(io::IO, bt::Nothing)
     write(io, 0x40)
 end
 write_blocktype(io::IO, bt::NumType) = write_valtype(io, bt)
-function write_blocktype(io::IO, bt::RefType)
-    (bt.nullable && !isconcrete(bt.ht)) ||
-        throw(ArgumentError("block types with concrete/non-null ref results must use a function type index"))
-    write_valtype(io, bt)
-end
+# A reference-type result (including concrete and non-nullable refs) uses the
+# valtype shorthand; 0x63/0x64 are negative as s33 first bytes, so this never
+# collides with the non-negative s33 type-index form.
+write_blocktype(io::IO, bt::RefType) = write_valtype(io, bt)
 function write_blocktype(io::IO, bt::Integer)
     bt >= 0 || throw(ArgumentError("negative type index in block type"))
     write_sleb(io, Int64(bt))   # s33, non-negative
 end
 
 function write_memarg(io::IO, ma::MemArg)
+    ma.align < 0x40 || throw(ArgumentError(
+        "memarg alignment exponent must be < 64 (bit 6 of the flags is the multi-memory flag)"))
     if ma.memidx == 0
         write_uleb(io, ma.align)
     else
@@ -141,8 +144,6 @@ function write_imm(io::IO, kind::Symbol, x)
         write_blocktype(io, x)
     elseif kind === :heaptype
         write_heaptype(io, x isa HeapType ? x : HeapType(x))
-    elseif kind === :reftype
-        write_valtype(io, x::RefType)
     elseif kind === :valtypevec
         write_vec(write_valtype, io, x)
     elseif kind === :u8
@@ -215,9 +216,12 @@ function write_elem(io::IO, e::Elem)
     e.mode in (:active, :passive, :declarative) ||
         throw(ArgumentError("bad elem mode $(e.mode)"))
     funcidxs = [_as_funcidx(expr) for expr in e.init]
-    compact = e.reftype == FuncRefT && !any(isnothing, funcidxs)
+    # Honor the recorded binary flavor (set by `read_elem`) so foreign modules
+    # re-encode byte-identically; hand-built segments default to compact.
+    compact = !e.exprform && e.reftype == FuncRefT && !any(isnothing, funcidxs)
+    explicit_table = e.mode === :active && (e.tableidx != 0 || e.explicit_tableidx)
     if compact
-        if e.mode === :active && e.tableidx == 0
+        if e.mode === :active && !explicit_table
             write_uleb(io, 0)
             write_expr(io, e.offset)
             write_vec(write_uleb, io, funcidxs)
@@ -233,7 +237,7 @@ function write_elem(io::IO, e::Elem)
             write_vec(write_uleb, io, funcidxs)
         end
     else
-        if e.mode === :active && e.tableidx == 0 && e.reftype == FuncRefT
+        if e.mode === :active && !explicit_table && e.reftype == FuncRefT
             write_uleb(io, 4)
             write_expr(io, e.offset)
             write_vec(write_expr, io, e.init)
@@ -290,8 +294,14 @@ function write_code(io::IO, f::Func)
 end
 
 function write_name_section(io::IO, m::WasmModule)
-    named = [(UInt32(numfuncimports(m) + i - 1), f.name)
-             for (i, f) in enumerate(m.funcs) if f.name !== nothing]
+    nimports = numfuncimports(m)
+    # Imported-function names (m.funcnames) followed by defined-function names,
+    # in function-index order as the name section requires.
+    named = Tuple{UInt32,String}[(idx, name) for (idx, name) in m.funcnames
+                                 if Int(idx) < nimports]
+    append!(named, ((UInt32(nimports + i - 1), f.name)
+                    for (i, f) in enumerate(m.funcs) if f.name !== nothing))
+    sort!(named; by=first)
     isempty(named) && return
     buf = IOBuffer()
     write_name(buf, "name")

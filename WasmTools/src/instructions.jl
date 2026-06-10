@@ -64,7 +64,6 @@ end
 #   :memarg     MemArg
 #   :blocktype  BlockTypeImm
 #   :heaptype   HeapType
-#   :reftype    RefType
 #   :valtypevec vector of ValType (typed select)
 #   :u8         raw byte (cast flags)
 #   :catchvec   vector of Catch (try_table)
@@ -272,6 +271,8 @@ for entry in _INSTRUCTIONS
             error("duplicate opcode $(spec.prefix)")
         DECODE_SINGLE[Int(spec.prefix)+1] = spec
     else
+        haskey(DECODE_PREFIXED, (spec.prefix, UInt32(spec.sub))) &&
+            error("duplicate opcode $(spec.prefix) $(spec.sub)")
         DECODE_PREFIXED[(spec.prefix, UInt32(spec.sub))] = spec
     end
 end

@@ -46,6 +46,12 @@ Table(type::TableType) = Table(type, nothing)
 Element segment. `mode` is `:active`, `:passive`, or `:declarative`.
 `init` holds one constant expression per element (e.g. `[Inst(:ref_func, 3)]`).
 For active segments, `tableidx`/`offset` give the target.
+
+`exprform` and `explicit_tableidx` record which binary flavor the segment was
+decoded from (expression-style flags 4-7, and the explicit-table-index flags
+2/6 even when the index is 0) so re-encoding is byte-identical; hand-built
+segments keep the defaults, which select the most compact encoding. These
+hints do not participate in `==` (it compares segment semantics only).
 """
 struct Elem
     mode::Symbol
@@ -53,7 +59,12 @@ struct Elem
     offset::Vector{Inst}
     reftype::RefType
     init::Vector{Vector{Inst}}
+    exprform::Bool
+    explicit_tableidx::Bool
 end
+Elem(mode::Symbol, tableidx::Integer, offset::Vector{Inst}, reftype::RefType,
+     init::Vector{Vector{Inst}}) =
+    Elem(mode, UInt32(tableidx), offset, reftype, init, false, false)
 Elem(mode::Symbol, reftype::RefType, init::Vector{Vector{Inst}}) =
     Elem(mode, UInt32(0), Inst[], reftype, init)
 Base.:(==)(a::Elem, b::Elem) = a.mode == b.mode && a.tableidx == b.tableidx &&
@@ -88,10 +99,13 @@ mutable struct WasmModule
     datas::Vector{Data}
     tags::Vector{TagType}
     customs::Vector{CustomSection}
+    funcnames::Dict{UInt32,String}   # names of *imported* functions, keyed by
+                                     # function index (defined functions carry
+                                     # their name on `Func.name`)
 end
 WasmModule() = WasmModule(RecGroup[], Import[], Func[], Table[], MemoryType[],
                           Global[], Export[], nothing, Elem[], Data[],
-                          TagType[], CustomSection[])
+                          TagType[], CustomSection[], Dict{UInt32,String}())
 
 """All type-section entries flattened across rec groups, in index order."""
 flattypes(m::WasmModule) = SubType[st for rg in m.types for st in rg.types]

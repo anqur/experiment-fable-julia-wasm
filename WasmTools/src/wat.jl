@@ -72,7 +72,6 @@ function imm_str(m::WasmModule, kind::Symbol, x)
         return string("(type ", x, ")")
     end
     kind === :heaptype && return heaptype_str(x isa HeapType ? x : HeapType(x))
-    kind === :reftype && return valtype_str(x)
     kind === :valtypevec && return string("(result ", join(valtype_str.(x), " "), ")")
     kind === :u8 && return string(x)
     if kind === :catchvec
