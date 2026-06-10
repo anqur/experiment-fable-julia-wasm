@@ -188,39 +188,62 @@ function renderBoxesMode() {
       right: Math.max(u.right, v.right), bottom: Math.max(u.bottom, v.bottom),
     };
   const entries = [];
-  function rec(node, depth) {       // -> {h, u}
+  function rec(node, depth) {       // -> {h, u, lo, hi}
     const name = kindName(node.head & 0xffff);
     const err = isErrName(name);
     if (node.leaf) {
-      if (isExtentSkipName(name) && !err) return { h: 0, u: null };
+      if (isExtentSkipName(name) && !err) return { h: 0, u: null, lo: 0, hi: 0 };
       const u = measure(node.a, node.b);
-      if (err) entries.push({ u: { ...u }, depth, height: 0, err, name });
-      return { h: 0, u };
+      if (err) entries.push({ u: { ...u }, depth, height: 0, err, name,
+                              lo: node.a, hi: node.b });
+      return { h: 0, u, lo: node.a, hi: node.b };
     }
-    const entry = { u: null, depth, height: 0, err, name: `[${name}]` };
+    const entry = { u: null, depth, height: 0, err, name: `[${name}]`,
+                    lo: node.a, hi: node.b };
     entries.push(entry);
     let h = 0;
     let u = null;
+    let lo = 0, hi = 0;
     for (const c of node.children) {
       const r = rec(c, depth + 1);
       h = Math.max(h, r.h + 1);
-      u = union(u, r.u);
+      if (r.u !== null) {
+        u = union(u, r.u);
+        if (lo === 0) lo = r.lo;
+        hi = r.hi;
+      }
     }
     entry.height = h;
-    // all-trivia node (e.g. an empty block): fall back to its full range
-    entry.u = u ?? (node.b >= node.a ? measure(node.a, node.b) : null);
-    return { h, u: entry.u };
+    if (u === null) {
+      // all-trivia node (e.g. an empty block): fall back to its full range
+      u = node.b >= node.a ? measure(node.a, node.b) : null;
+      lo = node.a;
+      hi = node.b;
+    }
+    entry.u = u;
+    entry.lo = lo;
+    entry.hi = hi;
+    return { h, u, lo, hi };
   }
   for (const r of roots) rec(r, 0);
+  const lineH = parseFloat(getComputedStyle(highlight).lineHeight);
+  const spacey = (c) =>
+    c === undefined || c === " " || c === "\n" || c === "\t";
   for (const e of entries) {
     if (e.u === null) continue;
     const pad = Math.min(e.height, 3) + 1;
+    // horizontal outset only into whitespace: a single-line box knows
+    // exactly which characters flank it — when the neighbor is a glyph
+    // (e.g. the $ before an interpolation's parens), keep the edge tight
+    const oneLine = e.u.bottom - e.u.top < 1.5 * lineH;
+    const padL = !oneLine || spacey(text[b2c[e.lo - 1] - 1]) ? pad : 1;
+    const padR = !oneLine || spacey(text[b2c[e.hi]]) ? pad : 1;
     const d = document.createElement("div");
     d.className = e.err ? "bb bb-err" : `bb b${e.depth % 6}`;
     d.title = e.name;
-    d.style.left = (e.u.left - preRect.left + highlight.scrollLeft - pad) + "px";
+    d.style.left = (e.u.left - preRect.left + highlight.scrollLeft - padL) + "px";
     d.style.top = (e.u.top - preRect.top + highlight.scrollTop - pad) + "px";
-    d.style.width = (Math.max(e.u.right - e.u.left, 3) + 2 * pad) + "px";
+    d.style.width = (Math.max(e.u.right - e.u.left, 3) + padL + padR) + "px";
     d.style.height = (e.u.bottom - e.u.top + 2 * pad) + "px";
     boxdiv.appendChild(d);
   }
