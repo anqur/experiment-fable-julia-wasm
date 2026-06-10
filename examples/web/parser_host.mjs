@@ -1,31 +1,18 @@
 // JS host for the wasm-compiled JuliaSyntax parser. Works in Node 22+ and any
 // browser with WasmGC.
 //
-// Host support needed beyond the lexer's (codeunit/ncodeunits/egal/consts):
-//   - emit_token / emit_node: the parser event sinks
-//   - _hb_* byte bridge: wasm streams bytes of a string it built; the host
-//     interns it (_hb_string) or parses it as a float (_hb_parse_f64/f32,
-//     mirroring strtod incl. hexfloats and the ERANGE status convention)
-//   - repr / print_to_string / _string: string formatting for diagnostic
-//     messages (cosmetic: messages stay inside the wasm-side ParseStream)
+// Strings are wasm-GC-resident byte arrays: the host builds/reads them
+// through the exported __str_new/__str_set/__str_len/__str_get accessors and
+// otherwise handles opaque externref handles. Beyond the event sinks
+// (emit_token/emit_node) and Symbol identity (egal), the imports are the
+// _hb_* byte bridge (float-literal parsing with a strtod emulation incl.
+// hexfloats) and string formatting for diagnostic messages (repr,
+// print_to_string, _string) — those receive and return wasm-string handles.
 
 import { HOSTCONSTS, IMPORTS } from "./parser_meta.js";
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
-
-function hostString(str) {
-  return { bytes: encoder.encode(str), str };
-}
-
-function refToString(x) {
-  if (x === null || x === undefined) return "nothing";
-  if (typeof x === "object") {
-    if (x.str !== undefined) return x.str;
-    if (x.sym !== undefined) return x.sym;
-  }
-  return String(x);
-}
 
 // Julia Char carries its UTF-8 bytes left-aligned in 32 bits
 function charBitsToString(u) {
@@ -48,13 +35,8 @@ function reprChar(u) {
   return `'${esc}'`;
 }
 
-function reprString(s) {
-  return JSON.stringify(s);
-}
-
-// strtod emulation: decimal via parseFloat, hexfloats by hand (JS Number()
-// can't parse them). Returns [value, status] with the ERANGE convention used
-// by JuliaSyntax: 0 ok, 1 underflow, 2 overflow.
+// strtod emulation: decimal via parseFloat, hexfloats by hand. Returns
+// [value, status] with the ERANGE convention: 0 ok, 1 underflow, 2 overflow.
 function strtod(s) {
   s = s.trim();
   let v;
@@ -79,27 +61,35 @@ export async function instantiateParser(wasmBytes) {
   let nodeSink = [];
   let hbuf = [];
   let hbStatus = 0;
-  const imports = { julia: {} };
+  let exp = null; // instance exports, set after instantiation
 
+  function makeString(text) {
+    const bytes = typeof text === "string" ? encoder.encode(text) : text;
+    const h = exp.__str_new(bytes.length);
+    for (let i = 0; i < bytes.length; i++) exp.__str_set(h, i, bytes[i]);
+    return h;
+  }
+  function readString(h) {
+    const n = exp.__str_len(h);
+    const bytes = new Uint8Array(n);
+    for (let i = 0; i < n; i++) bytes[i] = exp.__str_get(h, i);
+    return decoder.decode(bytes);
+  }
+  // an externref arg is either one of our Symbol-constant objects or an
+  // opaque wasm-string handle
+  const refToString = (x) =>
+    x === null || x === undefined ? "nothing" :
+    x.sym !== undefined ? x.sym : readString(x);
+
+  const imports = { julia: {} };
   for (const name of IMPORTS) {
     let fn;
     if (name.includes("emit_token")) {
       fn = (a, b, c) => { tokenSink.push([Number(a), Number(b), Number(c)]); };
     } else if (name.includes("emit_node")) {
       fn = (a, b, c) => { nodeSink.push([Number(a), Number(b), Number(c)]); };
-    } else if (name.includes("ncodeunits")) {
-      fn = (s) => BigInt(s.bytes.length);
-    } else if (name.includes("codeunit")) {
-      fn = (s, i) => {
-        const idx = Number(i) - 1;
-        if (idx < 0 || idx >= s.bytes.length) throw new Error("codeunit OOB");
-        return s.bytes[idx];
-      };
     } else if (name.includes("egal")) {
-      fn = (a, b) =>
-        a === b || (a?.str !== undefined && b?.str !== undefined && a.str === b.str)
-          ? 1
-          : 0;
+      fn = (a, b) => (a === b ? 1 : 0);
     } else if (name.includes("_hb_reset")) {
       fn = () => { hbuf = []; };
     } else if (name.includes("_hb_push")) {
@@ -122,16 +112,14 @@ export async function instantiateParser(wasmBytes) {
         hbStatus = st;
         return v32;
       };
-    } else if (name.includes("_hb_string")) {
-      fn = () => hostString(decoder.decode(new Uint8Array(hbuf)));
     } else if (name.includes("repr")) {
       fn = (x) =>
-        hostString(typeof x === "object" && x !== null
-          ? reprString(refToString(x))
+        makeString(typeof x === "object" && x !== null
+          ? JSON.stringify(refToString(x))
           : reprChar(Number(x)));
     } else if (name.includes("print_to_string") || name.includes("_string")) {
       fn = (...args) =>
-        hostString(args.map((a) =>
+        makeString(args.map((a) =>
           typeof a === "bigint" ? a.toString() :
           typeof a === "number" ? String(a) : refToString(a)).join(""));
     } else {
@@ -141,21 +129,21 @@ export async function instantiateParser(wasmBytes) {
   }
 
   HOSTCONSTS.forEach(([name, kind, value], k) => {
-    const obj = kind === "string" ? hostString(value) : { hostconst: k, sym: value };
     imports.julia[name] = new WebAssembly.Global(
       { value: "externref", mutable: false },
-      obj,
+      { hostconst: k, sym: value },
     );
   });
 
   const { instance } = await WebAssembly.instantiate(wasmBytes, imports);
-  const parse_into = instance.exports.parse_into;
+  exp = instance.exports;
+  const parse_into = exp.parse_into;
 
   return {
     parse(text) {
       tokenSink = [];
       nodeSink = [];
-      const n = Number(parse_into(hostString(text)));
+      const n = Number(parse_into(makeString(text)));
       return {
         ntokens: Math.floor(n / 1000000),
         nnodes: n % 1000000,

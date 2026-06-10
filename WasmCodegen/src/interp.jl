@@ -182,18 +182,27 @@ Base.Experimental.@overlay WASM_MT function Base.fill!(
     return a
 end
 
-# String construction from wasm bytes: stream through the host buffer. Matches
+# String construction primitive: copies bytes out of a Memory{UInt8} into a
+# fresh wasm string (array.copy via emit_memory_to_string!). The body is a
+# pure type-pinning stub — in particular it must NOT call String(v), which
+# under the overlay table resolves back to the overlay below and would make
+# inference conclude infinite recursion (rt Union{} -> trap).
+@noinline _memory_to_string(m::Memory{UInt8}, off::Int64, n::Int64) =
+    (Base.inferencebarrier(""))::String
+
+# String construction from wasm bytes: a pure-wasm copy. Matches
 # Base.String(v)'s buffer-stealing contract by emptying v.
 Base.Experimental.@overlay WASM_MT function Base.String(v::Vector{UInt8})
-    _hb_reset()
-    i = 1
-    while i <= length(v)
-        _hb_push(@inbounds v[i])
-        i += 1
-    end
+    n = Int64(length(v))
+    off = Int64(Base.memoryrefoffset(v.ref) - 1)
+    s = _memory_to_string(v.ref.mem, off, n)
     resize!(v, 0)
-    return _hb_string()
+    return s
 end
+
+# Base's ==(String,String) is a memcmp ccall; strings are GC byte arrays here
+Base.Experimental.@overlay WASM_MT Base.:(==)(a::String, b::String) =
+    _str_egal(a, b)
 
 # strtod/strtof over the host buffer; status: 0 ok, 1 underflow, 2 overflow
 # (the strtod ERANGE convention, as in Base.parse and JuliaSyntax)
@@ -250,9 +259,11 @@ end
 """Register the intercept lowerings (called below; uses emitters from compiler.jl)."""
 function _register_intercepts!()
     INTERCEPTS[_overlay_method(Base.codeunit, Tuple{String,Int64})] =
-        InterceptSpec(:hostcall, Base.codeunit, nothing)
+        InterceptSpec(:custom, Base.codeunit, emit_string_codeunit!)
     INTERCEPTS[_overlay_method(Base.ncodeunits, Tuple{String})] =
-        InterceptSpec(:hostcall, Base.ncodeunits, nothing)
+        InterceptSpec(:custom, Base.ncodeunits, emit_string_ncodeunits!)
+    INTERCEPTS[which(_memory_to_string, Tuple{Memory{UInt8},Int64,Int64})] =
+        InterceptSpec(:custom, _memory_to_string, emit_memory_to_string!)
     INTERCEPTS[_overlay_method(Base.repr, Tuple{String})] =
         InterceptSpec(:hostcall, Base.repr, nothing)
     INTERCEPTS[_overlay_method(Base.repr, Tuple{Char})] =

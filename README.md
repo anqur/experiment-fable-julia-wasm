@@ -44,18 +44,24 @@ checks native Julia, wasmtime, and Node against each other.
   identity (`===` is `ref.eq`), `Memory{T}`/`Vector` → GC arrays (`push!` and
   `copy` compile with zero offloads), `Union{Nothing,T}` → nullable refs,
   general small unions of concrete types → `anyref` with per-type boxes
+- **wasm-resident strings**: `String` is a GC byte array (the WIT array+size
+  model, with GC instead of linear memory) — `codeunit`/`ncodeunits`/`==`/
+  `sizeof` are in-wasm array ops, literals live in passive data segments, and
+  `Int128` is a `{lo,hi}` struct. At the boundary strings externalize
+  (`extern.convert_any`); hosts read/build them via exported `__str_*`
+  accessors
 - **try/catch/finally via wasm-EH**: per-block `try_table` routed to the
   innermost handler; `÷0`, overflow, bounds errors, and explicit throws are
   catchable inside `try`
 - **overlay interpreter**: a custom `AbstractInterpreter` replaces
-  pointer-based Base primitives before inlining — `codeunit`/`ncodeunits`
-  become host imports, `unsafe_copyto!` becomes `array.copy`, and unicode
-  classification (`category_code`, identifier predicates, grapheme breaks)
+  pointer-based Base primitives before inlining — memcpy/memset/memcmp
+  patterns become `array.copy`/loops, and unicode classification
+  (`category_code`, identifier predicates, grapheme breaks)
   compiles in-wasm via vendored [UnicodeNext](https://github.com/c42f/UnicodeNext.jl)
-- **host constants**: Symbol/String literals become imported `externref`
-  globals; mutable constant tables (`Dict`, `Vector`, `Memory`) materialize as
-  wasm globals via a start function, large numeric tables as data segments
-- **offloading**: callees with scalar/externref boundaries (including
+- **host constants**: Symbol literals become imported `externref` globals;
+  string/mutable constant tables (`Dict`, `Vector`, `Memory`) materialize as
+  wasm globals via a start function, large tables as data segments
+- **offloading**: callees with scalar/externref/String boundaries (including
   `Union{Nothing,scalar}` returns) become `"julia"` imports bound to native
   thunks — `parse`, `string(n, base=16)`, `exp`/`sin`/`log` run with one or
   two leaf offloads
@@ -68,12 +74,20 @@ values, dynamic dispatch, closures as values, RadixSort internals (default
 ## Showcase: the JuliaSyntax lexer
 
 `examples/lexer/` compiles the real `JuliaSyntax.Tokenize` lexer (no manual
-porting) into a 1.1MB module with **four** host imports: source-text byte
-access, `===` on host constants, and the token sink. Token streams match the
-native lexer exactly across unicode operators, interpolated/triple strings,
-all numeric literal forms, and malformed input — verified under wasmtime
-(`examples/lexer/run_wasmtime.jl`) and V8 (`examples/web/test_node.mjs`).
-Rebuild the web demo with `examples/lexer/build_web.jl`.
+porting) into a 1.1MB module with **two** host imports: the token sink and
+`===` on Symbol constants (source text lives in wasm as a GC byte array).
+Token streams match the native lexer exactly across unicode operators,
+interpolated/triple strings, all numeric literal forms, and malformed input —
+verified under wasmtime (`examples/lexer/run_wasmtime.jl`) and V8
+(`examples/web/test_node.mjs`). Rebuild the web demo with
+`examples/lexer/build_web.jl`.
+
+`examples/parser/` goes further: the complete `JuliaSyntax.jl`
+recursive-descent parser (error recovery and token validation included)
+streams its native (token, range) events out of wasm; the green parse tree is
+a host-side reconstruction (`examples/web/parser.html`). Matches native
+event-for-event on a 46-input corpus and on JuliaSyntax's own `parser.jl`
+under both wasmtime and V8.
 
 ## Testing
 

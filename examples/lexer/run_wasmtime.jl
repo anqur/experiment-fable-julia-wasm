@@ -20,10 +20,12 @@ for (name, v) in comp.hostconsts
 end
 inst = instantiate(lk, store, CompiledModule(eng, comp.bytes))
 wf = inst[comp.entry]
+codec = string_codec(inst)
+WasmCodegen.string_bridge[] = codec
 
 function wasm_tokens(src::String)
     empty!(TOKEN_SINK[])
-    n = wf(src)
+    n = wf(codec.fromstring(src))
     return copy(TOKEN_SINK[])
 end
 

@@ -136,6 +136,26 @@ function gc_i128!(mc::ModuleCompiler)
     return idx
 end
 
+"""
+The `{bytes::(ref null (array mut i8))}` struct type representing `String`.
+Strings are wasm-GC-resident — array+length instead of host JS strings (the
+WIT model, with a GC array standing in for linear memory). The byte array
+type is shared with `Memory{UInt8}`, so bytes move between strings and
+vectors with `array.copy`. Crossing the boundary they are externalized
+(`extern.convert_any`) and the host reads/writes them through the exported
+`__str_len`/`__str_get`/`__str_new`/`__str_set` accessors.
+"""
+function gc_string!(mc::ModuleCompiler)
+    idx = get(mc.gcboxes, String, nothing)
+    idx === nothing || return idx
+    arr = gc_array!(mc, Memory{UInt8})
+    idx = length(mc.gctypes)
+    push!(mc.gctypes, SubType(StructType(
+        [FieldType(RefType(true, HeapType(arr)), false)])))
+    mc.gcboxes[String] = idx
+    return idx
+end
+
 """Box type for scalar `T` inside `Union{Nothing,T}`: a one-field immutable
 struct at full storage width (no packing — boxes are transient)."""
 function gc_box!(mc::ModuleCompiler, @nospecialize T)
@@ -282,6 +302,8 @@ function valtype_for(mc::ModuleCompiler, @nospecialize T)
             u === Nothing && continue
             if scalar_repr(u) !== nothing
                 gc_box!(mc, u)
+            elseif u === String
+                gc_string!(mc)
             elseif is_gc_struct(u)
                 gc_struct!(mc, u)
             else
@@ -292,6 +314,7 @@ function valtype_for(mc::ModuleCompiler, @nospecialize T)
         ok && return RefType(true, AnyHT)
         throw(CompileError("unsupported union type $T"))
     end
+    T === String && return RefType(true, HeapType(gc_string!(mc)))
     if T === Int128 || T === UInt128
         # 128-bit integers: a {lo::i64, hi::i64} struct; signedness lives in
         # the operations (see emit_i128! in intrinsics.jl)
@@ -334,6 +357,10 @@ end
 function offload_kind(mc::ModuleCompiler, @nospecialize T)
     k = valkind_sym(T)
     k === nothing || return k
+    # Strings cross externalized (extern.convert_any); a generated wrapper
+    # function does the conversion so call sites stay GC-typed (see
+    # _make_offload_wrapper!), and the host reads bytes via __str_* exports.
+    T === String && return :externref
     vt = valtype_for(mc, T)   # throws CompileError if not representable
     vt == ExternRefT && return :externref
     throw(CompileError("cannot pass $T across the offload boundary (wasm-GC-resident)"))
@@ -627,9 +654,23 @@ function emit_const!(fc, @nospecialize v)
             # shared object: one wasm global per host object (identity preserved)
             emit!(fc, Inst(:global_get, (register_valueglobal!(fc.mc, v),)))
         end
+    elseif v isa String
+        # strings are wasm-resident byte arrays: a passive data segment holds
+        # the contents; the value is shared via a value-global (one per
+        # distinct literal object) materialized in the start function
+        if fc isa ConstSink
+            st = gc_string!(fc.mc)
+            arr = gc_array!(fc.mc, Memory{UInt8})
+            push!(fc.mc.wmod.datas, Data(Vector{UInt8}(codeunits(v))))
+            dataidx = length(fc.mc.wmod.datas) - 1
+            emit!(fc, i32_const(0), i32_const(Int32(ncodeunits(v))),
+                  array_new_data(arr, dataidx), struct_new(st))
+        else
+            emit!(fc, Inst(:global_get, (register_valueglobal!(fc.mc, v),)))
+        end
     elseif (vtc = try valtype_for(fc.mc, T) catch; nothing end) == ExternRefT
-        # host-resident literal (Symbol, String, ...): read the imported
-        # externref global bound to this exact value at instantiation
+        # host-resident literal (Symbol, ...): read the imported externref
+        # global bound to this exact value at instantiation
         emit!(fc, global_get(register_hostconst!(fc.mc, v)))
     else
         throw(CompileError("unsupported constant $v::$T"))
@@ -910,12 +951,34 @@ function emit_call!(fc::FuncCompiler, i::Int, ex::Expr)
             end
         else
             ra, rb = scalar_repr(Ta), scalar_repr(Tb)
-            if ra !== nothing && rb !== nothing
+            if typeintersect(Ta, Tb) === Union{}
+                # disjoint runtime types can never be egal
+                emit!(fc, i32_const(0))
+            elseif ra !== nothing && rb !== nothing
                 if ra.isfloat
                     INTRINSIC_HANDLERS[:fpiseq](fc, rt, args)
                 else
                     emit_cmp!(fc, "eq", args)
                 end
+            elseif strip_nothing(Ta) === String && strip_nothing(Tb) === String
+                # String egal is CONTENT equality (strings are immutable):
+                # null-aware call into the compiled byte-compare helper
+                reft = RefType(true, HeapType(gc_string!(fc.mc)))
+                ra2 = scratch_local!(fc, reft)
+                rb2 = scratch_local!(fc, reft)
+                emit_value!(fc, args[1])
+                emit!(fc, local_set(ra2))
+                emit_value!(fc, args[2])
+                emit!(fc, local_set(rb2))
+                mi_eq = _str_egal_instance()
+                request!(fc.mc, mi_eq)
+                emit!(fc, local_get(ra2), ref_is_null(), if_(I32))
+                emit!(fc, local_get(rb2), ref_is_null())
+                emit!(fc, else_())
+                emit!(fc, local_get(rb2), ref_is_null(), if_(I32), i32_const(0))
+                emit!(fc, else_(), local_get(ra2), local_get(rb2),
+                      Inst(:call, (CallTarget(mi_eq),)))
+                emit!(fc, end_(), end_())
             else
                 va = valtype_for(fc.mc, Ta)
                 vb = valtype_for(fc.mc, Tb)
@@ -1069,9 +1132,10 @@ function emit_call!(fc::FuncCompiler, i::Int, ex::Expr)
                 members = Any[u for u in Base.uniontypes(Tt isa Union ? Tt : Union{Tt,Union{}})]
                 _heap_of(u) = scalar_repr(u) !== nothing ?
                     HeapType(gc_box!(fc.mc, u)) :
+                    u === String ? HeapType(gc_string!(fc.mc)) :
                     HeapType(gc_struct!(fc.mc, u).typeidx)
                 all(u -> u === Nothing || scalar_repr(u) !== nothing ||
-                        is_gc_struct(u), members) ||
+                        u === String || is_gc_struct(u), members) ||
                     throw(CompileError("isa $Tv -> $Tt unsupported"))
                 v = scratch_local!(fc, RefType(true, AnyHT))
                 emit_value!(fc, args[1])
@@ -1099,6 +1163,12 @@ function emit_call!(fc::FuncCompiler, i::Int, ex::Expr)
         return true
     elseif f === Core.sizeof
         T = strip_nothing(argtype(fc, args[1]))
+        if T === String
+            emit_value!(fc, args[1])
+            emit!(fc, struct_get(gc_string!(fc.mc), 0), array_len(),
+                  Inst(:i64_extend_i32_u))
+            return true
+        end
         valtype_for(fc.mc, T) == ExternRefT ||
             throw(CompileError("sizeof on wasm-resident type $T"))
         hc = request_hostcall!(fc.mc, (:sizeof, T), Core.sizeof, Any[T], Int64)
@@ -1261,6 +1331,23 @@ function _check_order(@nospecialize ord)
         throw(CompileError("atomic memory access unsupported (order $ord)"))
 end
 
+"""Byte-wise content comparison backing String egal; compiled INTO wasm
+(`ncodeunits`/`codeunit` lower to `array.len`/`array.get_u`)."""
+function _str_egal(a::String, b::String)
+    na = ncodeunits(a)
+    ncodeunits(b) == na || return false
+    i = 1
+    while i <= na
+        codeunit(a, i) == codeunit(b, i) || return false
+        i += 1
+    end
+    return true
+end
+
+_str_egal_instance() =
+    _site_specialize(which(_str_egal, Tuple{String,String}),
+                     Tuple{typeof(_str_egal),String,String})::Core.MethodInstance
+
 """Specialize `m` at the (narrower) site signature `tt`."""
 function _site_specialize(m::Method, @nospecialize(tt))
     tt <: m.sig || return nothing
@@ -1378,6 +1465,46 @@ function emit_intercept!(fc::FuncCompiler, i::Int, ex::Expr, mi::Core.MethodInst
     hc = request_hostcall!(fc.mc, mi, spec.real, Any[T for T in ps[2:end]], rt)
     emit!(fc, Inst(:call, (hc,)))
     return rt !== Union{} && valtype_for(fc.mc, rt) !== nothing
+end
+
+"""`codeunit(s::String, i::Int64)`: `array.get_u` on the byte array (traps OOB)."""
+function emit_string_codeunit!(fc::FuncCompiler, i::Int, ex::Expr, mi::Core.MethodInstance)
+    st = gc_string!(fc.mc)
+    arr = gc_array!(fc.mc, Memory{UInt8})
+    emit_value!(fc, ex.args[3])
+    emit!(fc, struct_get(st, 0))
+    emit_value!(fc, ex.args[4])
+    emit!(fc, Inst(:i32_wrap_i64), i32_const(1), Inst(:i32_sub), array_get_u(arr))
+    return true
+end
+
+"""`ncodeunits(s::String)`: `array.len` (as Int64)."""
+function emit_string_ncodeunits!(fc::FuncCompiler, i::Int, ex::Expr, mi::Core.MethodInstance)
+    emit_value!(fc, ex.args[3])
+    emit!(fc, struct_get(gc_string!(fc.mc), 0), array_len(),
+          Inst(:i64_extend_i32_u))
+    return true
+end
+
+"""`_memory_to_string(mem, offset0, n)`: copy `n` bytes starting at 0-based
+`offset0` out of a `Memory{UInt8}` into a fresh String byte array."""
+function emit_memory_to_string!(fc::FuncCompiler, i::Int, ex::Expr, mi::Core.MethodInstance)
+    arr = gc_array!(fc.mc, Memory{UInt8})
+    st = gc_string!(fc.mc)
+    reft = RefType(true, HeapType(arr))
+    rsrc = scratch_local!(fc, reft)
+    rdst = scratch_local!(fc, reft)
+    nloc = scratch_local!(fc, I32)
+    emit_value!(fc, ex.args[3])                     # mem (IS the byte array)
+    emit!(fc, local_set(rsrc))
+    emit_value!(fc, ex.args[5])                     # n :: Int64
+    emit!(fc, Inst(:i32_wrap_i64), local_tee(nloc),
+          array_new_default(arr), local_set(rdst),
+          local_get(rdst), i32_const(0), local_get(rsrc))
+    emit_value!(fc, ex.args[4])                     # offset0 :: Int64
+    emit!(fc, Inst(:i32_wrap_i64), local_get(nloc), array_copy(arr, arr),
+          local_get(rdst), struct_new(st))
+    return true
 end
 
 """`unsafe_copyto!(dest::MemoryRef{T}, src::MemoryRef{T}, n)` as `array.copy`."""
@@ -2105,17 +2232,31 @@ function compile_wasm(@nospecialize(f), @nospecialize(argtypes::Type{<:Tuple});
     sort!(live; by=m -> findfirst(==(m), mc.order))
     offloads = [off for off in mc.offloads if off.key in liveoff]
 
-    # The entry function's signature is the wasm<->host boundary: only scalars
-    # and externrefs can cross it. GC-typed (struct/array ref) params/results
-    # would not merely be unusable — wasmtime v45's C API *aborts the process*
-    # (wasm_valtype_kind is unimplemented for GC types) when the embedder wraps
-    # such an export. Fail loudly at compile time instead.
+    # The wasm<->host boundary carries only scalars and externrefs. GC-typed
+    # (struct/array ref) params/results would not merely be unusable —
+    # wasmtime v45's C API *aborts the process* (wasm_valtype_kind is
+    # unimplemented for GC types) when the embedder wraps such an export.
+    # Strings are the sanctioned exception: a generated entry wrapper
+    # externalizes them (extern.convert_any), so the exported signature is
+    # externref and hosts access the bytes via the __str_* helper exports.
     entry_sig = mc.sigs[mi]
-    for vt in Iterators.flatten((entry_sig.params, entry_sig.results))
+    entry_argts = Any[widen(t) for t in
+                      collect(Any, Base.unwrap_unionall(mi.specTypes).parameters)]
+    entry_rt = widen(method_ir(mc, mi)[2])
+    entry_ng = Any[T for T in entry_argts[2:end] if !isghost(T)]
+    length(entry_ng) == length(entry_sig.params) ||
+        throw(CompileError("entry function $name has an unsupported signature shape"))
+    needs_entry_wrapper = entry_rt === String || any(T -> T === String, entry_ng)
+    bsig_params = ValType[entry_ng[k] === String ? ExternRefT : entry_sig.params[k]
+                          for k in 1:length(entry_ng)]
+    bsig_results = ValType[entry_rt === String ? ExternRefT : vt
+                           for vt in entry_sig.results]
+    for vt in Iterators.flatten((bsig_params, bsig_results))
         vt isa NumType || vt == ExternRefT ||
             throw(CompileError("entry function $name has a GC-reference boundary " *
-                               "type ($vt); only i32/i64/f32/f64 and host-resident " *
-                               "(externref) values can cross the wasm boundary"))
+                               "type ($vt); only i32/i64/f32/f64, String, and " *
+                               "host-resident (externref) values can cross the " *
+                               "wasm boundary"))
     end
 
     # GC struct types occupy indices [0, N) as a single rec group, registered
@@ -2144,7 +2285,7 @@ function compile_wasm(@nospecialize(f), @nospecialize(argtypes::Type{<:Tuple});
         push!(mc.wmod.imports, Import("julia", nm, GlobalType(ExternRefT, false)))
         push!(hostconsts, nm => v)
     end
-    wrapped = [off for off in offloads if union_box_info(mc, off.rettype) !== nothing]
+    wrapped = [off for off in offloads if _offload_needs_wrapper(mc, off)]
     for (k, off) in enumerate(wrapped)
         # calls to this offload target the wrapper instead of the raw import
         offidx[off.key] = nimports + k - 1
@@ -2172,10 +2313,7 @@ function compile_wasm(@nospecialize(f), @nospecialize(argtypes::Type{<:Tuple});
     end
     for (k, off) in enumerate(wrapped)
         importidx = findfirst(o -> o === off, offloads) - 1
-        w = _make_box_wrapper(mc, off, UInt32(importidx))
-        w.typeidx = addtype!(mc.wmod, FuncType(ValType[_sym_vt(s) for s in off.params],
-                                               ValType[valtype_for(mc, off.rettype)]))
-        push!(mc.wmod.funcs, w)
+        push!(mc.wmod.funcs, _make_offload_wrapper(mc, off, UInt32(importidx)))
     end
     for m in live
         func = mc.bodies[m]
@@ -2184,41 +2322,104 @@ function compile_wasm(@nospecialize(f), @nospecialize(argtypes::Type{<:Tuple});
         patch_valueglobals!(func.body, vgmap)
         push!(mc.wmod.funcs, func)
     end
+    nextidx = nimports + length(wrapped) + length(live)
+    # entry wrapper: externalize String params/results at the boundary
+    entry_export_idx = fidx[mi]
+    if needs_entry_wrapper
+        body = Inst[]
+        for k in 0:length(entry_ng)-1
+            push!(body, local_get(k))
+            entry_ng[k+1] === String &&
+                push!(body, Inst(:any_convert_extern),
+                      ref_cast_null(HeapType(gc_string!(mc))))
+        end
+        push!(body, Inst(:call, (UInt32(fidx[mi]),)))
+        entry_rt === String && push!(body, Inst(:extern_convert_any))
+        w = Func(addtype!(mc.wmod, FuncType(bsig_params, bsig_results)),
+                 ValType[], body, name * "__boundary")
+        push!(mc.wmod.funcs, w)
+        entry_export_idx = nextidx
+        nextidx += 1
+    end
+    # String accessors: hosts construct and read wasm strings through these
+    # (the externref handles are opaque on the host side)
+    if haskey(mc.gcboxes, String)
+        st = gc_string!(mc)
+        arr = gc_array!(mc, Memory{UInt8})
+        cast = (Inst(:any_convert_extern), ref_cast_null(HeapType(st)))
+        helpers = [
+            ("__str_new", FuncType([I32], [ExternRefT]),
+             Inst[local_get(0), array_new_default(arr), struct_new(st),
+                  Inst(:extern_convert_any)]),
+            ("__str_len", FuncType([ExternRefT], [I32]),
+             Inst[local_get(0), cast..., struct_get(st, 0), array_len()]),
+            ("__str_get", FuncType([ExternRefT, I32], [I32]),
+             Inst[local_get(0), cast..., struct_get(st, 0), local_get(1),
+                  array_get_u(arr)]),
+            ("__str_set", FuncType([ExternRefT, I32, I32], ValType[]),
+             Inst[local_get(0), cast..., struct_get(st, 0), local_get(1),
+                  local_get(2), array_set(arr)]),
+        ]
+        for (hname, ft, hbody) in helpers
+            push!(mc.wmod.funcs, Func(addtype!(mc.wmod, ft), ValType[], hbody, hname))
+            push!(mc.wmod.exports, Export(hname, :func, nextidx))
+            nextidx += 1
+        end
+    end
     if !isempty(startbody)
         sf = Func(addtype!(mc.wmod, FuncType(ValType[], ValType[])),
                   ValType[], startbody, "__init_constants")
         push!(mc.wmod.funcs, sf)
-        mc.wmod.start = UInt32(nimports + length(wrapped) + length(live))
+        mc.wmod.start = UInt32(nextidx)
     end
-    push!(mc.wmod.exports, Export(name, :func, fidx[mi]))
+    push!(mc.wmod.exports, Export(name, :func, entry_export_idx))
     bytes = encode(mc.wmod)
     return WasmCompilation(mc.wmod, bytes, name, offloads, hostconsts)
 end
 
 """
-Wrapper for an offload returning `Union{Nothing,scalar}`: calls the raw import
-(which returns `(value, present)`) and boxes the result into the nullable ref.
+Does an offload need a wasm-side wrapper between call sites and the raw
+import? Two cases (composable): a `Union{Nothing,scalar}` return — the wire
+carries `(value, present)`, boxed back into the nullable ref — and `String`
+params/results — GC-resident inside wasm, externalized on the wire.
 """
-function _make_box_wrapper(mc::ModuleCompiler, off::Offload, importidx::UInt32)
-    bi = union_box_info(mc, off.rettype)
-    box, elT = bi
-    np = length(off.params)
-    vvt = scalar_repr(elT).vt
+_offload_needs_wrapper(mc::ModuleCompiler, off::Offload) =
+    union_box_info(mc, off.rettype) !== nothing || off.rettype === String ||
+    any(T -> T === String, off.argtypes)
+
+function _make_offload_wrapper(mc::ModuleCompiler, off::Offload, importidx::UInt32)
+    ng = Any[T for T in off.argtypes if !isghost(T)]
+    params = ValType[T === String ? RefType(true, HeapType(gc_string!(mc))) :
+                     _sym_vt(off.params[k]) for (k, T) in enumerate(ng)]
     body = Inst[]
-    for k in 0:np-1
-        push!(body, local_get(k))
+    for (k, T) in enumerate(ng)
+        push!(body, local_get(k - 1))
+        T === String && push!(body, Inst(:extern_convert_any))
     end
     push!(body, Inst(:call, (importidx,)))
-    push!(body, local_set(np + 1))           # present flag (i32, top of stack)
-    push!(body, local_set(np))               # value
-    push!(body, local_get(np + 1))
-    push!(body, if_(RefType(true, HeapType(box))))
-    push!(body, local_get(np))
-    push!(body, struct_new(box))
-    push!(body, else_())
-    push!(body, ref_null(HeapType(box)))
-    push!(body, end_())
-    return Func(0, ValType[vvt, I32], body, "boxwrap_" * off.name)
+    bi = union_box_info(mc, off.rettype)
+    if bi !== nothing
+        box, elT = bi
+        np = length(params)
+        push!(body, local_set(np + 1))       # present flag (i32, top of stack)
+        push!(body, local_set(np))           # value
+        push!(body, local_get(np + 1))
+        push!(body, if_(RefType(true, HeapType(box))))
+        push!(body, local_get(np), struct_new(box))
+        push!(body, else_(), ref_null(HeapType(box)), end_())
+        results = ValType[RefType(true, HeapType(box))]
+        locals = ValType[scalar_repr(elT).vt, I32]
+    elseif off.rettype === String
+        push!(body, Inst(:any_convert_extern),
+              ref_cast_null(HeapType(gc_string!(mc))))
+        results = ValType[RefType(true, HeapType(gc_string!(mc)))]
+        locals = ValType[]
+    else
+        results = ValType[_sym_vt(s) for s in off.results]
+        locals = ValType[]
+    end
+    return Func(addtype!(mc.wmod, FuncType(params, results)), locals, body,
+                "wrap_" * off.name)
 end
 
 _sym_vt(s::Symbol) = s === :i64 ? I64 : s === :i32 ? I32 : s === :f64 ? F64 :
@@ -2258,6 +2459,32 @@ function offload_imports(comp::WasmCompilation)
             for off in comp.offloads]
 end
 
+"""
+Host-side String codec for boundary crossings, set by the embedder after
+instantiation: a NamedTuple `(tostring = handle -> String, fromstring =
+String -> handle)` where handles are whatever the embedding surfaces for
+externref values. The wasmtime path builds one over the module's `__str_*`
+exports (see WasmtimeRunner examples); JS hosts do their conversions in JS
+and never consult this.
+"""
+const string_bridge = Ref{Any}(nothing)
+
+function _bridge_tostring(h)
+    b = string_bridge[]
+    b === nothing && throw(WasmCodegenError())
+    return b.tostring(h)::String
+end
+function _bridge_fromstring(s::String)
+    b = string_bridge[]
+    b === nothing && throw(WasmCodegenError())
+    return b.fromstring(s)
+end
+struct WasmCodegenError <: Exception end
+Base.showerror(io::IO, ::WasmCodegenError) =
+    print(io, "a String crossed the offload boundary but " *
+              "WasmCodegen.string_bridge[] is unset; set it from the " *
+              "instance's __str_* exports after instantiation")
+
 function _offload_thunk(off::Offload)
     f, ats, rt = off.func, off.argtypes, off.rettype
     kinds = off.params
@@ -2265,7 +2492,9 @@ function _offload_thunk(off::Offload)
         # Reassemble the full positional argument list: ghost parameters (e.g.
         # singleton function arguments in keyword-sorter methods) are not on the
         # wire and are reconstructed from their types. :externref values arrive
-        # as the Julia objects themselves; scalars arrive as wire types.
+        # as the Julia objects themselves (or, for String, as opaque wasm-string
+        # handles decoded through the string bridge); scalars arrive as wire
+        # types.
         jlargs = Any[]
         wi = 1
         for T in ats
@@ -2273,7 +2502,8 @@ function _offload_thunk(off::Offload)
                 push!(jlargs, ghost_instance(T))
             else
                 v = wireargs[wi]
-                push!(jlargs, kinds[wi] === :externref ? v : from_wire(T, v))
+                push!(jlargs, kinds[wi] !== :externref ? from_wire(T, v) :
+                              T === String ? _bridge_tostring(v) : v)
                 wi += 1
             end
         end
@@ -2286,7 +2516,8 @@ function _offload_thunk(off::Offload)
             ret === nothing && return (_wire_zero(other), Int32(0))
             return (to_wire(other, ret), Int32(1))
         end
-        return off.results[1] === :externref ? ret : to_wire(rt, ret)
+        off.results[1] === :externref || return to_wire(rt, ret)
+        return rt === String ? _bridge_fromstring(ret::String) : ret
     end
     return thunk
 end

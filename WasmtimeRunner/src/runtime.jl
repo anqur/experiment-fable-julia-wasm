@@ -230,6 +230,25 @@ function _externref_new(ctx::Ptr{Cvoid}, obj)::ValUnion
     return union_ref(out[])
 end
 
+"""
+An externref received from wasm that carries no host data — typically a
+wasm-GC object externalized with `extern.convert_any` (e.g. a compiled
+module's String). Opaque on the host: hold it, pass it back into wasm, or
+read it through module exports (see `string_codec`). The underlying GC root
+lives until the store is torn down; handles surfaced inside host-function
+callbacks borrow the callback's root and are only valid for its duration.
+"""
+mutable struct OpaqueExtern
+    val::CVal
+end
+
+function _opaque_clone(::Ptr{Cvoid}, x::OpaqueExtern)::ValUnion
+    out = Ref(CRef())
+    ccall((:wasmtime_externref_clone, libwasmtime), Cvoid,
+          (Ref{CRef}, Ref{CRef}), Ref(unwrap_ref(x.val.of)), out)
+    return union_ref(out[])
+end
+
 function _externref_unwrap(ctx::Ptr{Cvoid}, u::ValUnion)
     r = unwrap_ref(u)
     r.store_id == 0 && return nothing
@@ -254,6 +273,8 @@ function to_cval(ctx::Ptr{Cvoid}, kind::Symbol, x)::CVal
     kind === :f64 && return CVal(WASMTIME_F64, union_f64(Float64(x)))
     if kind === :externref
         x === nothing && return CVal(WASMTIME_EXTERNREF, ValUnion())
+        x isa OpaqueExtern &&
+            return CVal(WASMTIME_EXTERNREF, _opaque_clone(ctx, x))
         return CVal(WASMTIME_EXTERNREF, _externref_new(ctx, x))
     end
     if kind === :funcref
@@ -286,9 +307,21 @@ function from_cval(ctx::Ptr{Cvoid}, v::CVal; unroot::Bool=false,
     elseif v.kind == WASMTIME_F64
         return unwrap_f64(v.of)
     elseif v.kind == WASMTIME_EXTERNREF
-        obj = _externref_unwrap(ctx, v.of)
-        unroot && _unroot_val(v)
-        return obj
+        r0 = unwrap_ref(v.of)
+        if r0.store_id == 0
+            unroot && _unroot_val(v)
+            return nothing
+        end
+        data = ccall((:wasmtime_externref_data, libwasmtime), Ptr{Cvoid},
+                     (Ptr{Cvoid}, Ref{CRef}), ctx, Ref(r0))
+        if data != C_NULL
+            obj = (unsafe_pointer_to_objref(data)::ExternRef).obj
+            unroot && _unroot_val(v)
+            return obj
+        end
+        # no host data: an externalized wasm-GC object. Keep the root (it
+        # falls with the store) and surface an opaque pass-back handle.
+        return OpaqueExtern(v)
     elseif v.kind == WASMTIME_FUNCREF
         f = unwrap_funcref(v.of)
         f.store_id == 0 && return nothing
@@ -680,3 +713,36 @@ function exports(inst::Instance)
 end
 
 Base.getindex(inst::Instance, name::AbstractString) = exports(inst)[String(name)]
+
+"""
+    string_codec(inst::Instance) -> (tostring, fromstring)
+
+Codec for wasm-resident strings (WasmCodegen's GC-byte-array representation)
+over the module's `__str_new`/`__str_set`/`__str_len`/`__str_get` exports.
+`tostring(handle)::String` reads an `OpaqueExtern` string handle out of wasm;
+`fromstring(s::String)` builds a fresh wasm string and returns its handle.
+Suitable for `WasmCodegen.string_bridge[]`.
+"""
+function string_codec(inst::Instance)
+    ex = exports(inst)
+    snew = ex["__str_new"]::WasmFunc
+    sset = ex["__str_set"]::WasmFunc
+    slen = ex["__str_len"]::WasmFunc
+    sget = ex["__str_get"]::WasmFunc
+    tostring = function (h)
+        n = Int(slen(h)::Int32)
+        buf = Vector{UInt8}(undef, n)
+        for i in 1:n
+            buf[i] = UInt8(sget(h, Int32(i - 1))::Int32 & 0xff)
+        end
+        return String(buf)
+    end
+    fromstring = function (s::String)
+        h = snew(Int32(ncodeunits(s)))
+        for (i, b) in enumerate(codeunits(s))
+            sset(h, Int32(i - 1), Int32(b))
+        end
+        return h
+    end
+    return (tostring=tostring, fromstring=fromstring)
+end

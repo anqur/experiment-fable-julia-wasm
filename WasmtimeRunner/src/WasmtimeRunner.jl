@@ -29,8 +29,8 @@ include("abi.jl")
 include("runtime.jl")
 
 export Engine, Store, CompiledModule, Linker, Instance,
-       WasmFunc, WasmGlobal, WasmMemory, ExternRef,
+       WasmFunc, WasmGlobal, WasmMemory, ExternRef, OpaqueExtern,
        define_func!, define_global!, instantiate, exports, validate_module, context,
-       WasmtimeError, WasmTrap, store_gc!
+       WasmtimeError, WasmTrap, store_gc!, string_codec
 
 end # module WasmtimeRunner

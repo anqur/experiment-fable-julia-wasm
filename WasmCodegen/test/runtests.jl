@@ -22,13 +22,17 @@ function wasm_callable(f, argtypes::Type{<:Tuple})
     end
     inst = instantiate(lk, store, CompiledModule(ENGINE, comp.bytes))
     wf = inst[comp.entry]
+    # strings are wasm-GC-resident: build/read them through the __str_* exports
+    codec = haskey(exports(inst), "__str_new") ? string_codec(inst) : nothing
     argts = collect(argtypes.parameters)
-    rt = nothing
     return function (args...)
-        # host-resident (externref) arguments pass through as Julia objects
-        wire = Any[WasmCodegen.scalar_repr(T) === nothing ? a : WasmCodegen.to_wire(T, a)
+        codec === nothing || (WasmCodegen.string_bridge[] = codec)
+        wire = Any[T === String && codec !== nothing ? codec.fromstring(a) :
+                   WasmCodegen.scalar_repr(T) === nothing ? a :
+                   WasmCodegen.to_wire(T, a)
                    for (T, a) in zip(argts, args)]
-        return wf(wire...)
+        r = wf(wire...)
+        return r isa OpaqueExtern && codec !== nothing ? codec.tostring(r) : r
     end
 end
 

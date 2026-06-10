@@ -22,11 +22,13 @@ for (name, v) in comp.hostconsts
 end
 inst = instantiate(lk, store, CompiledModule(eng, comp.bytes))
 wf = inst[comp.entry]
+codec = string_codec(inst)
+WasmCodegen.string_bridge[] = codec
 
 function wasm_events(src::String)
     empty!(TOKEN_SINK[])
     empty!(NODE_SINK[])
-    wf(src)
+    wf(codec.fromstring(src))
     return copy(TOKEN_SINK[]), copy(NODE_SINK[])
 end
 
