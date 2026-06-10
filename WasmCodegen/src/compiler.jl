@@ -263,6 +263,22 @@ function valtype_for(mc::ModuleCompiler, @nospecialize T)
             # scalar: box into a single-field struct; nothing is null
             vt isa NumType && return RefType(true, HeapType(gc_box!(mc, other)))
         end
+        # general small unions of concrete scalars/structs: anyref, with
+        # scalars boxed per-type; Nothing (if present) is null. ref.test/
+        # ref.cast against the box/struct types recover the variants.
+        ok = true
+        for u in U
+            u === Nothing && continue
+            if scalar_repr(u) !== nothing
+                gc_box!(mc, u)
+            elseif is_gc_struct(u)
+                gc_struct!(mc, u)
+            else
+                ok = false
+                break
+            end
+        end
+        ok && return RefType(true, AnyHT)
         throw(CompileError("unsupported union type $T"))
     end
     if T isa DataType && T <: GenericMemory
@@ -636,14 +652,21 @@ function emit_value_typed!(fc::FuncCompiler, @nospecialize(ref), @nospecialize(T
     vt = valtype_for(fc.mc, T)
     vt === nothing && return            # ghost context: no value at all
     if vt isa NumType
-        # boxed Union{Nothing,scalar} flowing into a refined scalar context:
-        # unbox (the value is provably non-null here)
+        # boxed union flowing into a refined scalar context: unbox (the value
+        # is provably of type T here)
         Tsrc = widen(argtype(fc, ref))
         if Tsrc isa Union
             bi = union_box_info(fc.mc, Tsrc)
             if bi !== nothing
                 emit_value!(fc, ref)
                 emit!(fc, struct_get(bi[1], 0))
+                emit_norm!(fc, T)
+                return
+            end
+            if valtype_for(fc.mc, Tsrc) isa RefType   # general anyref union
+                box = gc_box!(fc.mc, T)
+                emit_value!(fc, ref)
+                emit!(fc, ref_cast(HeapType(box)), struct_get(box, 0))
                 emit_norm!(fc, T)
                 return
             end
@@ -660,6 +683,13 @@ function emit_value_typed!(fc::FuncCompiler, @nospecialize(ref), @nospecialize(T
         if bi !== nothing && !(Tsrc isa Union) && scalar_repr(Tsrc) !== nothing
             emit_value!(fc, ref)
             emit!(fc, struct_new(bi[1]))
+            return
+        end
+        # scalar flowing into a general anyref union: box at its own type
+        if T isa Union && vt.ht == AnyHT && !(Tsrc isa Union) &&
+           scalar_repr(Tsrc) !== nothing
+            emit_value!(fc, ref)
+            emit!(fc, struct_new(gc_box!(fc.mc, Tsrc)))
             return
         end
     end
@@ -908,6 +938,33 @@ function emit_call!(fc::FuncCompiler, i::Int, ex::Expr)
                 emit!(fc, ref_is_null())
             else
                 throw(CompileError("isa $Tv -> $Tt unsupported"))
+            end
+        elseif Tv isa Union && valtype_for(fc.mc, Tv) == RefType(true, AnyHT)
+            # anyref union: variant test via ref.test on box/struct types
+            if Tt === Nothing
+                emit_value!(fc, args[1])
+                emit!(fc, ref_is_null())
+            else
+                members = Any[u for u in Base.uniontypes(Tt isa Union ? Tt : Union{Tt,Union{}})]
+                _heap_of(u) = scalar_repr(u) !== nothing ?
+                    HeapType(gc_box!(fc.mc, u)) :
+                    HeapType(gc_struct!(fc.mc, u).typeidx)
+                all(u -> u === Nothing || scalar_repr(u) !== nothing ||
+                        is_gc_struct(u), members) ||
+                    throw(CompileError("isa $Tv -> $Tt unsupported"))
+                v = scratch_local!(fc, RefType(true, AnyHT))
+                emit_value!(fc, args[1])
+                emit!(fc, local_set(v))
+                first_test = true
+                for u in members
+                    if u === Nothing
+                        emit!(fc, local_get(v), ref_is_null())
+                    else
+                        emit!(fc, local_get(v), ref_test(_heap_of(u)))
+                    end
+                    first_test || emit!(fc, Inst(:i32_or))
+                    first_test = false
+                end
             end
         else
             throw(CompileError("dynamic isa $Tv -> $Tt unsupported"))

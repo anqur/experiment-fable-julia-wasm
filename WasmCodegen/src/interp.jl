@@ -34,15 +34,22 @@ Base.Experimental.@overlay WASM_MT @noinline Base.codeunit(s::String, i::Int64) 
 Base.Experimental.@overlay WASM_MT @noinline Base.ncodeunits(s::String) =
     (Base.inferencebarrier(0))::Int64
 
-# utf8proc-backed character predicates (C calls in Base)
-Base.Experimental.@overlay WASM_MT @noinline Base.is_id_start_char(c::Char) =
-    (Base.inferencebarrier(false))::Bool
+# utf8proc-backed character predicates: pure-Julia semantic overlays via
+# UnicodeNext + the charmap.jl port of julia_extensions.c — these compile
+# INTO wasm, so no host-side unicode support is needed. (Character classes
+# of codepoints assigned after UnicodeNext's data version may differ from
+# the running Julia's utf8proc; the port logic itself is validated exact.)
+Base.Experimental.@overlay WASM_MT Base.is_id_start_char(c::Char) =
+    wasm_id_start_char(UInt32(c))
 
-Base.Experimental.@overlay WASM_MT @noinline Base.is_id_char(c::Char) =
-    (Base.inferencebarrier(false))::Bool
+Base.Experimental.@overlay WASM_MT Base.is_id_char(c::Char) =
+    wasm_id_char(UInt32(c))
 
-Base.Experimental.@overlay WASM_MT @noinline Base.Unicode.category_code(c::Char) =
-    (Base.inferencebarrier(Int32(0)))::Int32
+Base.Experimental.@overlay WASM_MT Base.Unicode.category_code(c::Char) =
+    Int32(Base.ismalformed(c) ? 31 : UnicodeNext.category_code(UInt32(c)))
+
+Base.Experimental.@overlay WASM_MT Base.Unicode.category_code(x::Integer) =
+    Int32(UnicodeNext.category_code(x))
 
 Base.Experimental.@overlay WASM_MT @noinline function Base.unsafe_copyto!(
         dest::MemoryRef{T}, src::MemoryRef{T}, n::Int64) where {T}
@@ -66,6 +73,15 @@ Base.Experimental.@overlay WASM_MT function Base.unsafe_wrap(::Type{Vector{UInt8
     return v
 end
 
+Base.Experimental.@overlay WASM_MT function Base.Unicode.isgraphemebreak!(
+        state::Ref{Int32}, c1::AbstractChar, c2::AbstractChar)
+    if Base.ismalformed(c1) || Base.ismalformed(c2)
+        state[] = 0
+        return true
+    end
+    return UnicodeNext.grapheme_break_stateful(UInt32(c1), UInt32(c2), state)
+end
+
 # memchr-backed byte search: plain Julia scan over codeunit hostcalls
 Base.Experimental.@overlay WASM_MT function Base.findnext(
         pred::Base.Fix2{typeof(==),UInt8}, a::Base.CodeUnits{UInt8,String}, i::Int64)
@@ -78,25 +94,6 @@ Base.Experimental.@overlay WASM_MT function Base.findnext(
         j += 1
     end
     return nothing
-end
-
-# Grapheme-break detection (utf8proc, stateful via Ref{Int32}): route through a
-# scalar-only helper that must NOT compile (the non-const global read pins it
-# to the host; otherwise the overlay below would recurse into it).
-_HOST_ONLY::Bool = true
-
-@noinline function _grapheme_break_packed(c1::Char, c2::Char, state::Int32)
-    _HOST_ONLY || return Int64(0)
-    r = Ref(state)
-    b = Base.Unicode.isgraphemebreak!(r, c1, c2)
-    return (Int64(b) << 32) | Int64(reinterpret(UInt32, r[]))
-end
-
-Base.Experimental.@overlay WASM_MT function Base.Unicode.isgraphemebreak!(
-        state::Ref{Int32}, c1::AbstractChar, c2::AbstractChar)
-    packed = _grapheme_break_packed(Char(c1), Char(c2), state[])
-    state[] = reinterpret(Int32, UInt32(packed & 0xffffffff))
-    return (packed >> 32) != 0
 end
 
 # --- interception registry ------------------------------------------------------
@@ -124,12 +121,6 @@ function _register_intercepts!()
         InterceptSpec(:hostcall, Base.codeunit, nothing)
     INTERCEPTS[_overlay_method(Base.ncodeunits, Tuple{String})] =
         InterceptSpec(:hostcall, Base.ncodeunits, nothing)
-    INTERCEPTS[_overlay_method(Base.is_id_start_char, Tuple{Char})] =
-        InterceptSpec(:hostcall, Base.is_id_start_char, nothing)
-    INTERCEPTS[_overlay_method(Base.is_id_char, Tuple{Char})] =
-        InterceptSpec(:hostcall, Base.is_id_char, nothing)
-    INTERCEPTS[_overlay_method(Base.Unicode.category_code, Tuple{Char})] =
-        InterceptSpec(:hostcall, c -> Int32(Base.Unicode.category_code(c)), nothing)
     INTERCEPTS[_overlay_method(Base.unsafe_copyto!,
                                Tuple{MemoryRef{T},MemoryRef{T},Int64} where {T})] =
         InterceptSpec(:custom, Base.unsafe_copyto!, emit_memref_copy!)

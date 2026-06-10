@@ -27,6 +27,7 @@ Base.showerror(io::IO, e::CompileError) = print(io, "CompileError: ", e.msg)
 const CC = Core.Compiler
 
 include("reprs.jl")
+include("charmap.jl")
 include("interp.jl")
 include("intrinsics.jl")
 include("compiler.jl")

@@ -4,12 +4,14 @@ authors = ["Keno Fischer <keno@juliahub.com> and contributors"]
 version = "0.1.0"
 
 [deps]
+UnicodeNext = "7b9d9d2f-29eb-4111-b31d-f1cfc33d1412"
 WasmTools = "5d3dcfdb-8eae-450c-8bf9-209f91b22ad6"
 
 [compat]
 julia = "1.12"
 
 [sources]
+UnicodeNext = {path = "../vendor/UnicodeNext"}
 WasmTools = {path = "../WasmTools"}
 WasmtimeRunner = {path = "../WasmtimeRunner"}
 
