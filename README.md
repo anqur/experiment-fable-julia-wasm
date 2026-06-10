@@ -70,6 +70,18 @@ exception propagation across compiled-function boundaries, RadixSort
 internals (default `sort!`; `InsertionSort` compiles), wider unions,
 dynamic dispatch, closures as values.
 
+## Showcase: the JuliaSyntax lexer in the browser
+
+`examples/lexer/` compiles the actual `JuliaSyntax.Tokenize` lexer from
+optimized IR to a 1.1MB wasm module with **four** host imports (source-text
+byte access, `===` on host constants, and the token sink) — unicode
+classification runs in-wasm via vendored UnicodeNext tables shipped as wasm GC
+arrays. Token streams match the native lexer exactly on a corpus covering
+unicode operators, interpolated/triple strings, all numeric literal forms, and
+malformed input — verified under both wasmtime (`run_wasmtime.jl`) and V8
+(`examples/web/test_node.mjs`). `examples/web/index.html` is a live demo:
+type Julia code, token boundaries and kinds render from the wasm lexer.
+
 ## Testing strategy
 
 Every layer is differentially tested:
