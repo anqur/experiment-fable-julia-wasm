@@ -25,8 +25,15 @@ end
 
 """Renormalize the sub-word value on top of the stack for Julia type `T`."""
 function emit_norm!(fc, @nospecialize(T))
+    if T === Bool
+        # Bool results must stay in {0,1}: e.g. add_int(true,true) is false
+        # (1-bit wrap) and trunc_int(Bool, x) takes the low bit. Without the
+        # mask, raw i32 values like 2 or 6 escape and flip later branches.
+        emit!(fc, i32_const(1), Inst(:i32_and))
+        return
+    end
     r = scalar_repr(T)
-    (r === nothing || r.isfloat || r.bits >= 32 || T === Bool || T === Char) && return
+    (r === nothing || r.isfloat || r.bits >= 32 || T === Char) && return
     if r.signed
         emit!(fc, Inst(r.bits == 8 ? :i32_extend8_s : :i32_extend16_s))
     else
@@ -39,6 +46,20 @@ function emit_zeroext!(fc, @nospecialize(T))
     r = scalar_repr(T)
     (r.bits >= 32 || T === Bool || T === Char) && return
     emit!(fc, i32_const(r.bits == 8 ? 0xff : 0xffff), Inst(:i32_and))
+end
+
+"""
+Sign-extend the sub-word value on top of the stack at its logical width,
+regardless of the repr's signedness. Required by ops that fix a *signed
+interpretation* of the bits independent of the Julia type: `ashr_int`,
+`slt_int`/`sle_int`, `sext_int`, `sitofp`. (Signed reprs are already kept
+sign-extended, so this only changes unsigned sub-word operands; Bool needs no
+fix — natively it is an 8-bit 0/1, its own sign extension.)
+"""
+function emit_signext!(fc, @nospecialize(T))
+    r = scalar_repr(T)
+    (r === nothing || r.isfloat || r.bits >= 32 || T === Bool || T === Char) && return
+    emit!(fc, Inst(r.bits == 8 ? :i32_extend8_s : :i32_extend16_s))
 end
 
 function _intty(fc, ref)
@@ -59,13 +80,21 @@ function emit_binop!(fc, name::String, rt, args; norm::Bool=true)
     norm && emit_norm!(fc, rt)
 end
 
-"""Comparison producing Bool; uses the operand storage type."""
-function emit_cmp!(fc, name::String, args; unsigned_fix::Bool=false)
+"""
+Comparison producing Bool; uses the operand storage type. `unsigned_fix`
+zero-extends sub-word operands for `_u` comparisons on signed reprs;
+`signed_fix` sign-extends sub-word operands for `_s` comparisons on unsigned
+reprs (e.g. `slt_int` on UInt8 compares the bits as signed).
+"""
+function emit_cmp!(fc, name::String, args; unsigned_fix::Bool=false,
+                   signed_fix::Bool=false)
     T, r = _intty(fc, args[1])
     emit_value!(fc, args[1])
     unsigned_fix && !r.signed && emit_zeroext!(fc, T)
+    signed_fix && !r.signed && emit_signext!(fc, T)
     emit_value!(fc, args[2])
     unsigned_fix && !r.signed && emit_zeroext!(fc, T)
+    signed_fix && !r.signed && emit_signext!(fc, T)
     emit!(fc, _op(r.vt, name))
 end
 
@@ -87,7 +116,13 @@ function _emit_count!(fc, ref, target::NumType)
     if rc.vt == I32 && target == I64
         emit!(fc, Inst(:i64_extend_i32_u))
     elseif rc.vt == I64 && target == I32
-        emit!(fc, Inst(:i32_wrap_i64))
+        # Saturate before wrapping: a plain i32.wrap_i64 would alias counts
+        # like 2^32 (low 32 bits zero) with 0, defeating the `count < bits`
+        # guards below. 64 exceeds every logical width we shift at i32
+        # storage, so it is a safe "huge count" sentinel.
+        sc = scratch_local!(fc, I64)
+        emit!(fc, local_tee(sc), Inst(:i32_wrap_i64), i32_const(64),
+              local_get(sc), i64_const(64), Inst(:i64_lt_u), select())
     end
 end
 
@@ -113,9 +148,9 @@ function emit_shift!(fc, kind::Symbol, rt, args)
         emit!(fc, _const(vt, 0))
         emit!(fc, local_get(cnt), _const(vt, r.bits))
         emit!(fc, _op(vt, "lt_u"), select())
-    else # ashr: clamp count to storage width - 1; sign-extended repr is exact
+    else # ashr: clamp count to storage width - 1; sign-extended value is exact
         emit_value!(fc, args[1])
-        emit_norm!(fc, T)   # ensure sign-extended (e.g. ashr on UInt8)
+        emit_signext!(fc, T)   # signed interpretation even for unsigned reprs
         storage_bits = vt == I64 ? 64 : 32
         emit!(fc, local_get(cnt))
         emit!(fc, _const(vt, storage_bits - 1))
@@ -139,7 +174,10 @@ function emit_intconvert!(fc, kind::Symbol, rt, args)
         emit_zeroext!(fc, srcT)
         rs.vt == I32 && rd.vt == I64 && emit!(fc, Inst(:i64_extend_i32_u))
     elseif kind === :sext
-        emit_norm!(fc, srcT === Bool ? Int32 : srcT)
+        # sext interprets the source bits as signed regardless of the repr's
+        # signedness (sext_int(Int64, 0xff) == -1); Bool is natively an 8-bit
+        # 0/1 so it needs no extension.
+        emit_signext!(fc, srcT)
         rs.vt == I32 && rd.vt == I64 && emit!(fc, Inst(:i64_extend_i32_s))
     else # trunc
         rs.vt == I64 && rd.vt == I32 && emit!(fc, Inst(:i32_wrap_i64))
@@ -165,7 +203,30 @@ _reg!((fc, rt, args) -> emit_binop!(fc, "mul", rt, args), :mul_int)
 _reg!((fc, rt, args) -> emit_binop!(fc, "and", rt, args; norm=false), :and_int)
 _reg!((fc, rt, args) -> emit_binop!(fc, "or", rt, args; norm=false), :or_int)
 _reg!((fc, rt, args) -> emit_binop!(fc, "xor", rt, args), :xor_int)
-_reg!((fc, rt, args) -> emit_binop!(fc, "div_s", rt, args), :sdiv_int, :checked_sdiv_int)
+_reg!((fc, rt, args) -> emit_binop!(fc, "div_s", rt, args), :sdiv_int)
+_reg!(:checked_sdiv_int) do fc, rt, args
+    T, r = _intty(fc, args[1])
+    if !r.isfloat && r.signed && r.bits < 32
+        # i32.div_s only traps for the 32-bit typemin/-1 pair. The sub-word
+        # overflow (typemin(T) ÷ -1, which must raise DivideError in Julia)
+        # computes -typemin at i32 width and would silently wrap back to
+        # typemin under renormalization — guard it explicitly.
+        lo = Int32(r.bits == 8 ? -128 : -32768)
+        sa = scratch_local!(fc, I32)
+        sb = scratch_local!(fc, I32)
+        emit_value!(fc, args[1]); emit!(fc, local_set(sa))
+        emit_value!(fc, args[2]); emit!(fc, local_set(sb))
+        emit!(fc, local_get(sb), i32_const(-1), Inst(:i32_eq),
+              local_get(sa), i32_const(lo), Inst(:i32_eq), Inst(:i32_and), if_())
+        emit!(fc, unreachable(), end_())
+        emit!(fc, local_get(sa), local_get(sb), _op(I32, "div_s"))
+        emit_norm!(fc, rt)
+    else
+        # 32/64-bit overflow and ÷0 trap natively in wasm div_s
+        emit_binop!(fc, "div_s", rt, args)
+    end
+end
+# rem never overflows (typemin % -1 == 0 both natively and in wasm rem_s)
 _reg!((fc, rt, args) -> emit_binop!(fc, "rem_s", rt, args), :srem_int, :checked_srem_int)
 
 function _unsigned_divrem(name)
@@ -202,8 +263,8 @@ end
 
 _reg!((fc, rt, args) -> emit_cmp!(fc, "eq", args), :eq_int)
 _reg!((fc, rt, args) -> emit_cmp!(fc, "ne", args), :ne_int)
-_reg!((fc, rt, args) -> emit_cmp!(fc, "lt_s", args), :slt_int)
-_reg!((fc, rt, args) -> emit_cmp!(fc, "le_s", args), :sle_int)
+_reg!((fc, rt, args) -> emit_cmp!(fc, "lt_s", args; signed_fix=true), :slt_int)
+_reg!((fc, rt, args) -> emit_cmp!(fc, "le_s", args; signed_fix=true), :sle_int)
 _reg!((fc, rt, args) -> emit_cmp!(fc, "lt_u", args; unsigned_fix=true), :ult_int)
 _reg!((fc, rt, args) -> emit_cmp!(fc, "le_u", args; unsigned_fix=true), :ule_int)
 
@@ -301,6 +362,11 @@ _reg!(:fpiseq) do fc, rt, args
 end
 
 _reg!(:muladd_float) do fc, rt, args
+    # DOCUMENTED LATITUDE: Julia's muladd permits either fused (one rounding)
+    # or unfused (two roundings) evaluation. Native x86-64 fuses to fma; wasm
+    # has no fma instruction, so this emits mul+add and can differ from native
+    # in the last ulp for catastrophic cancellation cases. Value-exact
+    # differential tests must accept either rounding for muladd.
     T, r = _intty(fc, args[1])
     emit_value!(fc, args[1]); emit_value!(fc, args[2])
     emit!(fc, _op(r.vt, "mul"))
@@ -313,10 +379,21 @@ _reg!(:have_fma) do fc, rt, args
 end
 
 # float <-> int conversions: args are (Type, x)
+#
+# DOCUMENTED LATITUDE (fptosi/fptoui): Julia's unsafe_trunc returns "an
+# arbitrary value" for NaN/out-of-range inputs. We emit the deterministic
+# saturating wasm instructions (NaN -> 0, overflow -> typemin/typemax at
+# storage width); native x86 returns the cvttsd2si sentinel (INT_MIN, or
+# all-ones for AVX-512 unsigned), and other hosts differ again. Checked
+# conversions (Int64(x), trunc, round) raise/trap identically on both sides;
+# only unsafe_trunc on inexact inputs may diverge from the native value and
+# must be excluded from value-exact differential corpora.
 _reg!(:sitofp) do fc, rt, args
     srcT, rs = _intty(fc, args[2])
     rd = scalar_repr(rt)
-    emit_value!(fc, args[2]); emit_norm!(fc, srcT)
+    # signed interpretation of the source bits regardless of repr signedness
+    # (sitofp(Float64, 0xff) == -1.0)
+    emit_value!(fc, args[2]); emit_signext!(fc, srcT)
     suffix = rs.vt == I64 ? "convert_i64_s" : "convert_i32_s"
     emit!(fc, _op(rd.vt, suffix))
 end

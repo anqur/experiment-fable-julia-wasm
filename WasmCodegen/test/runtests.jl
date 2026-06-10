@@ -434,3 +434,232 @@ symcode(n::Int64) = symscore(symof(n)) * 2
     @test wf("hello") == 5
     @test wf("") == 0
 end
+
+# --- real Base library functions ------------------------------------------------
+
+basegcd(a::Int64, b::Int64) = gcd(a, b)
+basebinom(n::Int64, k::Int64) = binomial(n, k)
+baseisqrt(n::Int64) = isqrt(n)
+basehash(n::Int64) = reinterpret(Int64, hash(n))
+basemod(a::Int64, b::Int64) = mod(a, b)
+basefld(a::Int64, b::Int64) = fld(a, b)
+basesum(n::Int64) = sum(1:n)
+basegen(n::Int64) = sum(i * i for i in 1:n)
+basessf(n::Int64) = Int64(searchsortedfirst(1:100, n))
+basehypot(a::Float64, b::Float64) = hypot(a, b)
+basefloor(x::Float64) = floor(Int64, x)
+baseexp(x::Float64) = exp(x)
+basesin(x::Float64) = sin(x)
+baselog(x::Float64) = log(x)
+basestr(n::Int64) = Int64(length(string(n, base=16)))
+function basesort(n::Int64)
+    v = [((i * 7919) % 100) for i in 1:n]
+    sort!(v; alg=InsertionSort)
+    issorted(v) ? v[1] + v[end] : -1
+end
+
+@testset "Base library functions" begin
+    @difftest basegcd Tuple{Int64,Int64} [(12, 18), (0, 0), (typemin(Int64), 0),
+                                          (typemin(Int64), typemin(Int64))]
+    @difftest basebinom Tuple{Int64,Int64} [(10, 3), (60, 29), (5, 7), (66, 33)]
+    @difftest baseisqrt Tuple{Int64} [(0,), (99,), (10^12,), (-1,)]
+    @difftest basehash Tuple{Int64} [(0,), (123,), (-1,)]
+    @difftest basemod Tuple{Int64,Int64} [(7, 3), (-7, 3), (7, -3), (7, 0)]
+    @difftest basefld Tuple{Int64,Int64} [(7, 2), (-7, 2), (typemin(Int64), -1)]
+    @difftest basesum Tuple{Int64} [(0,), (100,), (12345,)]
+    @difftest basegen Tuple{Int64} [(0,), (10,), (100,)]
+    @difftest basessf Tuple{Int64} [(5,), (1000,), (-7,)]
+    @difftest basehypot Tuple{Float64,Float64} [(3.0, 4.0), (1e200, 1e200), (0.0, -0.0)]
+    @difftest basefloor Tuple{Float64} [(2.7,), (-2.7,), (1e300,), (NaN,)]
+    @difftest baseexp Tuple{Float64} [(0.0,), (1.0,), (-2.5,), (710.0,), (NaN,)]
+    @difftest basesin Tuple{Float64} [(0.0,), (1.5,), (100.0,), (1e10,)]
+    @difftest baselog Tuple{Float64} [(1.0,), (2.5,), (-1.0,), (0.0,)]
+    @difftest basestr Tuple{Int64} [(255,), (-16,), (0,)]
+    @difftest basesort Tuple{Int64} [(0,), (1,), (50,)]
+end
+
+# --- regression tests for audited findings --------------------------------------
+
+@testset "sub-word checked sdiv: typemin ÷ -1 must raise" begin
+    divi8(a, b) = a ÷ b
+    @difftest divi8 Tuple{Int8,Int8} [(Int8(-128), Int8(-1)), (Int8(-128), Int8(1)),
+                                      (Int8(7), Int8(2)), (Int8(7), Int8(0)),
+                                      (Int8(-7), Int8(3)), (Int8(127), Int8(-1))]
+    divi16(a, b) = a ÷ b
+    @difftest divi16 Tuple{Int16,Int16} [(Int16(-32768), Int16(-1)),
+                                         (Int16(-32768), Int16(2)),
+                                         (Int16(100), Int16(7)), (Int16(1), Int16(0))]
+    remi8(a, b) = a % b
+    @difftest remi8 Tuple{Int8,Int8} [(Int8(-128), Int8(-1)), (Int8(7), Int8(0)),
+                                      (Int8(-7), Int8(3))]
+end
+
+@testset "Char raw-bits representation" begin
+    charcp(c) = UInt32(c)                      # decodes raw bits -> codepoint
+    @difftest charcp Tuple{Char} [('a',), ('λ',), ('∀',), ('\0',), ('\U10FFFF',)]
+    charbits(c) = reinterpret(UInt32, c)       # bitcast: identity on raw bits
+    @difftest charbits Tuple{Char} [('a',), ('λ',), ('∀',)]
+    charid(c) = c                              # round-trip through the wire
+    @difftest charid Tuple{Char} [('a',), ('λ',), ('∀',)]
+    zextchar(c) = Core.Intrinsics.zext_int(UInt64, c)
+    @difftest zextchar Tuple{Char} [('a',), ('λ',)]
+    chlt(a, b) = a < b                         # ordering must stay correct
+    @difftest chlt Tuple{Char,Char} [('a', 'b'), ('b', 'a'), ('a', 'a'),
+                                     ('a', 'λ'), ('λ', 'a'), ('λ', '∀')]
+    cheq(a, b) = a == b
+    @difftest cheq Tuple{Char,Char} [('a', 'a'), ('a', 'b'), ('∀', '∀')]
+    mkchar(x) = Char(x)                        # checked construction from codepoint
+    @difftest mkchar Tuple{UInt32} [(UInt32(0x61),), (UInt32(0x3bb),), (UInt32(0x2200),)]
+end
+
+# Char crossing the wasm->host offload boundary (from_wire must invert to_wire)
+@noinline hostchar(c::Char) = (s = string(c); Int64(codepoint(s[1])))   # offloaded
+callhostchar(c::Char) = hostchar(c) + 1
+
+@testset "Char through offloaded host functions" begin
+    comp = compile_wasm(callhostchar, Tuple{Char})
+    @test length(comp.offloads) == 1
+    @difftest callhostchar Tuple{Char} [('a',), ('b',), ('λ',), ('∀',)]
+end
+
+@testset "shift counts >= 2^32 on i32-storage values" begin
+    shl32(x, n) = x << n
+    @difftest shl32 Tuple{Int32,Int64} [(Int32(1), Int64(2)^32), (Int32(1), Int64(2)^32 + 1),
+                                        (Int32(1), -(Int64(2)^32)), (Int32(1), Int64(31)),
+                                        (Int32(1), Int64(32)), (Int32(1), Int64(0)),
+                                        (Int32(-7), Int64(2)^32 + 5)]
+    shru8(x, n) = x >> n
+    @difftest shru8 Tuple{UInt8,Int64} [(UInt8(0x80), Int64(2)^32 + 1), (UInt8(0x80), Int64(4)),
+                                        (UInt8(0xff), Int64(2)^32), (UInt8(0xff), Int64(8))]
+    shlu32(x, n) = x << n
+    @difftest shlu32 Tuple{UInt32,UInt64} [(UInt32(1), UInt64(2)^32), (UInt32(1), UInt64(1)),
+                                           (UInt32(1), UInt64(2)^32 + 31)]
+    ashr8big(x, n) = Core.Intrinsics.ashr_int(x, n)
+    @difftest ashr8big Tuple{Int8,Int64} [(Int8(-128), Int64(2)^32), (Int8(-128), Int64(1)),
+                                          (Int8(-1), Int64(2)^32 + 2)]
+end
+
+@testset "signed-interpretation intrinsics on unsigned sub-word reps" begin
+    ashru8(x, n) = Core.Intrinsics.ashr_int(x, n)
+    @difftest ashru8 Tuple{UInt8,UInt64} [(UInt8(0x80), UInt64(1)), (UInt8(0xff), UInt64(100)),
+                                          (UInt8(0x40), UInt64(2)), (UInt8(0x01), UInt64(1))]
+    ashru16(x, n) = Core.Intrinsics.ashr_int(x, n)
+    @difftest ashru16 Tuple{UInt16,UInt64} [(UInt16(0x8000), UInt64(1)), (UInt16(0xffff), UInt64(50))]
+    sltu8(a, b) = Core.Intrinsics.slt_int(a, b)
+    @difftest sltu8 Tuple{UInt8,UInt8} [(UInt8(0x80), UInt8(0x01)), (UInt8(0x01), UInt8(0x80)),
+                                        (UInt8(0x7f), UInt8(0x80)), (UInt8(0x80), UInt8(0x80))]
+    sleu8(a, b) = Core.Intrinsics.sle_int(a, b)
+    @difftest sleu8 Tuple{UInt8,UInt8} [(UInt8(0x80), UInt8(0x01)), (UInt8(0x01), UInt8(0x80)),
+                                        (UInt8(0x80), UInt8(0x80))]
+    sltu16(a, b) = Core.Intrinsics.slt_int(a, b)
+    @difftest sltu16 Tuple{UInt16,UInt16} [(UInt16(0x8000), UInt16(0x0001)),
+                                           (UInt16(0x0001), UInt16(0x8000))]
+    sextu8(x) = Core.Intrinsics.sext_int(Int64, x)
+    @difftest sextu8 Tuple{UInt8} [(UInt8(0xff),), (UInt8(0x7f),), (UInt8(0x80),)]
+    sextu16(x) = Core.Intrinsics.sext_int(Int32, x)
+    @difftest sextu16 Tuple{UInt16} [(UInt16(0xffff),), (UInt16(0x7fff),)]
+    sitofpu8(x) = Core.Intrinsics.sitofp(Float64, x)
+    @difftest sitofpu8 Tuple{UInt8} [(UInt8(0xff),), (UInt8(0x7f),), (UInt8(0x80),)]
+    sitofpu16(x) = Core.Intrinsics.sitofp(Float64, x)
+    @difftest sitofpu16 Tuple{UInt16} [(UInt16(0xffff),), (UInt16(0x0001),)]
+    # signed reps must be unaffected (control)
+    ashri8(x, n) = Core.Intrinsics.ashr_int(x, n)
+    @difftest ashri8 Tuple{Int8,UInt64} [(Int8(-128), UInt64(1)), (Int8(64), UInt64(2))]
+    slti8(a, b) = Core.Intrinsics.slt_int(a, b)
+    @difftest slti8 Tuple{Int8,Int8} [(Int8(-1), Int8(1)), (Int8(1), Int8(-1))]
+end
+
+@testset "Bool results are normalized to {0,1}" begin
+    truncb(x) = Core.Intrinsics.trunc_int(Bool, x)
+    @difftest truncb Tuple{Int64} [(6,), (2,), (3,), (1,), (0,), (-1,)]
+    # bad Bools used to flip branches *inside* wasm (no wire decoding involved)
+    truncb_branch(x) = Core.Intrinsics.trunc_int(Bool, x) ? Int64(1) : Int64(2)
+    @difftest truncb_branch Tuple{Int64} [(6,), (3,), (0,)]
+    addb(a, b) = Core.Intrinsics.add_int(a, b)        # 1-bit wrap: true+true == false
+    @difftest addb Tuple{Bool,Bool} [(true, true), (true, false), (false, false)]
+    addb_branch(a, b) = Core.Intrinsics.add_int(a, b) ? Int64(10) : Int64(20)
+    @difftest addb_branch Tuple{Bool,Bool} [(true, true), (true, false), (false, false)]
+    zextb(x) = Core.Intrinsics.zext_int(Int64, Core.Intrinsics.trunc_int(Bool, x))
+    @difftest zextb Tuple{Int64} [(6,), (3,), (1,), (0,)]
+    modb(x) = x % Bool                                # control: and_int path
+    @difftest modb Tuple{Int64} [(6,), (3,), (0,)]
+end
+
+mutable struct CF
+    const a::Int64
+    b::Int64
+end
+setconst(x::Int64) = (c = CF(1, 2); setfield!(c, :a, x); getfield(c, :a))
+setnonconst(x::Int64) = (c = CF(1, 2); setfield!(c, :b, x); getfield(c, :b))
+
+@testset "setfield! on const fields traps like native throws" begin
+    @difftest setconst Tuple{Int64} [(5,), (1,)]      # native ErrorException ~ wasm trap
+    @difftest setnonconst Tuple{Int64} [(5,), (-3,)]  # plain fields still writable
+end
+
+mutable struct NodeQ
+    v::Int64
+end
+pickref(c, x, y) = Core.ifelse(c, NodeQ(x), NodeQ(y)).v
+
+@testset "Core.ifelse on GC refs uses typed select" begin
+    comp = compile_wasm(pickref, Tuple{Bool,Int64,Int64})
+    validate_module(ENGINE, comp.bytes)               # used to fail validation
+    @difftest pickref Tuple{Bool,Int64,Int64} [(true, 1, 2), (false, 1, 2)]
+end
+
+@noinline mkpair_noinline(x, y) = PairT(x, y)
+retpair(a::Int64, b::Int64) = mkpair_noinline(a, b)
+takepair(p::PairT{Int64}) = p.a + p.b
+
+@testset "GC-typed entry signatures raise CompileError (not a process abort)" begin
+    # wrapping such an export would abort the process inside wasmtime's
+    # wasm_valtype_kind; the compiler must refuse loudly instead
+    @test_throws CompileError compile_wasm(retpair, Tuple{Int64,Int64})
+    @test_throws CompileError compile_wasm(takepair, Tuple{PairT{Int64}})
+    err = try compile_wasm(retpair, Tuple{Int64,Int64}); nothing catch e; e end
+    @test err isa CompileError && occursin("boundary", err.msg)
+end
+
+@testset "muladd documented latitude: fused or unfused, never anything else" begin
+    mm(a, b, c) = muladd(a, b, c)
+    wf = wasm_callable(mm, Tuple{Float64,Float64,Float64})
+    for (a, b, c) in [(1 + 2.0^-52, 1 + 2.0^-52, -(1 + 2.0^-51)),
+                      (2.0, 3.0, 1.0), (0.1, 0.2, 0.3),
+                      (1e308, 10.0, -Inf), (NaN, 1.0, 1.0)]
+        w = wf(a, b, c)
+        @test isequal(w, a * b + c) || isequal(w, fma(a, b, c))
+    end
+    mm32(a, b, c) = muladd(a, b, c)
+    wf32 = wasm_callable(mm32, Tuple{Float32,Float32,Float32})
+    for (a, b, c) in [(1 + Float32(2.0)^-23, 1 + Float32(2.0)^-23, -(1 + Float32(2.0)^-22)),
+                      (2.0f0, 3.0f0, 1.0f0)]
+        w = wf32(a, b, c)
+        @test isequal(w, a * b + c) || isequal(w, fma(a, b, c))
+    end
+end
+
+@testset "unsafe_trunc documented latitude: wasm saturates deterministically" begin
+    ut64(x) = unsafe_trunc(Int64, x)
+    wf = wasm_callable(ut64, Tuple{Float64})
+    @test wf(1.9) === Int64(1) && wf(-2.9) === Int64(-2)      # in-range: exact
+    @test wf(NaN) === Int64(0)                                # wasm trunc_sat
+    @test wf(1e300) === typemax(Int64)
+    @test wf(-1e300) === typemin(Int64)
+    utu64(x) = unsafe_trunc(UInt64, x)
+    wfu = wasm_callable(utu64, Tuple{Float64})
+    @test wfu(3.7) === Int64(3)        # wire repr of UInt64(3)
+    @test wfu(NaN) === Int64(0)
+    @test wfu(-1.5) === Int64(0)
+    ut8(x) = unsafe_trunc(Int8, x)
+    wf8 = wasm_callable(ut8, Tuple{Float64})
+    @test wf8(7.9) === Int32(7)        # wire repr of Int8(7)
+    @test wf8(1e12) === Int32(-1)      # saturated at i32 width, then wrapped
+    # defined-behavior conversions must match native exactly (errors and all)
+    chk64(x) = Int64(x)
+    @difftest chk64 Tuple{Float64} [(3.0,), (3.5,), (NaN,), (1e300,), (-0.0,)]
+    rnd64(x) = round(Int64, x)
+    @difftest rnd64 Tuple{Float64} [(2.5,), (-2.5,), (NaN,), (1e300,), (0.49,)]
+    trc64(x) = trunc(Int64, x)
+    @difftest trc64 Tuple{Float64} [(2.9,), (-2.9,), (NaN,), (1e300,)]
+end

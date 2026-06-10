@@ -3,6 +3,13 @@
 # Scalars are stored in i32/i64/f32/f64. Sub-word integers (Int8/16, UInt8/16)
 # live in i32 with a normalization discipline: signed values are kept
 # sign-extended, unsigned values zero-extended; arithmetic renormalizes.
+#
+# Char is stored as its RAW 32-bit pattern (UTF-8 bytes left-justified) — the
+# exact same representation native Julia uses — both inside wasm and on the
+# wire. This makes bitcast/zext/trunc on Char identity operations and keeps
+# Base's codepoint decoding (e.g. `UInt32(::Char)`) bit-faithful. Do NOT store
+# the codepoint anywhere: mixing the two conventions silently corrupts every
+# Char that crosses the boundary.
 
 struct ScalarRepr
     vt::NumType      # wasm storage type
@@ -56,6 +63,7 @@ end
 """Convert a host value arriving as i32/i64/f32/f64 back to Julia type `T`."""
 function from_wire(@nospecialize(T), v)
     T === Bool && return v != 0
+    # Char travels as its raw bit pattern (must invert `to_wire` exactly)
     T === Char && return reinterpret(Char, UInt32(reinterpret(UInt32, Int32(v))))
     r = scalar_repr(T)
     r.isfloat && return T(v)
@@ -66,7 +74,7 @@ end
 """Convert a Julia scalar to what the wasm boundary expects."""
 function to_wire(@nospecialize(T), v)
     T === Bool && return Int32(v::Bool)
-    T === Char && return reinterpret(Int32, UInt32(v::Char))
+    T === Char && return reinterpret(Int32, v::Char)   # raw bits, not codepoint
     r = scalar_repr(T)
     r === nothing && throw(CompileError("unsupported boundary type $T"))
     r.isfloat && return T(v)

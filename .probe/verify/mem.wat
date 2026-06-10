@@ -1,1 +1,0 @@
-(module (memory (export "mem") 8 8) (data (i32.const 0) "\aa\bb"))

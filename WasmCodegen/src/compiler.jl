@@ -15,10 +15,15 @@ struct CallTarget
     mi::Core.MethodInstance
 end
 
+"""Call to an auto-generated host import for a builtin on host-resident values."""
+struct HostCall
+    key::Any    # e.g. (:sizeof, String)
+end
+
 struct Offload
-    mi::Core.MethodInstance
+    key::Any                   # MethodInstance, or a builtin HostCall key
     func::Any                  # the callable (singleton instance)
-    argtypes::Vector{Any}      # non-ghost Julia argument types
+    argtypes::Vector{Any}      # Julia argument types (ghosts reconstructed in thunk)
     rettype::Any
     params::Vector{Symbol}
     results::Vector{Symbol}
@@ -39,7 +44,7 @@ mutable struct ModuleCompiler
     bodies::Dict{Core.MethodInstance,Func}
     sigs::Dict{Core.MethodInstance,FuncType}
     offloads::Vector{Offload}
-    offload_ids::Dict{Core.MethodInstance,Int}
+    offload_ids::Dict{Any,Int}
     queue::Vector{Core.MethodInstance}
     failures::Dict{Core.MethodInstance,CompileError}
     gctypes::Vector{SubType}                      # GC type entries, one rec group
@@ -137,7 +142,10 @@ function gc_struct!(mc::ModuleCompiler, @nospecialize T)
         FT = ftypes[i]
         isghost(FT) && continue
         st = field_storage(mc, FT)
-        push!(fields, FieldType(st, mut))
+        # `const` fields of mutable structs are wasm-immutable too, so the
+        # validator rejects any struct.set we might erroneously emit for them
+        # (defense in depth; emit_setfield! already traps on const fields).
+        push!(fields, FieldType(st, mut && !Base.isconst(T, i)))
         fieldmap[i] = length(fields) - 1
     end
     mc.gctypes[idx+1] = SubType(StructType(fields))
@@ -175,6 +183,23 @@ function valtype_for(mc::ModuleCompiler, @nospecialize T)
         return ExternRefT
     end
     throw(CompileError("unsupported Julia type $T"))
+end
+
+"""
+Register a host import implementing a builtin over host-resident values
+(e.g. `sizeof(::String)`). Returns the `HostCall` immediate to emit.
+"""
+function request_hostcall!(mc::ModuleCompiler, key, func, argtypes::Vector{Any},
+                           @nospecialize rettype)
+    if !haskey(mc.offload_ids, key)
+        params = Symbol[offload_kind(mc, T) for T in argtypes if !isghost(T)]
+        results = Symbol[]
+        isghost(rettype) || rettype === Union{} || push!(results, offload_kind(mc, rettype))
+        name = "host_$(length(mc.offloads))_$(key isa Tuple ? key[1] : key)"
+        push!(mc.offloads, Offload(key, func, argtypes, rettype, params, results, name))
+        mc.offload_ids[key] = length(mc.offloads) - 1
+    end
+    return HostCall(key)
 end
 
 """Boundary kind for offloaded signatures: scalar kinds or `:externref`."""
@@ -242,10 +267,13 @@ function offload!(mc::ModuleCompiler, mi::Core.MethodInstance, why::Exception)
     _, rettype = method_ir(mi)
     rettype = widen(rettype)
     args = Any[T for T in argts[2:end]]   # full list; ghosts reconstructed in the thunk
-    params = Symbol[offload_kind(mc, T) for T in args if !isghost(T)]
-    results = Symbol[]
-    if !isghost(rettype) && rettype !== Union{}
-        push!(results, offload_kind(mc, rettype))
+    params, results = try
+        (Symbol[offload_kind(mc, T) for T in args if !isghost(T)],
+         (!isghost(rettype) && rettype !== Union{}) ? [offload_kind(mc, rettype)] : Symbol[])
+    catch err
+        err isa CompileError || rethrow()
+        throw(CompileError("cannot offload $(mi): $(err.msg); " *
+                           "original failure: $(sprint(showerror, why))"))
     end
     name = "offload_$(length(mc.offloads))_$(mi.def.name)"
     push!(mc.offloads, Offload(mi, ftype.instance, args, rettype, params, results, name))
@@ -311,7 +339,10 @@ function emit_const!(fc::FuncCompiler, @nospecialize v)
     elseif v isa Bool
         emit!(fc, i32_const(Int32(v)))
     elseif v isa Char
-        emit!(fc, i32_const(reinterpret(Int32, UInt32(v))))
+        # Char is stored as its RAW bits (UTF-8 bytes left-justified), exactly
+        # like native Julia — see reprs.jl. Storing the codepoint instead would
+        # silently break bitcast/zext (e.g. UInt32(c) decodes raw bits).
+        emit!(fc, i32_const(reinterpret(Int32, v)))
     elseif v isa Union{Int8,Int16,Int32}
         emit!(fc, i32_const(Int32(v)))
     elseif v isa Union{UInt8,UInt16}
@@ -434,8 +465,16 @@ function emit_call!(fc::FuncCompiler, i::Int, ex::Expr)
                 vb = valtype_for(fc.mc, Tb)
                 va isa RefType && vb isa RefType ||
                     throw(CompileError("=== on $Ta, $Tb"))
-                (va == ExternRefT || vb == ExternRefT) &&
-                    throw(CompileError("=== on host-resident (externref) values: $Ta"))
+                if va == ExternRefT || vb == ExternRefT
+                    # egal of host-resident values: route through a host import
+                    va == vb || throw(CompileError("=== mixing externref and GC values"))
+                    hc = request_hostcall!(fc.mc, (:egal,), ===,
+                                           Any[Ta, Tb], Bool)
+                    emit_value!(fc, args[1])
+                    emit_value!(fc, args[2])
+                    emit!(fc, Inst(:call, (hc,)))
+                    return true
+                end
                 ismutabletype(strip_nothing(Ta)) || ismutabletype(strip_nothing(Tb)) ||
                     throw(CompileError("=== (structural egal) on immutable structs $Ta"))
                 emit_value!(fc, args[1])
@@ -446,10 +485,14 @@ function emit_call!(fc::FuncCompiler, i::Int, ex::Expr)
         return true
     elseif f === Core.ifelse
         Tv = widen(rt)
-        emit_value!(fc, args[2])
-        emit_value!(fc, args[3])
+        vt = valtype_for(fc.mc, Tv)
+        vt === nothing && return true   # ghost result: no value, no effects
+        emit_value_typed!(fc, args[2], Tv)
+        emit_value_typed!(fc, args[3], Tv)
         emit_value!(fc, args[1])
-        emit!(fc, select())
+        # untyped `select` is restricted to numeric types; references need the
+        # typed form `select (result t)`
+        emit!(fc, vt isa RefType ? select_t(ValType[vt]) : select())
         return true
     elseif f === Core.getfield || f === Base.getfield
         obj = args[1]
@@ -502,6 +545,14 @@ function emit_call!(fc::FuncCompiler, i::Int, ex::Expr)
         Tv = argtype(fc, args[1])
         Tt isa Type && Tv <: Tt || throw(CompileError("dynamic typeassert $Tv::$Tt"))
         emit_value!(fc, args[1])
+        return true
+    elseif f === Core.sizeof
+        T = strip_nothing(argtype(fc, args[1]))
+        valtype_for(fc.mc, T) == ExternRefT ||
+            throw(CompileError("sizeof on wasm-resident type $T"))
+        hc = request_hostcall!(fc.mc, (:sizeof, T), Core.sizeof, Any[T], Int64)
+        emit_value!(fc, args[1])
+        emit!(fc, Inst(:call, (hc,)))
         return true
     elseif f === Core.memorynew
         return emit_memorynew!(fc, i, args)
@@ -685,6 +736,15 @@ function emit_getfield!(fc::FuncCompiler, i::Int, args)
         emit!(fc, array_len(), Inst(:i64_extend_i32_u))
         return true
     end
+    if To isa DataType && To <: Core.GenericMemoryRef
+        k = _const_fieldidx(To, args[2])
+        k == Base.fieldindex(To, :mem) ||
+            throw(CompileError("getfield(::MemoryRef, :ptr_or_offset) unsupported"))
+        mref = gc_memref!(fc.mc, To)
+        emit_value!(fc, args[1])
+        emit!(fc, struct_get(mref, 0))
+        return true
+    end
     is_gc_struct(To) || throw(CompileError("getfield on unsupported type $To"))
     info = gc_struct!(fc.mc, To)
     k = _const_fieldidx(To, args[2])
@@ -710,6 +770,14 @@ function emit_setfield!(fc::FuncCompiler, i::Int, args)
         throw(CompileError("setfield! on unsupported type $To"))
     info = gc_struct!(fc.mc, To)
     k = _const_fieldidx(To, args[2])
+    if Base.isconst(To, k) || Base.isfieldatomic(To, k)
+        # Native Julia throws at runtime ("const field ... cannot be changed" /
+        # ConcurrencyViolationError for plain writes to atomic fields). Trap to
+        # match; everything after is unreachable (stack-polymorphic), so the
+        # caller's local.set/drop still validates.
+        emit!(fc, unreachable())
+        return true
+    end
     FT = info.fieldtypes[k]
     if !isghost(FT)
         emit_value!(fc, args[1])
@@ -1035,14 +1103,19 @@ function compile_wasm(@nospecialize(f), @nospecialize(argtypes::Type{<:Tuple});
     # prune to functions reachable from the entry; collect live offloads
     live = Core.MethodInstance[]
     liveset = Set{Core.MethodInstance}()
-    liveoff = Set{Core.MethodInstance}()
+    liveoff = Set{Any}()
     stack = [mi]
     while !isempty(stack)
         cur = pop!(stack)
         cur in liveset && continue
         push!(liveset, cur); push!(live, cur)
         for inst in mc.bodies[cur].body
-            inst.op === :call && inst.imm[1] isa CallTarget || continue
+            inst.op === :call || continue
+            if inst.imm[1] isa HostCall
+                push!(liveoff, (inst.imm[1]::HostCall).key)
+                continue
+            end
+            inst.imm[1] isa CallTarget || continue
             t = (inst.imm[1]::CallTarget).mi
             st = mc.status[t]
             if st === :compiled
@@ -1055,7 +1128,20 @@ function compile_wasm(@nospecialize(f), @nospecialize(argtypes::Type{<:Tuple});
         end
     end
     sort!(live; by=m -> findfirst(==(m), mc.order))
-    offloads = [off for off in mc.offloads if off.mi in liveoff]
+    offloads = [off for off in mc.offloads if off.key in liveoff]
+
+    # The entry function's signature is the wasm<->host boundary: only scalars
+    # and externrefs can cross it. GC-typed (struct/array ref) params/results
+    # would not merely be unusable — wasmtime v45's C API *aborts the process*
+    # (wasm_valtype_kind is unimplemented for GC types) when the embedder wraps
+    # such an export. Fail loudly at compile time instead.
+    entry_sig = mc.sigs[mi]
+    for vt in Iterators.flatten((entry_sig.params, entry_sig.results))
+        vt isa NumType || vt == ExternRefT ||
+            throw(CompileError("entry function $name has a GC-reference boundary " *
+                               "type ($vt); only i32/i64/f32/f64 and host-resident " *
+                               "(externref) values can cross the wasm boundary"))
+    end
 
     # GC struct types occupy indices [0, N) as a single rec group, registered
     # before any function-signature types
@@ -1063,9 +1149,9 @@ function compile_wasm(@nospecialize(f), @nospecialize(argtypes::Type{<:Tuple});
 
     # assign final indices: offload imports first, then compiled funcs
     nimports = length(offloads)
-    offidx = Dict{Core.MethodInstance,Int}()
+    offidx = Dict{Any,Int}()
     for (k, off) in enumerate(offloads)
-        offidx[off.mi] = k - 1
+        offidx[off.key] = k - 1
         importfunc!(mc.wmod, "julia", off.name,
                     FuncType(ValType[_sym_vt(s) for s in off.params],
                              ValType[_sym_vt(s) for s in off.results]))
@@ -1090,12 +1176,16 @@ _sym_vt(s::Symbol) = s === :i64 ? I64 : s === :i32 ? I32 : s === :f64 ? F64 :
                      error("unknown boundary kind $s")
 
 function patch_calls!(body::Vector{Inst}, fidx::Dict{Core.MethodInstance,Int},
-                      offidx::Dict{Core.MethodInstance,Int})
+                      offidx::Dict{Any,Int})
     for (k, inst) in enumerate(body)
-        inst.op === :call && inst.imm[1] isa CallTarget || continue
-        mi = (inst.imm[1]::CallTarget).mi
-        idx = haskey(fidx, mi) ? fidx[mi] : offidx[mi]
-        body[k] = Inst(:call, (UInt32(idx),))
+        inst.op === :call || continue
+        if inst.imm[1] isa HostCall
+            body[k] = Inst(:call, (UInt32(offidx[(inst.imm[1]::HostCall).key]),))
+        elseif inst.imm[1] isa CallTarget
+            mi = (inst.imm[1]::CallTarget).mi
+            idx = haskey(fidx, mi) ? fidx[mi] : offidx[mi]
+            body[k] = Inst(:call, (UInt32(idx),))
+        end
     end
 end
 

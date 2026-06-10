@@ -182,3 +182,245 @@ end
     store_gc!(store)
     @test inst["makeAndSum"](1, 2) === Int64(6)
 end
+
+# --- regression tests for audited findings -------------------------------------
+
+@testset "externref roots are released (no leak)" begin
+    eng = Engine(); store = Store(eng)
+    m = WasmModule()
+    addfunc!(m, "ident", FuncType([ExternRefT], [ExternRefT]), ValType[],
+             [local_get(0)]; export_name="ident")
+    push!(m.globals, Global(GlobalType(ExternRefT, true), [ref_null(ExternHT)]))
+    push!(m.exports, Export("g", :global, 0))
+    bytes = encode(m)
+    inst = instantiate(store, CompiledModule(eng, bytes))
+    ident = inst["ident"]
+
+    # store.roots must not grow per call (it only retains host-function boxes)
+    obj = [1, 2, 3]
+    nroots0 = length(store.roots)
+    for _ in 1:1000
+        @assert ident(obj) === obj
+    end
+    @test length(store.roots) == nroots0
+
+    # Julia-side boxes are registered while wasm can reach the value and
+    # released once wasm's GC reclaims it (finalizer-based rooting).
+    table_count(marker) = Base.@lock WasmtimeRunner._EXTERNREF_TABLE_LOCK begin
+        count(b -> b.obj isa Tuple{Symbol,Int} && b.obj[1] === marker,
+              collect(keys(WasmtimeRunner._EXTERNREF_TABLE)))
+    end
+    marker = :leak_probe
+    let store2 = Store(eng), inst2 = instantiate(store2, CompiledModule(eng, bytes))
+        id2 = inst2["ident"]
+        for i in 1:200
+            id2((marker, i))
+        end
+        @test table_count(marker) == 200       # alive until the wasm GC runs
+        store_gc!(store2)                      # arg+result roots were unrooted
+        @test table_count(marker) == 0         # ... so the boxes are released
+        # objects held by wasm state survive Julia GC even with no Julia refs
+        g2 = inst2["g"]
+        g2[] = (marker, -1)
+        GC.gc(); GC.gc()
+        store_gc!(store2)
+        @test g2[] == (marker, -1)
+        @test table_count(marker) == 1
+        g2[] = nothing
+        store_gc!(store2)
+        @test table_count(marker) == 0
+        # store deletion releases everything that is still registered
+        for i in 1:50
+            id2((marker, i))
+        end
+        @test table_count(marker) == 50
+        finalize(store2)
+        @test table_count(marker) == 0
+    end
+
+    # externref global set/get round-trip (and set unroots its temporary)
+    g = inst["g"]
+    x = Dict(:k => 1)
+    g[] = x
+    @test g[] === x
+    nroots1 = length(store.roots)
+    for _ in 1:100
+        g[] = x
+    end
+    @test length(store.roots) == nroots1
+end
+
+@testset "read(WasmMemory) returns an owned copy" begin
+    eng = Engine()
+    m = WasmModule()
+    push!(m.mems, MemoryType(Limits(1, 2)))
+    push!(m.exports, Export("mem", :memory, 0))
+    push!(m.datas, Data(:active, 0, [i32_const(0)], UInt8[0xAA, 0xBB]))
+    bytes = encode(m)
+    buf = let store = Store(eng)
+        inst = instantiate(store, CompiledModule(eng, bytes))
+        b = read(inst["mem"])
+        finalize(store)   # wasmtime_store_delete unmaps the linear memory
+        b
+    end
+    GC.gc(); GC.gc()
+    # with the old unsafe_wrap view this segfaulted (use-after-free)
+    @test buf[1] == 0xAA && buf[2] == 0xBB
+    @test sum(Int, buf) == Int(0xAA) + Int(0xBB)
+    @test length(buf) == 65536
+end
+
+@testset "funcref round-trip" begin
+    eng = Engine(); store = Store(eng)
+    m = WasmModule()
+    importfunc!(m, "host", "echo", FuncType([FuncRefT], [FuncRefT]))      # idx 0
+    inc_t = FuncType([I64], [I64])
+    inc_tidx = addtype!(m, inc_t)
+    addfunc!(m, "inc", inc_t, ValType[],
+             [local_get(0), i64_const(1), i64_add()]; export_name="inc")  # idx 1
+    addfunc!(m, "getf", FuncType(ValType[], [FuncRefT]), ValType[],
+             [ref_func(1)]; export_name="getf")                           # idx 2
+    addfunc!(m, "mknullf", FuncType(ValType[], [FuncRefT]), ValType[],
+             [ref_null(FuncHT)]; export_name="mknullf")
+    addfunc!(m, "callf", FuncType([FuncRefT, I64], [I64]), ValType[],
+             [i32_const(0), local_get(0), table_set(0),
+              local_get(1), i32_const(0), call_indirect(inc_tidx, 0)];
+             export_name="callf")
+    addfunc!(m, "via_host", FuncType([I64], [I64]), ValType[],
+             [i32_const(0), ref_func(1), call(0), table_set(0),
+              local_get(0), i32_const(0), call_indirect(inc_tidx, 0)];
+             export_name="via_host")
+    push!(m.tables, Table(TableType(FuncRefT, Limits(1, 1))))
+
+    lk = Linker(eng)
+    define_func!(x -> x, lk, "host", "echo", [:funcref], [:funcref])
+    inst = instantiate(lk, store, CompiledModule(eng, encode(m)))
+
+    fr = inst["getf"]()
+    @test fr isa WasmFunc                      # wrapped, not a raw CFunc
+    @test fr.params == [:i64] && fr.results == [:i64]
+    @test fr(41) === Int64(42)                 # callable directly
+    @test inst["callf"](fr, 41) === Int64(42)  # and passable back into wasm
+    @test inst["mknullf"]() === nothing        # null funcref -> nothing
+    # funcref through a host function (host sees a raw CFunc and echoes it)
+    @test inst["via_host"](41) === Int64(42)
+end
+
+@testset "anyref/exnref results are loud, not silently collapsed" begin
+    eng = Engine(); store = Store(eng)
+    m = WasmModule()
+    # two non-null anyref globals holding *different* i31 values, plus a null one
+    push!(m.globals, Global(GlobalType(AnyRefT, true), [i32_const(1), ref_i31()]))
+    push!(m.globals, Global(GlobalType(AnyRefT, true), [i32_const(2), ref_i31()]))
+    push!(m.globals, Global(GlobalType(AnyRefT, true), [ref_null(AnyHT)]))
+    push!(m.exports, Export("g1", :global, 0))
+    push!(m.exports, Export("g2", :global, 1))
+    push!(m.exports, Export("gnull", :global, 2))
+    inst = instantiate(store, CompiledModule(eng, encode(m)))
+
+    # reading a non-null anyref must throw, never return a placeholder that
+    # would make two distinct wasm values compare isequal
+    @test_throws WasmtimeError inst["g1"][]
+    @test_throws WasmtimeError inst["g2"][]
+    @test inst["gnull"][] === nothing
+
+    # setting an anyref-typed global is rejected up front (no confusing
+    # wasmtime "type mismatch: expected (ref null any), found i64" error,
+    # and no silent :i64 fallback)
+    @test_throws ArgumentError inst["g1"][] = 5
+    @test_throws ArgumentError inst["gnull"][] = nothing
+end
+
+# Custom exception whose showerror itself throws: the host-function catch
+# block must still produce a clean trap and must not let the secondary
+# exception escape the @cfunction (that corrupts wasmtime's trap-handler
+# state and aborts the process on the NEXT genuine trap).
+struct EvilError <: Exception end
+Base.showerror(io::IO, ::EvilError) = error("buggy showerror")
+
+@testset "host exception with broken showerror still traps cleanly" begin
+    eng = Engine(); store = Store(eng)
+    m = WasmModule()
+    importfunc!(m, "host", "bad", FuncType(ValType[], [I64]))
+    addfunc!(m, "go", FuncType(ValType[], [I64]), ValType[], [call(0)];
+             export_name="go")
+    addfunc!(m, "boom", FuncType(ValType[], ValType[]), ValType[],
+             [unreachable()]; export_name="boom")
+    lk = Linker(eng)
+    define_func!(() -> throw(EvilError()), lk, "host", "bad", Symbol[], [:i64])
+    inst = instantiate(lk, store, CompiledModule(eng, encode(m)))
+    for _ in 1:5
+        err = try
+            inst["go"]()
+            nothing
+        catch e
+            e
+        end
+        @test err isa Union{WasmTrap,WasmtimeError}
+        @test occursin("showerror itself threw", err.msg)
+    end
+    # a later genuine trap must still unwind cleanly (no stale trap-handler state)
+    @test_throws WasmTrap inst["boom"]()
+    @test_throws WasmTrap inst["boom"]()
+end
+
+@testset "store lock: same-task wasm->host->wasm re-entrancy" begin
+    eng = Engine(); store = Store(eng)
+    m = WasmModule()
+    importfunc!(m, "host", "reenter", FuncType([I64], [I64]))
+    addfunc!(m, "double", FuncType([I64], [I64]), ValType[],
+             [local_get(0), i64_const(2), i64_mul()]; export_name="double")
+    addfunc!(m, "entry", FuncType([I64], [I64]), ValType[],
+             [local_get(0), call(0)]; export_name="entry")
+    lk = Linker(eng)
+    instref = Ref{Any}(nothing)
+    define_func!(lk, "host", "reenter", [:i64], [:i64]) do x
+        x <= 0 ? Int64(0) : instref[]["double"](x) + instref[]["entry"](x - 1)
+    end
+    inst = instantiate(lk, store, CompiledModule(eng, encode(m)))
+    instref[] = inst
+    @test inst["entry"](3) === Int64(12)   # 2*3 + 2*2 + 2*1 + 0
+end
+
+@testset "store lock: concurrent threaded calls on one store are safe" begin
+    # Without per-store locking, 8 threads hammering one store's GC-allocating
+    # export abort the process (wasmtime DRC collector data race). Run the
+    # workload in a subprocess so the regression would fail this test instead
+    # of killing the test runner.
+    script = joinpath(mktempdir(), "race_threads.jl")
+    write(script, """
+        using WasmtimeRunner, WasmTools, WasmTools.Instructions
+        eng = Engine(); store = Store(eng)
+        m = WasmModule()
+        boxt = addtype!(m, StructType([FieldType(I64, false)]))
+        body = [
+            block(), loop(),
+                local_get(1), local_get(0), i64_ge_s(), br_if(1),
+                local_get(1), struct_new(boxt), struct_get(boxt, 0),
+                local_get(2), i64_add(), local_set(2),
+                local_get(1), i64_const(1), i64_add(), local_set(1),
+                br(0),
+            end_(), end_(),
+            local_get(2),
+        ]
+        addfunc!(m, "churn", FuncType([I64], [I64]), ValType[I64, I64], body;
+                 export_name="churn")
+        inst = instantiate(store, CompiledModule(eng, encode(m)))
+        churn = inst["churn"]
+        n = Int64(1000); expected = n * (n - 1) ÷ 2
+        ok = Threads.Atomic{Int}(0)
+        ts = [Threads.@spawn begin
+                  good = true
+                  for _ in 1:100
+                      churn(n) == expected || (good = false)
+                  end
+                  good && Threads.atomic_add!(ok, 1)
+              end for _ in 1:8]
+        foreach(wait, ts)
+        ok[] == 8 || error("wrong results from \$(8 - ok[]) threads")
+        println("THREADTEST OK")
+        """)
+    cmd = `$(Base.julia_cmd()) -t 8 --project=$(Base.active_project()) $script`
+    out = read(ignorestatus(cmd), String)
+    @test occursin("THREADTEST OK", out)
+end
