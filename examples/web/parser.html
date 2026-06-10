@@ -61,12 +61,23 @@
                   border-left: 1px dotted #d0d7de; }
   #tree-wrap > ul { padding-left: 0; border-left: 0; }
   #tree-wrap li { margin: 1px 0; }
-  .nodekind { font-weight: 600; color: #6639ba; }
+  #tree-wrap li[data-node] > .nodeline { cursor: pointer; }
+  .nodeline { border-radius: 3px; padding: 0 2px; }
+  li.selected > .nodeline { background: #fff8c5; box-shadow: 0 0 0 1px #d4a72c; }
+  .nodekind { font-weight: 600; }
+  /* interior labels carry their box's depth color */
+  .nodekind.d0 { color: #d64545; } .nodekind.d1 { color: #d88a1e; }
+  .nodekind.d2 { color: #b09a12; } .nodekind.d3 { color: #3f9b3c; }
+  .nodekind.d4 { color: #2f7fc1; } .nodekind.d5 { color: #8a5bc7; }
   .nodekind.err { color: #ffffff; background: #d73a49; border-radius: 3px;
                   padding: 0 3px; }
-  .leafkind { color: #0969da; }
+  /* leaves mirror the editor's gray chips */
+  .leafkind {
+    color: #1f2328; background: rgba(31,35,40,.05);
+    border: 1px solid rgba(31,35,40,.25); border-radius: 3px; padding: 0 3px;
+  }
   .trivia { color: #b1b7be; }
-  .trivia .leafkind { color: #b1b7be; }
+  .trivia .leafkind { color: #b1b7be; background: none; border: none; padding: 0; }
   .range { color: #97a0a9; font-size: 11px; }
   .snippet { color: #1a7f37; }
   .snippet.trv { color: #b1b7be; }
@@ -168,6 +179,38 @@ try {
   throw e;
 }
 
+// preorder index of all nodes: assigns ids (mirrored as data-node in the
+// tree pane), depths, and trimmed extents for editor selections
+function indexNodes(roots) {
+  const list = [];
+  function rec(node, depth) {
+    const name = kindName(node.head & 0xffff);
+    const err = isErrName(name);
+    const trivia = node.leaf && isExtentSkipName(name) && !err;
+    const entry = { a: node.a, b: node.b, lo: node.a, hi: node.b,
+                    depth, err, trivia, leaf: !!node.leaf };
+    node._id = list.length;
+    node._depth = depth;
+    list.push(entry);
+    if (node.leaf) return trivia ? null : [node.a, node.b];
+    let lo = 0, hi = 0;
+    for (const c of node.children) {
+      const r = rec(c, depth + 1);
+      if (r !== null) {
+        if (lo === 0) lo = r[0];
+        hi = r[1];
+      }
+    }
+    if (lo !== 0) {
+      entry.lo = lo;
+      entry.hi = hi;
+    }
+    return [entry.lo, entry.hi];
+  }
+  for (const r of roots) rec(r, 0);
+  return list;
+}
+
 function renderNode(node, bytes, dec) {
   const kind = node.head & 0xffff;
   const name = kindName(kind);
@@ -178,16 +221,19 @@ function renderNode(node, bytes, dec) {
     const piece = dec.decode(bytes.subarray(node.a - 1, node.b));
     const shown = piece.length > 24 ? piece.slice(0, 24) + "…" : piece;
     const kcls = isErr ? "nodekind err" : "leafkind";
-    return `<li class="${isTrivia ? "trivia" : ""}"><span class="${kcls}">${esc(name)}</span> ` +
-           `<span class="snippet${isTrivia ? " trv" : ""}">${esc(JSON.stringify(shown))}</span> ${range}</li>`;
+    return `<li class="${isTrivia ? "trivia" : ""}" data-node="${node._id}">` +
+           `<span class="nodeline"><span class="${kcls}">${esc(name)}</span> ` +
+           `<span class="snippet${isTrivia ? " trv" : ""}">${esc(JSON.stringify(shown))}</span> ${range}</span></li>`;
   }
   const inner = node.children.map((c) => renderNode(c, bytes, dec)).join("");
-  return `<li><span class="nodekind${isErr ? " err" : ""}">[${esc(name)}]</span> ${range}` +
+  const kcls = isErr ? "nodekind err" : `nodekind d${node._depth % 6}`;
+  return `<li data-node="${node._id}"><span class="nodeline">` +
+         `<span class="${kcls}">[${esc(name)}]</span> ${range}</span>` +
          `<ul>${inner}</ul></li>`;
 }
 
 let mode = "tokens";
-let cached = null;   // { ev, text, bytes, b2c, roots }
+let cached = null;   // { ev, text, bytes, b2c, roots, index }
 
 // --- token mode: monaco inline decorations -----------------------------------
 function tokenDecorations() {
@@ -341,6 +387,66 @@ function applyHighlight() {
   }
 }
 
+// --- editor <-> tree-outline sync ---------------------------------------------
+let selectedLi = null;
+let syncing = false;
+
+function selectTreeNode(id, { scrollTree }) {
+  selectedLi?.classList.remove("selected");
+  selectedLi = id === null ? null : treeEl.querySelector(`li[data-node="${id}"]`);
+  if (selectedLi) {
+    selectedLi.classList.add("selected");
+    if (scrollTree) selectedLi.scrollIntoView({ block: "nearest" });
+  }
+}
+
+// 0-based byte offset of a 0-based char offset (inverse of byteToCharMap)
+function charToByte(off) {
+  const { b2c } = cached;
+  let lo = 0, hi = b2c.length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    b2c[mid] < off ? (lo = mid + 1) : (hi = mid);
+  }
+  return lo;
+}
+
+function deepestNodeAt(byte) {
+  let best = null;
+  cached.index.forEach((e, id) => {
+    if (e.trivia || byte < e.a || byte > e.b) return;
+    if (best === null || e.depth >= cached.index[best].depth) best = id;
+  });
+  return best;
+}
+
+function syncFromCursor() {
+  if (!cached) return;
+  const pos = editor.getPosition();
+  const byte = charToByte(model.getOffsetAt(pos)) + 1;
+  selectTreeNode(deepestNodeAt(byte), { scrollTree: true });
+}
+
+treeEl.addEventListener("click", (ev) => {
+  const li = ev.target.closest("li[data-node]");
+  if (!li || !cached) return;
+  ev.stopPropagation();
+  const e = cached.index[+li.dataset.node];
+  const { b2c } = cached;
+  const s = model.getPositionAt(b2c[e.lo - 1]);
+  const en = model.getPositionAt(Math.max(b2c[e.hi], b2c[e.lo - 1]));
+  const range = new monaco.Range(s.lineNumber, s.column, en.lineNumber, en.column);
+  syncing = true;
+  editor.setSelection(range);
+  editor.revealRangeInCenterIfOutsideViewport(range);
+  syncing = false;
+  selectTreeNode(+li.dataset.node, { scrollTree: false });
+});
+
+editor.onDidChangeCursorPosition(() => {
+  if (!syncing) syncFromCursor();
+});
+
 function render() {
   const text = model.getValue();
   const bytes = new TextEncoder().encode(text);
@@ -355,9 +461,12 @@ function render() {
   }
   const dt = (performance.now() - t0).toFixed(1);
   const roots = buildTree(ev.tokens, ev.nodes, TOMBSTONE);
-  cached = { ev, text, bytes, b2c: byteToCharMap(text), roots };
+  const index = indexNodes(roots);
+  cached = { ev, text, bytes, b2c: byteToCharMap(text), roots, index };
   applyHighlight();
   treeEl.innerHTML = roots.map((r) => renderNode(r, bytes, dec)).join("");
+  selectedLi = null;
+  syncFromCursor();   // re-highlight the node under the (possibly new) cursor
   status.textContent =
     `${ev.tokens.length} tokens, ${ev.nodes.length} tree nodes in ${dt} ms (wasm)`;
 }
