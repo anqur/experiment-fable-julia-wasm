@@ -314,8 +314,11 @@ function renderBoxes() {
     // (e.g. the $ before an interpolation's parens, or adjacent tokens in
     // z^2), the edge stays flush so neighboring boxes share one seam
     const oneLine = e.u.bottom - e.u.top < 1.5 * lineH;
-    const padL = !oneLine || spacey(text[b2c[e.lo - 1] - 1]) ? pad : 0;
+    let padL = !oneLine || spacey(text[b2c[e.lo - 1] - 1]) ? pad : 0;
     const padR = !oneLine || spacey(text[b2c[e.hi]]) ? pad : 0;
+    // content space is clipped at x=0 (the line-number margin starts there):
+    // column-1 boxes can only outset into what's actually available
+    padL = Math.min(padL, Math.max(e.u.left, 0));
     const d = document.createElement("div");
     d.className = e.err ? "bb bb-err" : e.leaf ? "bb bb-leaf" : `bb b${e.depth % 6}`;
     d.title = e.name;
