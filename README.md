@@ -1,104 +1,93 @@
 # Julia → WebAssembly (WasmGC backend)
 
 A layered stack for compiling Julia to WebAssembly using wasm's GC proposal,
-with wasmtime as the reference execution engine and the browser (V8) as the
+with wasmtime as the reference execution engine and the browser as the
 ultimate target.
+
+**Live demo:** the actual `JuliaSyntax.Tokenize` lexer, compiled from Julia's
+optimized IR and lexing as you type, entirely client-side:
+**<https://kenoaistaging.github.io/experiment-fable-julia-wasm/>**
 
 ## Packages
 
 | Package | Purpose |
 |---|---|
-| `WasmTools/` | Pure-Julia reader/writer/manipulator for wasm binaries. Full wasm 3.0 coverage: WasmGC (struct/array/ref types, rec groups, subtyping), function references, tail calls, exception handling, bulk memory, multi-memory, memory64 limits. Byte-stable round trips; fuzzed against `wasm-tools smith`. Zero dependencies. |
-| `WasmtimeRunner/` | Embeds [wasmtime](https://wasmtime.dev) v45 via its C API: load/validate/instantiate modules, call exports, define host functions backed by Julia callables, bind arbitrary Julia values into wasm as `externref`. Traps and engine errors surface as Julia exceptions. |
-| `WasmCodegen/` | Translator from Julia's optimized SSA IR (`Base.code_ircode`) to wasm. Engine-agnostic (depends only on WasmTools). Calls it cannot translate become *offload imports* — host functions that call back into native Julia, so partial programs run end-to-end while the compiler grows. |
+| `WasmTools/` | Pure-Julia reader/writer for wasm binaries. Full wasm 3.0: WasmGC (struct/array/ref types, rec groups, subtyping), function references, tail calls, exception handling, bulk memory, multi-memory. Byte-stable round trips; fuzzed against `wasm-tools smith`. Zero dependencies. |
+| `WasmtimeRunner/` | Embeds [wasmtime](https://wasmtime.dev) via `Wasmtime_jll` (pinned to v45): load/validate/instantiate modules, call exports, define host functions backed by Julia callables, bind Julia values into wasm as `externref`. Traps and engine errors surface as Julia exceptions. |
+| `WasmCodegen/` | Translator from Julia's optimized SSA IR to wasm. Engine-agnostic (depends only on WasmTools + vendored UnicodeNext). Untranslatable callees become *offload imports* — host functions calling back into native Julia — so partial programs run end-to-end while the compiler grows. |
 
 ## Quick start
 
-```bash
-export JULIA_DEPOT_PATH=/workspace/.julia:$HOME/.julia
-julia --project=/workspace            # top-level env devs all three packages
-```
-
 ```julia
+# julia --project=.   (the top-level environment devs all three packages)
 using WasmCodegen, WasmtimeRunner
 
 fib(n::Int64) = n <= 1 ? n : fib(n - 1) + fib(n - 2)
-comp = compile_wasm(fib, Tuple{Int64})    # comp.bytes is the wasm binary
+comp = compile_wasm(fib, Tuple{Int64})     # comp.bytes is the wasm binary
 
 eng = Engine(); store = Store(eng)
 inst = instantiate(store, CompiledModule(eng, comp.bytes))
 inst["fib"](20)                            # 6765, computed inside wasmtime
 ```
 
-The same bytes run in the browser/Node (V8):
+The same bytes run on V8: `julia --project=. examples/node_differential.jl`
+checks native Julia, wasmtime, and Node against each other.
 
-```bash
-julia --project=/workspace examples/node_differential.jl   # 3-engine diff test
-node examples/run_wasm.mjs /tmp/fib.wasm fib 20
-```
+## What the compiler supports
 
-## What the compiler supports today
-
-- Int8–64/UInt8–64/Bool/Char/Float32/Float64 scalars (sub-word types carry a
-  sign-correct i32 normalization discipline)
-- full integer/float arithmetic, comparisons, conversions, bit counting,
-  Julia's total shift semantics, checked arithmetic (`Base.checked_*`) with
-  exact overflow-flag semantics
-- arbitrary control flow via a dispatcher-loop lowering (any CFG, including
-  irreducible), SSA phis as parallel copies
-- function calls across `:invoke` edges (recursion, mutual recursion)
-- **WasmGC**: concrete structs and tuples become GC structs (packed i8/i16
-  fields), mutable structs keep identity (`===` is `ref.eq`),
-  `Union{Nothing,T}` becomes a nullable ref (`=== nothing` is `ref.is_null`) —
-  enough for linked data structures
-- **try/catch/finally via wasm-EH**: per-block `try_table` routing to the
-  innermost Julia handler; `÷0`, `typemin÷-1`, out-of-bounds, and explicit
-  throws are catchable inside `try` (and trap at the equivalent point outside)
-- **offloading**: untranslatable callees with scalar signatures become
-  `"julia"` imports; `offload_imports(comp)` yields thunks the embedder binds
-  (see `WasmCodegen/test/runtests.jl`), letting any frontier of the stack run
-  in wasm while the rest stays native — the basis for differential testing
-
-- **overlay interpreter**: a custom `AbstractInterpreter` intercepts
-  pointer-based Base primitives before inlining (`codeunit`/`ncodeunits` →
-  host imports, `unsafe_copyto!` → `array.copy`), and `Union{Nothing,scalar}`
-  values are boxed GC refs — `parse`/`tryparse`, `push!`-driven vector growth
-  (zero offloads), `copy`, and string iteration all run in wasm
+- all Julia scalars (sub-word integers with a sign-correct i32 discipline,
+  `Char` as raw bits, arbitrary primitive types), full arithmetic with Julia's
+  exact semantics: total shifts, checked overflow tuples, bit ops, conversions
+- arbitrary control flow (dispatcher-loop lowering, any CFG), recursion and
+  mutual recursion across `:invoke` edges
+- **WasmGC**: structs/tuples → GC structs (packed i8/i16 fields), mutable
+  identity (`===` is `ref.eq`), `Memory{T}`/`Vector` → GC arrays (`push!` and
+  `copy` compile with zero offloads), `Union{Nothing,T}` → nullable refs,
+  general small unions of concrete types → `anyref` with per-type boxes
+- **try/catch/finally via wasm-EH**: per-block `try_table` routed to the
+  innermost handler; `÷0`, overflow, bounds errors, and explicit throws are
+  catchable inside `try`
+- **overlay interpreter**: a custom `AbstractInterpreter` replaces
+  pointer-based Base primitives before inlining — `codeunit`/`ncodeunits`
+  become host imports, `unsafe_copyto!` becomes `array.copy`, and unicode
+  classification (`category_code`, identifier predicates, grapheme breaks)
+  compiles in-wasm via vendored [UnicodeNext](https://github.com/c42f/UnicodeNext.jl)
+- **host constants**: Symbol/String literals become imported `externref`
+  globals; mutable constant tables (`Dict`, `Vector`, `Memory`) materialize as
+  wasm globals via a start function, large numeric tables as data segments
+- **offloading**: callees with scalar/externref boundaries (including
+  `Union{Nothing,scalar}` returns) become `"julia"` imports bound to native
+  thunks — `parse`, `string(n, base=16)`, `exp`/`sin`/`log` run with one or
+  two leaf offloads
 
 Not yet: binding the caught exception value (`catch e` with `e` used),
-exception propagation across compiled-function boundaries, RadixSort
-internals (default `sort!`; `InsertionSort` compiles), wider unions,
-dynamic dispatch, closures as values.
+exception propagation across compiled-function call boundaries, `Any`-typed
+values, dynamic dispatch, closures as values, RadixSort internals (default
+`sort!`; `InsertionSort` compiles).
 
-## Showcase: the JuliaSyntax lexer in the browser
+## Showcase: the JuliaSyntax lexer
 
-`examples/lexer/` compiles the actual `JuliaSyntax.Tokenize` lexer from
-optimized IR to a 1.1MB wasm module with **four** host imports (source-text
-byte access, `===` on host constants, and the token sink) — unicode
-classification runs in-wasm via vendored UnicodeNext tables shipped as wasm GC
-arrays. Token streams match the native lexer exactly on a corpus covering
-unicode operators, interpolated/triple strings, all numeric literal forms, and
-malformed input — verified under both wasmtime (`run_wasmtime.jl`) and V8
-(`examples/web/test_node.mjs`). `examples/web/index.html` is a live demo:
-type Julia code, token boundaries and kinds render from the wasm lexer.
+`examples/lexer/` compiles the real `JuliaSyntax.Tokenize` lexer (no manual
+porting) into a 1.1MB module with **four** host imports: source-text byte
+access, `===` on host constants, and the token sink. Token streams match the
+native lexer exactly across unicode operators, interpolated/triple strings,
+all numeric literal forms, and malformed input — verified under wasmtime
+(`examples/lexer/run_wasmtime.jl`) and V8 (`examples/web/test_node.mjs`).
+Rebuild the web demo with `examples/lexer/build_web.jl`.
 
-## Testing strategy
+## Testing
 
-Every layer is differentially tested:
-
-1. `WasmTools/test/` — byte-stable round trips, golden binaries, validation by
-   `wasm-tools`, decode of foreign binaries; `test/fuzz.jl` runs seeded
-   `wasm-tools smith` campaigns.
-2. `WasmtimeRunner/test/` — modules built with WasmTools executed in wasmtime:
-   traps, multi-value, host functions, externref identity, WasmGC execution.
-3. `WasmCodegen/test/` — the differential harness: every corpus function runs
-   natively and in wasmtime; values must `isequal`, errors must map to traps.
-4. `examples/node_differential.jl` — the same binaries on V8 (browser path).
+Differential testing at every layer: `WasmTools` round-trips byte-stably and
+is fuzzed against `wasm-tools smith`; `WasmCodegen`'s harness runs every
+corpus function natively and in wasmtime (values must `isequal`, Julia
+exceptions must become traps/exceptions); `examples/node_differential.jl`
+repeats the comparison on V8. Run a package's suite directly:
+`julia --project=. WasmCodegen/test/runtests.jl`.
 
 ## Toolchain notes
 
-- `WasmtimeRunner` depends on `Wasmtime_jll` (compat-pinned to v45, matching
-  the verified ABI contracts in `src/abi.jl`); `ENV["WASMTIME_LIB"]` overrides.
-  `tools/wasmtime-c-api/` keeps the v45 C **headers** for reference/probes.
-- `tools/wasm-tools-dist/` — `wasm-tools` 1.251 (validator/printer/fuzzer).
-- Run `julia --project=/workspace` for a dev environment with all packages.
+- `Wasmtime_jll` is compat-pinned to v45, matching the ABI contracts verified
+  in `WasmtimeRunner/src/abi.jl`; `ENV["WASMTIME_LIB"]` overrides.
+- Tests use the `wasm-tools` binary if present at `tools/wasm-tools-dist/`
+  (release v1.251.0) and skip external validation otherwise; `tools/` also
+  carries the wasmtime v45 C headers for ABI probes (see `CLAUDE.md`).
