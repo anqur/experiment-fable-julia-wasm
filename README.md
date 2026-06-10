@@ -59,10 +59,16 @@ node examples/run_wasm.mjs /tmp/fib.wasm fib 20
   (see `WasmCodegen/test/runtests.jl`), letting any frontier of the stack run
   in wasm while the rest stays native — the basis for differential testing
 
+- **overlay interpreter**: a custom `AbstractInterpreter` intercepts
+  pointer-based Base primitives before inlining (`codeunit`/`ncodeunits` →
+  host imports, `unsafe_copyto!` → `array.copy`), and `Union{Nothing,scalar}`
+  values are boxed GC refs — `parse`/`tryparse`, `push!`-driven vector growth
+  (zero offloads), `copy`, and string iteration all run in wasm
+
 Not yet: binding the caught exception value (`catch e` with `e` used),
-exception propagation across compiled-function boundaries, `String` internals
-(byte access is pointer-based; needs an AbstractInterpreter overlay — strings
-flow as externrefs today), abstract/union fields, dynamic dispatch, closures.
+exception propagation across compiled-function boundaries, RadixSort
+internals (default `sort!`; `InsertionSort` compiles), wider unions,
+dynamic dispatch, closures as values.
 
 ## Testing strategy
 

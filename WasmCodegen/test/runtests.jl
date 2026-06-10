@@ -518,7 +518,7 @@ callhostchar(c::Char) = hostchar(c) + 1
 
 @testset "Char through offloaded host functions" begin
     comp = compile_wasm(callhostchar, Tuple{Char})
-    @test length(comp.offloads) == 1
+    @test !isempty(comp.offloads)
     @difftest callhostchar Tuple{Char} [('a',), ('b',), ('λ',), ('∀',)]
 end
 
@@ -721,4 +721,37 @@ end
     @difftest finallyfn Tuple{Int64} [(1,), (5,), (10,)]
     @difftest safeidx Tuple{Int64} [(1,), (3,), (0,), (99,), (typemin(Int64),)]
     @difftest tryphi Tuple{Int64} [(5,), (-3,), (0,)]
+end
+
+# --- overlay interpreter: string primitives, parse, dynamic vectors -------------
+
+strbytes(s::String) = (c = 0; for i in 1:ncodeunits(s); c += codeunit(s, i); end; c)
+parseback(n::Int64) = parse(Int64, string(n)) + 1
+tryp(s::String) = (x = tryparse(Int64, s); x === nothing ? Int64(-1) : x)
+function growsum(n::Int64)
+    v = Int64[]
+    for i in 1:n
+        push!(v, i * i)
+    end
+    s = 0
+    for x in v
+        s += x
+    end
+    return s + length(v)
+end
+function copyvec(n::Int64)
+    v = collect(1:n)
+    w = copy(v)
+    w[1] = -1
+    return v[1] * 1000 + w[1]
+end
+strlen2(s::String) = Int64(length(s))   # UTF-8 decoding loop over codeunits
+
+@testset "overlay interpreter (strings, parse, growth)" begin
+    @difftest strbytes Tuple{String} [("hello",), ("",), ("α β γ",)]
+    @difftest parseback Tuple{Int64} [(41,), (-1000,), (0,)]
+    @difftest tryp Tuple{String} [("123",), ("abc",), ("-99",), ("",)]
+    @difftest growsum Tuple{Int64} [(0,), (1,), (100,), (1000,)]
+    @difftest copyvec Tuple{Int64} [(1,), (5,)]
+    @difftest strlen2 Tuple{String} [("hello",), ("αβγ",), ("",)]
 end

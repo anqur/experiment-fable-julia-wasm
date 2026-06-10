@@ -40,11 +40,10 @@ Monorepo of three layered Julia packages compiling Julia to WebAssembly-with-GC:
   General registry (`JULIA_PKG_SERVER=""` flavor) — keep that in mind when
   resolving.
 - Next compiler layers, in rough order:
-  1. **Custom `AbstractInterpreter`** with overlay methods so a small set of
-     pointer-based Base primitives (`codeunit(::String,…)`, `pointer`,
-     `unsafe_copyto!(::Memory…)`, `MemoryRef.ptr_or_offset` consumers) are
-     intercepted *before inlining* and routed to hostcalls / GC-array ops.
-     This is what blocks `parse`, full `sort!` (ScratchQuickSort), `push!`.
+  1. DONE: overlay `AbstractInterpreter` (src/interp.jl) intercepts
+     `codeunit`/`ncodeunits`/`unsafe_copyto!` pre-inlining; add more overlay
+     methods there as gaps appear (e.g. whatever blocks RadixSort: a bare
+     `Type`-typed value in `Base.Sort._sort!`).
   2. Exception-value binding (`catch e`): materialize exception objects as
      the tag payload (GC structs / externref via any.convert_extern), and
      propagate exceptions across compiled-function call boundaries.

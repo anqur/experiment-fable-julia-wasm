@@ -36,8 +36,34 @@ const _SCALAR_REPRS = IdDict{Type,ScalarRepr}(
 """Scalar representation for a Julia type, or `nothing` if not a scalar."""
 scalar_repr(@nospecialize T) = get(_SCALAR_REPRS, T, nothing)
 
-"""Ghost types carry no runtime data (singletons such as `nothing`, functions)."""
-isghost(@nospecialize T) = T !== Union{} && Base.issingletontype(T)
+"""
+The type value `X` when `T` is exactly `Type{X}`, else `nothing`. Robust to
+the kind of `Type{X}` (a `TypeEq` on current nightlies, not a `DataType`).
+"""
+function _typeval(@nospecialize T)
+    (T === DataType || T === Union{}) && return nothing
+    (T isa Union || T isa UnionAll || T isa TypeVar) && return nothing
+    T isa Type && T <: Type || return nothing
+    p = try T.parameters catch; return nothing end
+    length(p) == 1 || return nothing
+    p[1] isa TypeVar && return nothing
+    return p[1]
+end
+
+"""
+Ghost types carry no runtime data: singletons (`nothing`, functions) and
+specific type objects (`Type{Int64}` — `issingletontype` is false for these,
+but the value is fully determined by the type).
+"""
+isghost(@nospecialize T) =
+    T !== Union{} && (Base.issingletontype(T) || _typeval(T) !== nothing)
+
+"""The unique value of a ghost type."""
+function ghost_instance(@nospecialize T)
+    v = _typeval(T)
+    v !== nothing && return v
+    return T.instance
+end
 
 """
 The wasm value type carrying values of Julia type `T`, `nothing` for ghosts.

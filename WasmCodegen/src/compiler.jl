@@ -8,8 +8,6 @@
 # SSA values live in wasm locals; phi nodes are resolved with parallel-copy
 # semantics on the edges (push all incoming values, then set in reverse).
 
-const CC = Core.Compiler
-
 """Placeholder call target patched to a final function index after the worklist drains."""
 struct CallTarget
     mi::Core.MethodInstance
@@ -51,13 +49,17 @@ mutable struct ModuleCompiler
     gcinfo::IdDict{Any,GCStructInfo}
     gcarrays::IdDict{Any,Int}                     # Memory{T} -> array typeidx
     gcmemrefs::IdDict{Any,Int}                    # MemoryRef{T} -> struct typeidx
+    gcboxes::IdDict{Any,Int}                      # scalar T -> box struct typeidx
+                                                  #   (for Union{Nothing,T})
     eh_used::Bool                                 # some function has try/catch
+    interp::WasmInterp                            # inference w/ the overlay table
 end
 ModuleCompiler() = ModuleCompiler(WasmModule(), Core.MethodInstance[],
                                   Dict(), Dict(), Dict(), Offload[], Dict(),
                                   Core.MethodInstance[], Dict(),
                                   SubType[], IdDict{Any,GCStructInfo}(),
-                                  IdDict{Any,Int}(), IdDict{Any,Int}(), false)
+                                  IdDict{Any,Int}(), IdDict{Any,Int}(),
+                                  IdDict{Any,Int}(), false, WasmInterp())
 
 # Types with special runtime layouts that must not lower as plain GC structs.
 const _SPECIAL_LAYOUT = Any[String, Symbol, Module, DataType, Core.MethodInstance,
@@ -106,6 +108,27 @@ function gc_memref!(mc::ModuleCompiler, @nospecialize RT)
     mc.gctypes[idx+1] = SubType(StructType(
         [FieldType(RefType(true, HeapType(arr)), false), FieldType(I32, false)]))
     return idx
+end
+
+"""Box type for scalar `T` inside `Union{Nothing,T}`: a one-field immutable
+struct at full storage width (no packing — boxes are transient)."""
+function gc_box!(mc::ModuleCompiler, @nospecialize T)
+    idx = get(mc.gcboxes, T, nothing)
+    idx === nothing || return idx
+    idx = length(mc.gctypes)
+    push!(mc.gctypes, SubType(StructType([FieldType(scalar_repr(T).vt, false)])))
+    mc.gcboxes[T] = idx
+    return idx
+end
+
+"""`(boxtypeidx, T)` when `U` is `Union{Nothing,T}` with scalar `T`, else `nothing`."""
+function union_box_info(mc::ModuleCompiler, @nospecialize U)
+    U isa Union || return nothing
+    Us = Base.uniontypes(U)
+    (length(Us) == 2 && Nothing in Us) || return nothing
+    other = Us[1] === Nothing ? Us[2] : Us[1]
+    scalar_repr(other) === nothing && return nothing
+    return (gc_box!(mc, other), other)
 end
 
 """Storage type for a struct field of Julia type `T` (packed sub-words)."""
@@ -165,9 +188,16 @@ function valtype_for(mc::ModuleCompiler, @nospecialize T)
         U = Base.uniontypes(T)
         if length(U) == 2 && Nothing in U
             other = U[1] === Nothing ? U[2] : U[1]
-            if is_gc_struct(other)
-                return RefType(true, HeapType(gc_struct!(mc, other).typeidx))
+            vt = try
+                valtype_for(mc, other)
+            catch err
+                err isa CompileError || rethrow()
+                nothing
             end
+            # already a reference: reuse its heap type, nullable
+            vt isa RefType && return RefType(true, vt.ht)
+            # scalar: box into a single-field struct; nothing is null
+            vt isa NumType && return RefType(true, HeapType(gc_box!(mc, other)))
         end
         throw(CompileError("unsupported union type $T"))
     end
@@ -196,7 +226,8 @@ function request_hostcall!(mc::ModuleCompiler, key, func, argtypes::Vector{Any},
         params = Symbol[offload_kind(mc, T) for T in argtypes if !isghost(T)]
         results = Symbol[]
         isghost(rettype) || rettype === Union{} || push!(results, offload_kind(mc, rettype))
-        name = "host_$(length(mc.offloads))_$(key isa Tuple ? key[1] : key)"
+        tag = key isa Core.MethodInstance ? key.def.name : key isa Tuple ? key[1] : key
+        name = "host_$(length(mc.offloads))_$(tag)"
         push!(mc.offloads, Offload(key, func, argtypes, rettype, params, results, name))
         mc.offload_ids[key] = length(mc.offloads) - 1
     end
@@ -223,9 +254,10 @@ end
 
 widen(@nospecialize t) = CC.widenconst(t)
 
-"""IR for a method instance at full optimization."""
-function method_ir(mi::Core.MethodInstance)
-    matches = Base.code_ircode_by_type(mi.specTypes)
+"""IR for a method instance at full optimization under the wasm interpreter."""
+function method_ir(mc::ModuleCompiler, mi::Core.MethodInstance)
+    matches = Base.code_ircode_by_type(mi.specTypes;
+                                       world=mc.interp.world, interp=mc.interp)
     length(matches) == 1 ||
         throw(CompileError("expected unique method match for $(mi.specTypes)"))
     return matches[1]   # (IRCode, rettype)
@@ -263,21 +295,29 @@ function offload!(mc::ModuleCompiler, mi::Core.MethodInstance, why::Exception)
     sig = Base.unwrap_unionall(mi.specTypes)
     argts = collect(Any, sig.parameters)
     ftype = argts[1]
-    Base.issingletontype(ftype) ||
+    isghost(ftype) ||
         throw(CompileError("cannot offload non-singleton callee $ftype ($(sprint(showerror, why)))"))
-    _, rettype = method_ir(mi)
+    _, rettype = method_ir(mc, mi)
     rettype = widen(rettype)
     args = Any[T for T in argts[2:end]]   # full list; ghosts reconstructed in the thunk
     params, results = try
-        (Symbol[offload_kind(mc, T) for T in args if !isghost(T)],
-         (!isghost(rettype) && rettype !== Union{}) ? [offload_kind(mc, rettype)] : Symbol[])
+        res = if isghost(rettype) || rettype === Union{}
+            Symbol[]
+        elseif (bi = union_box_info(mc, rettype)) !== nothing
+            # nullable-scalar return crosses the wire as (value, flag); a wasm
+            # wrapper boxes it back into the nullable ref (see compile_wasm)
+            Symbol[valkind_sym(bi[2]), :i32]
+        else
+            Symbol[offload_kind(mc, rettype)]
+        end
+        (Symbol[offload_kind(mc, T) for T in args if !isghost(T)], res)
     catch err
         err isa CompileError || rethrow()
         throw(CompileError("cannot offload $(mi): $(err.msg); " *
                            "original failure: $(sprint(showerror, why))"))
     end
     name = "offload_$(length(mc.offloads))_$(mi.def.name)"
-    push!(mc.offloads, Offload(mi, ftype.instance, args, rettype, params, results, name))
+    push!(mc.offloads, Offload(mi, ghost_instance(ftype), args, rettype, params, results, name))
     mc.offload_ids[mi] = length(mc.offloads) - 1
     mc.status[mi] = :offload
     return nothing
@@ -362,9 +402,37 @@ function emit_const!(fc::FuncCompiler, @nospecialize v)
         emit!(fc, f64_const(v))
     elseif v isa Float32
         emit!(fc, f32_const(v))
+    elseif is_gc_struct(T) && !ismutabletype(T)
+        # immutable struct/tuple constant: materialize field by field
+        info = gc_struct!(fc.mc, T)
+        for k in 1:fieldcount(T)
+            FT = info.fieldtypes[k]
+            isghost(FT) && continue
+            emit_const_field!(fc, getfield(v, k), FT)
+        end
+        emit!(fc, struct_new(info.typeidx))
     else
         throw(CompileError("unsupported constant $v::$T"))
     end
+end
+
+"""Emit a constant in a field context of declared type `FT` (boxes/nulls unions)."""
+function emit_const_field!(fc::FuncCompiler, @nospecialize(v), @nospecialize(FT))
+    vt = valtype_for(fc.mc, FT)
+    vt === nothing && return
+    if vt isa RefType
+        if isghost(typeof(v))
+            emit!(fc, ref_null(vt.ht))
+            return
+        end
+        bi = union_box_info(fc.mc, FT)
+        if bi !== nothing && scalar_repr(typeof(v)) !== nothing
+            emit_const!(fc, v)
+            emit!(fc, struct_new(bi[1]))
+            return
+        end
+    end
+    emit_const!(fc, v)
 end
 
 """Push an IR value reference onto the wasm stack."""
@@ -399,9 +467,19 @@ values flowing into a nullable-ref context become `ref.null` (e.g. a literal
 function emit_value_typed!(fc::FuncCompiler, @nospecialize(ref), @nospecialize(T))
     vt = valtype_for(fc.mc, T)
     vt === nothing && return            # ghost context: no value at all
-    if vt isa RefType && isghost(argtype(fc, ref))
-        emit!(fc, ref_null(vt.ht))
-        return
+    if vt isa RefType
+        Tsrc = widen(argtype(fc, ref))
+        if isghost(Tsrc)
+            emit!(fc, ref_null(vt.ht))
+            return
+        end
+        # scalar flowing into Union{Nothing,scalar}: box it
+        bi = union_box_info(fc.mc, T)
+        if bi !== nothing && !(Tsrc isa Union) && scalar_repr(Tsrc) !== nothing
+            emit_value!(fc, ref)
+            emit!(fc, struct_new(bi[1]))
+            return
+        end
     end
     emit_value!(fc, ref)
 end
@@ -530,6 +608,24 @@ function emit_call!(fc::FuncCompiler, i::Int, ex::Expr)
                 vb = valtype_for(fc.mc, Tb)
                 va isa RefType && vb isa RefType ||
                     throw(CompileError("=== on $Ta, $Tb"))
+                Tm = strip_nothing(Ta)
+                if Tm isa DataType && Tm <: Core.GenericMemoryRef
+                    # MemoryRef egal: same memory (identity) and same offset
+                    mref = gc_memref!(fc.mc, Tm)
+                    reft = RefType(true, HeapType(mref))
+                    ra2 = scratch_local!(fc, reft)
+                    rb2 = scratch_local!(fc, reft)
+                    emit_value!(fc, args[1])
+                    emit!(fc, local_set(ra2))
+                    emit_value!(fc, args[2])
+                    emit!(fc, local_set(rb2))
+                    emit!(fc, local_get(ra2), struct_get(mref, 0),
+                          local_get(rb2), struct_get(mref, 0), ref_eq(),
+                          local_get(ra2), struct_get(mref, 1),
+                          local_get(rb2), struct_get(mref, 1), Inst(:i32_eq),
+                          Inst(:i32_and))
+                    return true
+                end
                 if va == ExternRefT || vb == ExternRefT
                     # egal of host-resident values: route through a host import
                     va == vb || throw(CompileError("=== mixing externref and GC values"))
@@ -581,11 +677,41 @@ function emit_call!(fc::FuncCompiler, i::Int, ex::Expr)
         end
         emit!(fc, struct_new(info.typeidx))
         return true
+    elseif f === Core._apply_iterate
+        # `tuple(xs...)` over a container: only the paired
+        # `isa(result, Tuple{})` use (kwarg-leftover checks) is supported;
+        # the splat itself produces no representable value
+        length(args) == 3 && resolve_callee(fc, args[2]) === Core.tuple ||
+            throw(CompileError("unsupported call to _apply_iterate at %$i"))
+        return :novalue
     elseif f === Core.isa
         Tv = argtype(fc, args[1])
         Tt = args[2] isa GlobalRef ? getglobal(args[2].mod, args[2].name) :
              args[2] isa QuoteNode ? args[2].value : args[2]
         Tt isa Type || throw(CompileError("isa with non-constant type"))
+        # `isa(tuple(v...), Tuple{})` from kwarg-leftover checks: emptiness of v
+        if Tt === Tuple{} && args[1] isa Core.SSAValue
+            def = stmt_at(fc, args[1].id)
+            if def isa Expr && def.head === :call && length(def.args) == 4 &&
+               resolve_callee(fc, def.args[1]) === Core._apply_iterate &&
+               resolve_callee(fc, def.args[3]) === Core.tuple
+                cont = def.args[4]
+                Tc = argtype(fc, cont)
+                if Tc isa DataType && Tc <: Vector && isconcretetype(Tc)
+                    vinfo = gc_struct!(fc.mc, Tc)
+                    sz = Base.fieldindex(Tc, :size)
+                    tinfo = gc_struct!(fc.mc, vinfo.fieldtypes[sz])
+                    emit_value!(fc, cont)
+                    emit!(fc, struct_get(vinfo.typeidx, vinfo.fieldmap[sz]),
+                          struct_get(tinfo.typeidx, 0), Inst(:i64_eqz))
+                    return true
+                elseif Tc isa DataType && Tc <: Tuple && isconcretetype(Tc)
+                    emit!(fc, i32_const(Int32(Tc === Tuple{})))
+                    return true
+                end
+            end
+            throw(CompileError("unsupported isa(_, Tuple{}) at %$i"))
+        end
         if Tv <: Tt
             emit!(fc, i32_const(1))
         elseif typeintersect(Tv, Tt) === Union{}
@@ -761,10 +887,13 @@ function emit_invoke!(fc::FuncCompiler, i::Int, ex::Expr)
          ci isa Core.CodeInstance ? ci.def : nothing
     mi isa Core.MethodInstance ||
         throw(CompileError("invoke without a MethodInstance at %$i"))
+    # overlay-method intercepts (pointer-based Base primitives)
+    spec = get(INTERCEPTS, mi.def, nothing)
+    spec !== nothing && return emit_intercept!(fc, i, ex, mi, spec)
     # evaluate arguments (skipping the function-value slot) typed against the
     # callee signature, so e.g. `nothing` literals become ref.null
     sig = Base.unwrap_unionall(mi.specTypes)
-    Base.issingletontype(sig.parameters[1]) ||
+    isghost(sig.parameters[1]) ||
         throw(CompileError("invoke of non-singleton callable $(sig.parameters[1])"))
     ps = collect(Any, sig.parameters)
     length(ps) == length(ex.args) - 1 ||
@@ -776,12 +905,57 @@ function emit_invoke!(fc::FuncCompiler, i::Int, ex::Expr)
     emit!(fc, Inst(:call, (CallTarget(mi),)))
     # Whether a value is now on the stack is decided by the *callee* signature:
     # the call-site statement type can be wider (e.g. `Any` for unused results).
-    rt_callee = ci isa Core.CodeInstance ? widen(ci.rettype) : widen(method_ir(mi)[2])
+    rt_callee = ci isa Core.CodeInstance ? widen(ci.rettype) : widen(method_ir(fc.mc, mi)[2])
     if rt_callee === Union{}
         emit!(fc, unreachable())
         return false
     end
     return valtype_for(fc.mc, rt_callee) !== nothing
+end
+
+"""Lower an :invoke of an overlay method (see interp.jl) to a hostcall or a
+custom wasm sequence. Returns whether a value was pushed."""
+function emit_intercept!(fc::FuncCompiler, i::Int, ex::Expr, mi::Core.MethodInstance,
+                         spec::InterceptSpec)
+    if spec.kind === :custom
+        return spec.emit(fc, i, ex, mi)::Bool
+    end
+    sig = Base.unwrap_unionall(mi.specTypes)
+    ps = collect(Any, sig.parameters)
+    length(ps) == length(ex.args) - 1 ||
+        throw(CompileError("vararg intercept of $(mi) unsupported"))
+    rt = ex.args[1] isa Core.CodeInstance ?
+         widen((ex.args[1]::Core.CodeInstance).rettype) :
+         widen(method_ir(fc.mc, mi)[2])
+    for (k, ref) in enumerate(ex.args[3:end])
+        emit_value_typed!(fc, ref, ps[k+1])
+    end
+    hc = request_hostcall!(fc.mc, mi, spec.real, Any[T for T in ps[2:end]], rt)
+    emit!(fc, Inst(:call, (hc,)))
+    return rt !== Union{} && valtype_for(fc.mc, rt) !== nothing
+end
+
+"""`unsafe_copyto!(dest::MemoryRef{T}, src::MemoryRef{T}, n)` as `array.copy`."""
+function emit_memref_copy!(fc::FuncCompiler, i::Int, ex::Expr, mi::Core.MethodInstance)
+    dest, src, n = ex.args[3], ex.args[4], ex.args[5]
+    RT = strip_nothing(argtype(fc, dest))
+    mref = gc_memref!(fc.mc, RT)
+    arr = gc_array!(fc.mc, fieldtype(RT, :mem))
+    reft = RefType(true, HeapType(mref))
+    rd = scratch_local!(fc, reft)
+    rs = scratch_local!(fc, reft)
+    emit_value!(fc, dest)
+    emit!(fc, local_set(rd))
+    emit_value!(fc, src)
+    emit!(fc, local_set(rs))
+    emit!(fc, local_get(rd), struct_get(mref, 0),
+          local_get(rd), struct_get(mref, 1),
+          local_get(rs), struct_get(mref, 0),
+          local_get(rs), struct_get(mref, 1))
+    emit_value!(fc, n)
+    emit!(fc, Inst(:i32_wrap_i64), array_copy(arr, arr))
+    emit!(fc, local_get(rd))   # unsafe_copyto! returns dest
+    return true
 end
 
 function _const_fieldidx(@nospecialize(To), @nospecialize k)
@@ -889,6 +1063,15 @@ function emit_stmt!(fc::FuncCompiler, b::Int, i::Int)
         Tto = type_at(fc, i)
         vt_to = valtype_for(fc.mc, Tto)
         Tfrom = widen(argtype(fc, s.val))
+        # unbox: Pi from Union{Nothing,scalar} refining to the scalar
+        bi = Tfrom isa Union ? union_box_info(fc.mc, Tfrom) : nothing
+        if bi !== nothing && vt_to isa NumType
+            emit_value!(fc, s.val)
+            emit!(fc, struct_get(bi[1], 0))   # never null per Pi semantics
+            emit_norm!(fc, Tto)
+            emit!(fc, local_set(fc.ssalocal[i]))
+            return true
+        end
         emit_value_typed!(fc, s.val, Tto)
         if vt_to isa RefType && !isghost(Tfrom)
             vt_from = valtype_for(fc.mc, Tfrom)
@@ -936,8 +1119,8 @@ function emit_stmt!(fc::FuncCompiler, b::Int, i::Int)
         end
         pushed = try
             if ex.head === :call
-                emit_call!(fc, i, ex)
-                !isghost(rt)
+                r = emit_call!(fc, i, ex)
+                r === :novalue ? false : !isghost(rt)
             elseif ex.head === :invoke
                 emit_invoke!(fc, i, ex)
             else
@@ -1087,7 +1270,7 @@ function _emit_block_body!(fc::FuncCompiler, b::Int)
 end
 
 function compile_function(mc::ModuleCompiler, mi::Core.MethodInstance)
-    ir, rettype = method_ir(mi)
+    ir, rettype = method_ir(mc, mi)
     rettype = widen(rettype)
     nargs = length(ir.argtypes)
 
@@ -1292,7 +1475,8 @@ function compile_wasm(@nospecialize(f), @nospecialize(argtypes::Type{<:Tuple});
         push!(mc.wmod.tags, TagType(tagft))
     end
 
-    # assign final indices: offload imports first, then compiled funcs
+    # assign final indices: offload imports first, then box-wrappers for
+    # nullable-scalar-returning offloads, then compiled funcs
     nimports = length(offloads)
     offidx = Dict{Any,Int}()
     for (k, off) in enumerate(offloads)
@@ -1301,9 +1485,21 @@ function compile_wasm(@nospecialize(f), @nospecialize(argtypes::Type{<:Tuple});
                     FuncType(ValType[_sym_vt(s) for s in off.params],
                              ValType[_sym_vt(s) for s in off.results]))
     end
+    wrapped = [off for off in offloads if union_box_info(mc, off.rettype) !== nothing]
+    for (k, off) in enumerate(wrapped)
+        # calls to this offload target the wrapper instead of the raw import
+        offidx[off.key] = nimports + k - 1
+    end
     fidx = Dict{Core.MethodInstance,Int}()
     for (k, m) in enumerate(live)
-        fidx[m] = nimports + k - 1
+        fidx[m] = nimports + length(wrapped) + k - 1
+    end
+    for (k, off) in enumerate(wrapped)
+        importidx = findfirst(o -> o === off, offloads) - 1
+        w = _make_box_wrapper(mc, off, UInt32(importidx))
+        w.typeidx = addtype!(mc.wmod, FuncType(ValType[_sym_vt(s) for s in off.params],
+                                               ValType[valtype_for(mc, off.rettype)]))
+        push!(mc.wmod.funcs, w)
     end
     for m in live
         func = mc.bodies[m]
@@ -1314,6 +1510,32 @@ function compile_wasm(@nospecialize(f), @nospecialize(argtypes::Type{<:Tuple});
     push!(mc.wmod.exports, Export(name, :func, fidx[mi]))
     bytes = encode(mc.wmod)
     return WasmCompilation(mc.wmod, bytes, name, offloads)
+end
+
+"""
+Wrapper for an offload returning `Union{Nothing,scalar}`: calls the raw import
+(which returns `(value, present)`) and boxes the result into the nullable ref.
+"""
+function _make_box_wrapper(mc::ModuleCompiler, off::Offload, importidx::UInt32)
+    bi = union_box_info(mc, off.rettype)
+    box, elT = bi
+    np = length(off.params)
+    vvt = scalar_repr(elT).vt
+    body = Inst[]
+    for k in 0:np-1
+        push!(body, local_get(k))
+    end
+    push!(body, Inst(:call, (importidx,)))
+    push!(body, local_set(np + 1))           # present flag (i32, top of stack)
+    push!(body, local_set(np))               # value
+    push!(body, local_get(np + 1))
+    push!(body, if_(RefType(true, HeapType(box))))
+    push!(body, local_get(np))
+    push!(body, struct_new(box))
+    push!(body, else_())
+    push!(body, ref_null(HeapType(box)))
+    push!(body, end_())
+    return Func(0, ValType[vvt, I32], body, "boxwrap_" * off.name)
 end
 
 _sym_vt(s::Symbol) = s === :i64 ? I64 : s === :i32 ? I32 : s === :f64 ? F64 :
@@ -1358,7 +1580,7 @@ function _offload_thunk(off::Offload)
         wi = 1
         for T in ats
             if isghost(T)
-                push!(jlargs, T.instance)
+                push!(jlargs, ghost_instance(T))
             else
                 v = wireargs[wi]
                 push!(jlargs, kinds[wi] === :externref ? v : from_wire(T, v))
@@ -1368,7 +1590,15 @@ function _offload_thunk(off::Offload)
         ret = f(jlargs...)
         (isghost(rt) || rt === Union{}) && return nothing
         isempty(off.results) && return nothing
+        if length(off.results) == 2 && rt isa Union
+            # nullable-scalar return: (value, present-flag)
+            other = strip_nothing(rt)
+            ret === nothing && return (_wire_zero(other), Int32(0))
+            return (to_wire(other, ret), Int32(1))
+        end
         return off.results[1] === :externref ? ret : to_wire(rt, ret)
     end
     return thunk
 end
+
+_wire_zero(@nospecialize T) = T === Char ? Int32(0) : to_wire(T, zero(T))

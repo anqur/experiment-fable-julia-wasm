@@ -24,9 +24,14 @@ struct CompileError <: Exception
 end
 Base.showerror(io::IO, e::CompileError) = print(io, "CompileError: ", e.msg)
 
+const CC = Core.Compiler
+
 include("reprs.jl")
+include("interp.jl")
 include("intrinsics.jl")
 include("compiler.jl")
+
+_register_intercepts!()
 
 export compile_wasm, WasmCompilation, offload_imports, CompileError
 
