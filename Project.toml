@@ -1,0 +1,7 @@
+[deps]
+WasmTools = "5d3dcfdb-8eae-450c-8bf9-209f91b22ad6"
+WasmtimeRunner = "6ef1e157-63b0-4083-add8-761f9e147aa3"
+
+[sources]
+WasmTools = {path = "WasmTools"}
+WasmtimeRunner = {path = "WasmtimeRunner"}
