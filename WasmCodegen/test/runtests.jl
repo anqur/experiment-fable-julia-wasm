@@ -343,3 +343,60 @@ mutident(x) = (c = Counter(x); identity_struct(c) === c)
     @difftest nested_get Tuple{Int64} [(5,), (-7,), (0,)]
     @difftest mutident Tuple{Int64} [(3,), (0,)]
 end
+
+# --- Memory{T} / Vector as WasmGC arrays ---------------------------------------
+
+function memdirect(n::Int64)
+    m = Memory{Int64}(undef, n)
+    for i in 1:n; m[i] = 2i; end
+    s = 0
+    for i in 1:n; s += m[i]; end
+    return s + length(m)
+end
+
+function sumvec(n::Int64)
+    v = Vector{Float64}(undef, n)
+    for i in 1:n
+        v[i] = i * 0.5
+    end
+    s = 0.0
+    for i in eachindex(v)
+        s += v[i]
+    end
+    return s
+end
+
+function bytesum(n::Int64)
+    m = Memory{UInt8}(undef, n)
+    for i in 1:n; m[i] = (i * 7) % UInt8; end
+    s = 0
+    for i in n:-1:1; s = s * 3 + m[i]; end
+    return s
+end
+
+function oob(i::Int64)
+    m = Memory{Int64}(undef, 3)
+    for k in 1:3; m[k] = k; end
+    return m[i]
+end
+
+negalloc(n::Int64) = length(Memory{Int64}(undef, n))
+
+function ptmem(n::Int64)
+    m = Memory{Pt}(undef, n)
+    for i in 1:n; m[i] = Pt(Float64(i), 1.0); end
+    s = 0.0
+    for i in 1:n; s += m[i].x; end
+    return s
+end
+
+@testset "Memory and Vector via GC arrays" begin
+    @difftest memdirect Tuple{Int64} [(0,), (1,), (10,), (1000,)]
+    @difftest sumvec Tuple{Int64} [(0,), (1,), (17,)]
+    @difftest bytesum Tuple{Int64} [(0,), (1,), (300,)]
+    @difftest oob Tuple{Int64} [(1,), (2,), (3,), (0,), (4,), (-1,), (typemax(Int64),)]
+    # note: no 2^40 case — wasm GC arrays are 32-bit-length, native Linux
+    # overcommit lets an 8TB Memory "succeed"; an honest platform divergence
+    @difftest negalloc Tuple{Int64} [(0,), (5,), (-1,)]
+    @difftest ptmem Tuple{Int64} [(0,), (1,), (12,)]
+end

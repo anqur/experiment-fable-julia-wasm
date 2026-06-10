@@ -44,26 +44,62 @@ mutable struct ModuleCompiler
     failures::Dict{Core.MethodInstance,CompileError}
     gctypes::Vector{SubType}                      # GC type entries, one rec group
     gcinfo::IdDict{Any,GCStructInfo}
+    gcarrays::IdDict{Any,Int}                     # Memory{T} -> array typeidx
+    gcmemrefs::IdDict{Any,Int}                    # MemoryRef{T} -> struct typeidx
 end
 ModuleCompiler() = ModuleCompiler(WasmModule(), Core.MethodInstance[],
                                   Dict(), Dict(), Dict(), Offload[], Dict(),
                                   Core.MethodInstance[], Dict(),
-                                  SubType[], IdDict{Any,GCStructInfo}())
+                                  SubType[], IdDict{Any,GCStructInfo}(),
+                                  IdDict{Any,Int}(), IdDict{Any,Int}())
 
 # Types with special runtime layouts that must not lower as plain GC structs.
 const _SPECIAL_LAYOUT = Any[String, Symbol, Module, DataType, Core.MethodInstance,
                             Core.CodeInstance, Task, Core.SimpleVector]
 
-"""Is `T` a Julia type we lower to a WasmGC struct?"""
+"""Is `T` a Julia type we lower to a WasmGC struct? (`Array` qualifies — it is
+an ordinary mutable struct over `Memory`; `Memory`/`MemoryRef` lower specially.)"""
 function is_gc_struct(@nospecialize T)
     T isa DataType || return false
     isconcretetype(T) || return false
     any(S -> T <: S, _SPECIAL_LAYOUT) && return false
-    (T <: AbstractArray || T <: GenericMemory || T <: Core.GenericMemoryRef ||
-     T <: Ptr) && return false
+    (T <: GenericMemory || T <: Core.GenericMemoryRef || T <: Ptr) && return false
     isghost(T) && return false
     scalar_repr(T) === nothing || return false
     return isstructtype(T) || T <: Tuple
+end
+
+"""Lower `Memory{T}` to a (mutable-element) WasmGC array type; returns the type index."""
+function gc_array!(mc::ModuleCompiler, @nospecialize MT)
+    idx = get(mc.gcarrays, MT, nothing)
+    idx === nothing || return idx
+    MT isa DataType && MT <: GenericMemory && isconcretetype(MT) ||
+        throw(CompileError("unsupported memory type $MT"))
+    MT.parameters[1] === :not_atomic ||
+        throw(CompileError("atomic memory unsupported: $MT"))
+    elT = MT.parameters[2]
+    isghost(elT) && throw(CompileError("ghost-element memory unsupported: $MT"))
+    idx = length(mc.gctypes)
+    push!(mc.gctypes, SubType(ArrayType(FieldType(I32, true))))   # placeholder
+    mc.gcarrays[MT] = idx
+    mc.gctypes[idx+1] = SubType(ArrayType(FieldType(field_storage(mc, elT), true)))
+    return idx
+end
+
+"""Lower `MemoryRef{T}` to a `{mem::(ref null \$arr), idx::i32}` GC struct."""
+function gc_memref!(mc::ModuleCompiler, @nospecialize RT)
+    idx = get(mc.gcmemrefs, RT, nothing)
+    idx === nothing || return idx
+    RT isa DataType && RT <: Core.GenericMemoryRef && isconcretetype(RT) ||
+        throw(CompileError("unsupported memoryref type $RT"))
+    MT = fieldtype(RT, :mem)
+    idx = length(mc.gctypes)
+    push!(mc.gctypes, SubType(StructType(FieldType[])))           # placeholder
+    mc.gcmemrefs[RT] = idx
+    arr = gc_array!(mc, MT)
+    mc.gctypes[idx+1] = SubType(StructType(
+        [FieldType(RefType(true, HeapType(arr)), false), FieldType(I32, false)]))
+    return idx
 end
 
 """Storage type for a struct field of Julia type `T` (packed sub-words)."""
@@ -125,6 +161,11 @@ function valtype_for(mc::ModuleCompiler, @nospecialize T)
             end
         end
         throw(CompileError("unsupported union type $T"))
+    end
+    if T isa DataType && T <: GenericMemory
+        return RefType(true, HeapType(gc_array!(mc, T)))
+    elseif T isa DataType && T <: Core.GenericMemoryRef
+        return RefType(true, HeapType(gc_memref!(mc, T)))
     end
     is_gc_struct(T) && return RefType(true, HeapType(gc_struct!(mc, T).typeidx))
     throw(CompileError("unsupported Julia type $T"))
@@ -218,8 +259,8 @@ mutable struct FuncCompiler
     body::Vector{Inst}
     depth::Int                   # open blocks between emission point and dispatch loop
     nextlocal::Int
-    scratch::Dict{NumType,Vector{Int}}
-    scratch_used::Dict{NumType,Int}
+    scratch::Dict{ValType,Vector{Int}}
+    scratch_used::Dict{ValType,Int}
     ssapair::Dict{Int,Tuple{Int,Int}}   # ssa idx -> (value, flag) locals for
                                         # checked-arithmetic tuple results
 end
@@ -231,7 +272,7 @@ function newlocal!(fc::FuncCompiler, vt::ValType)
     return fc.nparams + length(fc.locals) - 1
 end
 
-function scratch_local!(fc::FuncCompiler, vt::NumType)
+function scratch_local!(fc::FuncCompiler, vt::ValType)
     pool = get!(Vector{Int}, fc.scratch, vt)
     used = get(fc.scratch_used, vt, 0) + 1
     fc.scratch_used[vt] = used
@@ -452,10 +493,140 @@ function emit_call!(fc::FuncCompiler, i::Int, ex::Expr)
         Tt isa Type && Tv <: Tt || throw(CompileError("dynamic typeassert $Tv::$Tt"))
         emit_value!(fc, args[1])
         return true
+    elseif f === Core.memorynew
+        return emit_memorynew!(fc, i, args)
+    elseif f === Core.memoryrefnew
+        return emit_memoryrefnew!(fc, i, args)
+    elseif f === Core.memoryrefget
+        return emit_memoryrefget!(fc, i, args)
+    elseif f === Core.memoryrefset!
+        return emit_memoryrefset!(fc, i, args)
+    elseif f === Core.memoryrefoffset
+        RT = argtype(fc, args[1])
+        mref = gc_memref!(fc.mc, RT)
+        emit_value!(fc, args[1])
+        emit!(fc, struct_get(mref, 1), Inst(:i64_extend_i32_u),
+              i64_const(1), Inst(:i64_add))
+        return true
+    elseif f === Core.memoryref_isassigned
+        RT = argtype(fc, args[1])
+        mref = gc_memref!(fc.mc, RT)
+        gc_array!(fc.mc, fieldtype(RT, :mem))
+        r = scratch_local!(fc, RefType(true, HeapType(mref)))
+        emit_value!(fc, args[1])
+        emit!(fc, local_tee(r), struct_get(mref, 1),
+              local_get(r), struct_get(mref, 0), array_len(),
+              Inst(:i32_lt_u))
+        return true
     elseif f === Core.throw
+        throw(CompileError("unsupported builtin throw"))
     else
         throw(CompileError("unsupported call to $(f) at %$i"))
     end
+end
+
+"""`Core.memorynew(Memory{T}, n)`: bounds-guarded `array.new_default`."""
+function emit_memorynew!(fc::FuncCompiler, i::Int, args)
+    MT = widen(type_at(fc, i))
+    arr = gc_array!(fc.mc, MT)
+    n = scratch_local!(fc, I64)
+    emit_value!(fc, args[2])
+    emit!(fc, local_tee(n), i64_const(typemax(Int32)), Inst(:i64_gt_u), if_())
+    emit!(fc, unreachable())     # negative or absurd size: Julia throws
+    emit!(fc, end_())
+    emit!(fc, local_get(n), Inst(:i32_wrap_i64), array_new_default(arr))
+    return true
+end
+
+"""`memoryrefnew(mem)` and `memoryrefnew(ref, idx, boundscheck)`."""
+function emit_memoryrefnew!(fc::FuncCompiler, i::Int, args)
+    RT = widen(type_at(fc, i))
+    mref = gc_memref!(fc.mc, RT)
+    if length(args) == 1
+        emit_value!(fc, args[1])
+        emit!(fc, i32_const(0), struct_new(mref))
+        return true
+    end
+    length(args) == 3 || throw(CompileError("unsupported memoryrefnew arity"))
+    arr = gc_array!(fc.mc, fieldtype(RT, :mem))
+    arrt = RefType(true, HeapType(arr))
+    ix = scratch_local!(fc, I64)
+    mem = scratch_local!(fc, arrt)
+    # The base may be a MemoryRef or the Memory itself.
+    baseT = strip_nothing(argtype(fc, args[1]))
+    if baseT <: GenericMemory
+        emit_value!(fc, args[1])
+        emit!(fc, local_set(mem))
+        # 0-based index in i64 to avoid wraparound: idx - 1
+        emit_value!(fc, args[2])
+        emit!(fc, i64_const(1), Inst(:i64_sub), local_tee(ix))
+    else
+        r = scratch_local!(fc, RefType(true, HeapType(mref)))
+        emit_value!(fc, args[1])
+        emit!(fc, local_tee(r), struct_get(mref, 0), local_set(mem))
+        # 0-based new index: ref.idx + (idx - 1)
+        emit_value!(fc, args[2])
+        emit!(fc, local_get(r), struct_get(mref, 1), Inst(:i64_extend_i32_u),
+              Inst(:i64_add), i64_const(1), Inst(:i64_sub), local_tee(ix))
+    end
+    # trap unless 0 <= newidx <= len (one-past-end refs are legal, access traps)
+    emit!(fc, local_get(mem), array_len(),
+          Inst(:i64_extend_i32_u), Inst(:i64_gt_u), if_())
+    emit!(fc, unreachable())
+    emit!(fc, end_())
+    emit!(fc, local_get(mem),
+          local_get(ix), Inst(:i32_wrap_i64), struct_new(mref))
+    return true
+end
+
+function _emit_array_get!(fc::FuncCompiler, arr::Int, @nospecialize elT)
+    st = field_storage(fc.mc, elT)
+    if st isa PackedType
+        signed = elT !== Bool && scalar_repr(elT).signed
+        emit!(fc, signed ? array_get_s(arr) : array_get_u(arr))
+    else
+        emit!(fc, array_get(arr))
+    end
+end
+
+"""`memoryrefget(ref, :not_atomic, boundscheck)`: `array.get` (traps OOB)."""
+function emit_memoryrefget!(fc::FuncCompiler, i::Int, args)
+    RT = argtype(fc, args[1])
+    _check_order(args[2])
+    mref = gc_memref!(fc.mc, RT)
+    MT = fieldtype(RT, :mem)
+    arr = gc_array!(fc.mc, MT)
+    r = scratch_local!(fc, RefType(true, HeapType(mref)))
+    emit_value!(fc, args[1])
+    emit!(fc, local_tee(r), struct_get(mref, 0),
+          local_get(r), struct_get(mref, 1))
+    _emit_array_get!(fc, arr, MT.parameters[2])
+    return true
+end
+
+"""`memoryrefset!(ref, v, :not_atomic, boundscheck)`; evaluates to `v`."""
+function emit_memoryrefset!(fc::FuncCompiler, i::Int, args)
+    RT = argtype(fc, args[1])
+    _check_order(args[3])
+    mref = gc_memref!(fc.mc, RT)
+    MT = fieldtype(RT, :mem)
+    arr = gc_array!(fc.mc, MT)
+    elT = MT.parameters[2]
+    r = scratch_local!(fc, RefType(true, HeapType(mref)))
+    emit_value!(fc, args[1])
+    emit!(fc, local_tee(r), struct_get(mref, 0),
+          local_get(r), struct_get(mref, 1))
+    emit_value_typed!(fc, args[2], elT)
+    emit!(fc, array_set(arr))
+    # the statement's value is the stored value
+    emit_value_typed!(fc, args[2], widen(type_at(fc, i)))
+    return true
+end
+
+function _check_order(@nospecialize ord)
+    ord isa QuoteNode && (ord = ord.value)
+    ord === :not_atomic ||
+        throw(CompileError("atomic memory access unsupported (order $ord)"))
 end
 
 function emit_invoke!(fc::FuncCompiler, i::Int, ex::Expr)
@@ -496,6 +667,14 @@ end
 
 function emit_getfield!(fc::FuncCompiler, i::Int, args)
     To = strip_nothing(argtype(fc, args[1]))
+    if To isa DataType && To <: GenericMemory
+        k = _const_fieldidx(To, args[2])
+        k == 1 || throw(CompileError("getfield(::Memory, :ptr) unsupported"))
+        gc_array!(fc.mc, To)
+        emit_value!(fc, args[1])
+        emit!(fc, array_len(), Inst(:i64_extend_i32_u))
+        return true
+    end
     is_gc_struct(To) || throw(CompileError("getfield on unsupported type $To"))
     info = gc_struct!(fc.mc, To)
     k = _const_fieldidx(To, args[2])
@@ -713,7 +892,7 @@ function compile_function(mc::ModuleCompiler, mi::Core.MethodInstance)
     nargs = length(ir.argtypes)
 
     fc = FuncCompiler(mc, ir, rettype, 0, fill(-1, nargs), Int[], ValType[],
-                      Inst[], 0, -1, Dict{NumType,Vector{Int}}(), Dict{NumType,Int}(),
+                      Inst[], 0, -1, Dict{ValType,Vector{Int}}(), Dict{ValType,Int}(),
                       Dict{Int,Tuple{Int,Int}}())
 
     # parameter layout
