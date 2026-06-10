@@ -1,0 +1,220 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Julia parser — compiled to WebAssembly</title>
+<style>
+  :root { color-scheme: light; }
+  body {
+    margin: 0; padding: 2rem; background: #fafafa; color: #1f2328;
+    font-family: system-ui, sans-serif;
+  }
+  h1 { font-size: 1.2rem; font-weight: 600; }
+  h1 .wasm { color: #654ff0; }
+  p.sub { color: #57606a; font-size: .85rem; max-width: 72rem; }
+  #status { font-size: .8rem; color: #57606a; margin-bottom: .75rem; }
+  #panes { display: flex; gap: 1rem; align-items: flex-start; flex-wrap: wrap; }
+  #editor-wrap {
+    position: relative; flex: 1 1 30rem; min-width: 24rem;
+    border: 1px solid #d0d7de; border-radius: 8px; background: #ffffff;
+  }
+  #highlight, #input {
+    box-sizing: border-box; width: 100%; min-height: 26rem; margin: 0;
+    padding: 1rem; border: 0;
+    font: 14px/1.6 ui-monospace, "JuliaMono", "SF Mono", Menlo, Consolas, monospace;
+    white-space: pre-wrap; word-break: break-all; overflow-wrap: anywhere;
+    tab-size: 4;
+  }
+  #highlight {
+    position: absolute; inset: 0; pointer-events: none; color: #1f2328;
+    overflow: hidden;
+  }
+  #input {
+    position: relative; background: transparent; color: transparent;
+    caret-color: #1f2328; resize: vertical; outline: none; display: block;
+  }
+  .c0 { background: #ffd6d6; } .c1 { background: #ffe7b8; }
+  .c2 { background: #fdf3a9; } .c3 { background: #c9f2c5; }
+  .c4 { background: #c5e8f7; } .c5 { background: #e4d5f7; }
+  span[data-tok] { border-radius: 3px; }
+  .tok-error { background: #d73a49; color: #ffffff; }
+  #tree-wrap {
+    flex: 1 1 26rem; min-width: 22rem; max-height: 40rem; overflow: auto;
+    border: 1px solid #d0d7de; border-radius: 8px; background: #ffffff;
+    padding: .75rem 1rem; font: 13px/1.55 ui-monospace, Menlo, Consolas, monospace;
+  }
+  #tree-wrap ul { list-style: none; margin: 0; padding-left: 1.1rem;
+                  border-left: 1px dotted #d0d7de; }
+  #tree-wrap > ul { padding-left: 0; border-left: 0; }
+  #tree-wrap li { margin: 1px 0; }
+  .nodekind { font-weight: 600; color: #6639ba; }
+  .nodekind.err { color: #ffffff; background: #d73a49; border-radius: 3px;
+                  padding: 0 3px; }
+  .leafkind { color: #0969da; }
+  .trivia { color: #b1b7be; }
+  .trivia .leafkind { color: #b1b7be; }
+  .range { color: #97a0a9; font-size: 11px; }
+  .snippet { color: #1a7f37; }
+  .snippet.trv { color: #b1b7be; }
+</style>
+</head>
+<body>
+<h1>JuliaSyntax parser, compiled Julia&nbsp;IR&nbsp;→&nbsp;<span class="wasm">WebAssembly</span></h1>
+<p class="sub">
+  The complete <code>JuliaSyntax.jl</code> recursive-descent parser — compiled
+  from Julia's optimized IR to WasmGC, no manual port. The wasm module streams
+  the parser's native output events (tokens + tree ranges); the green parse
+  tree on the right is reconstructed from them exactly like
+  <code>JuliaSyntax.build_tree</code> does. Tokens cycle through light colors;
+  error nodes are red. Try breaking the code — the parser's error recovery
+  runs in wasm too.
+</p>
+<div id="status">loading parser.wasm…</div>
+<div id="panes">
+  <div id="editor-wrap">
+    <pre id="highlight" aria-hidden="true"></pre>
+    <textarea id="input" spellcheck="false">function mandel(z::Complex)
+    c = z
+    for n in 1:80
+        abs2(z) ≥ 4.0 && return n - 1
+        z = z^2 + c   # escape-time iteration
+    end
+    return 80
+end
+
+s = "interpolate: $(mandel(0.3 + 0.5im))"
+@show s</textarea>
+  </div>
+  <div id="tree-wrap"><ul id="tree"></ul></div>
+</div>
+<script type="module">
+import { instantiateParser } from "./parser_host.mjs";
+import { KINDS } from "./parser_meta.js";
+
+const NCOLORS = 6;
+const input = document.getElementById("input");
+const highlight = document.getElementById("highlight");
+const treeEl = document.getElementById("tree");
+const status = document.getElementById("status");
+
+const esc = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;");
+const kindName = (id) => (KINDS[id] ?? [String(id)])[0];
+let TOMBSTONE = -1;
+for (const [id, [nm]] of Object.entries(KINDS))
+  if (nm === "TOMBSTONE") TOMBSTONE = Number(id);
+
+let parser = null;
+try {
+  const bytes = await (await fetch("./parser.wasm")).arrayBuffer();
+  parser = await instantiateParser(bytes);
+  status.textContent = "parser.wasm instantiated — parsing locally in your browser";
+} catch (e) {
+  status.textContent = "failed to load parser.wasm: " + e + " (browser needs WasmGC: Chrome 119+/Firefox 120+/Safari 18.4+)";
+  throw e;
+}
+
+// Mirror of JuliaSyntax.build_tree over the event streams. Token/range
+// indices are 1-based (token 1 is the parser's sentinel); byte ranges are
+// 1-based inclusive.
+function buildTree(tokens, ranges) {
+  const stack = [];
+  let i = 1, j = 0;
+  while (true) {
+    const lastToken = j < ranges.length ? ranges[j][2] : tokens.length;
+    while (i <= lastToken) {
+      const [head, , nextByte] = tokens[i - 1];
+      if ((head & 0xffff) === TOMBSTONE) { i++; continue; }
+      stack.push({ firstToken: i, node: {
+        head, a: tokens[i - 2][2], b: nextByte - 1, leaf: true } });
+      i++;
+    }
+    if (j >= ranges.length) break;
+    while (j < ranges.length) {
+      const [head, firstToken, lt] = ranges[j];
+      if (lt !== lastToken) break;
+      if ((head & 0xffff) === TOMBSTONE) { j++; continue; }
+      let k = stack.length;
+      while (k > 0 && firstToken <= stack[k - 1].firstToken) k--;
+      const children = stack.slice(k).map((e) => e.node);
+      const node = { head,
+        a: tokens[firstToken - 2][2], b: tokens[lt - 1][2] - 1, children };
+      stack.length = k;
+      stack.push({ firstToken, node });
+      j++;
+    }
+  }
+  return stack.map((e) => e.node);
+}
+
+function renderNode(node, bytes, dec) {
+  const kind = node.head & 0xffff;
+  const name = kindName(kind);
+  const isErr = name.startsWith("Error") || name === "error";
+  const isTrivia = name === "Whitespace" || name === "NewlineWs" || name === "Comment";
+  const range = `<span class="range">[${node.a}:${node.b}]</span>`;
+  if (node.leaf) {
+    const piece = dec.decode(bytes.subarray(node.a - 1, node.b));
+    const shown = piece.length > 24 ? piece.slice(0, 24) + "…" : piece;
+    const kcls = isErr ? "nodekind err" : "leafkind";
+    return `<li class="${isTrivia ? "trivia" : ""}"><span class="${kcls}">${esc(name)}</span> ` +
+           `<span class="snippet${isTrivia ? " trv" : ""}">${esc(JSON.stringify(shown))}</span> ${range}</li>`;
+  }
+  const inner = node.children.map((c) => renderNode(c, bytes, dec)).join("");
+  return `<li><span class="nodekind${isErr ? " err" : ""}">[${esc(name)}]</span> ${range}` +
+         `<ul>${inner}</ul></li>`;
+}
+
+function render() {
+  const text = input.value;
+  const bytes = new TextEncoder().encode(text);
+  const dec = new TextDecoder();
+  const t0 = performance.now();
+  let ev;
+  try {
+    ev = parser.parse(text);
+  } catch (e) {
+    status.textContent = "parser trapped: " + e;
+    return;
+  }
+  const dt = (performance.now() - t0).toFixed(1);
+
+  // token-boundary coloring (token i spans bytes [tokens[i-1].next_byte,
+  // tokens[i].next_byte - 1], 1-based)
+  let html = "";
+  let ci = 0;
+  for (let i = 2; i <= ev.tokens.length; i++) {
+    const [head, , nextByte] = ev.tokens[i - 1];
+    const kind = head & 0xffff;
+    const name = kindName(kind);
+    const a = ev.tokens[i - 2][2], b = nextByte - 1;
+    if (kind === TOMBSTONE || name === "EndMarker" || b < a) continue;
+    const piece = dec.decode(bytes.subarray(a - 1, b));
+    const isWs = name === "Whitespace" || name === "NewlineWs";
+    const isErr = name.startsWith("Error") || name === "error";
+    let cls = "";
+    if (isErr) {
+      cls = "tok-error";
+    } else if (!isWs) {
+      cls = "c" + (ci % NCOLORS);
+      ci++;
+    }
+    html += cls
+      ? `<span class="${cls}" data-tok="${name}" title="${name}">${esc(piece)}</span>`
+      : esc(piece);
+  }
+  highlight.innerHTML = html + "\n";
+
+  const roots = buildTree(ev.tokens, ev.nodes);
+  treeEl.innerHTML = roots.map((r) => renderNode(r, bytes, dec)).join("");
+  status.textContent =
+    `${ev.tokens.length} tokens, ${ev.nodes.length} tree nodes in ${dt} ms (wasm)`;
+}
+
+input.addEventListener("input", render);
+input.addEventListener("scroll", () => {
+  highlight.scrollTop = input.scrollTop;
+});
+render();
+</script>
+</body>
+</html>
