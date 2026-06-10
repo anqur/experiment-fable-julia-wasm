@@ -490,6 +490,114 @@ _reg!(:fpext) do fc, rt, args
     emit!(fc, Inst(:f64_promote_f32))
 end
 
+# --- 128-bit integers ---------------------------------------------------------
+# Int128/UInt128 live in a {lo::i64, hi::i64} GC struct (see gc_i128!). Only
+# the operations Base's checked range arithmetic needs are implemented;
+# everything else fails loudly.
+
+_is_i128(@nospecialize T) = T === Int128 || T === UInt128
+
+"""Load an i128 value's halves into two scratch i64 locals; returns (lo, hi)."""
+function _i128_load!(fc, @nospecialize ref)
+    t128 = gc_i128!(fc.mc)
+    r = scratch_local!(fc, RefType(true, HeapType(t128)))
+    lo = scratch_local!(fc, I64)
+    hi = scratch_local!(fc, I64)
+    emit_value!(fc, ref)
+    emit!(fc, local_tee(r), struct_get(t128, 0), local_set(lo),
+          local_get(r), struct_get(t128, 1), local_set(hi))
+    return lo, hi
+end
+
+function emit_i128!(fc, name::Symbol, @nospecialize(rt), args)
+    t128 = gc_i128!(fc.mc)
+    if name === :sext_int || name === :zext_int
+        srcT = argtype(fc, args[2])
+        if _is_i128(srcT)   # 128 -> 128 reinterpretation
+            emit_value!(fc, args[2])
+            return
+        end
+        r = scalar_repr(srcT)
+        r === nothing && throw(CompileError("$name to 128 bits from $srcT"))
+        emit_value!(fc, args[2])
+        if name === :sext_int
+            emit_signext!(fc, srcT)
+            r.vt == I32 && emit!(fc, Inst(:i64_extend_i32_s))
+            lo = scratch_local!(fc, I64)
+            emit!(fc, local_tee(lo), local_get(lo),
+                  i64_const(63), Inst(:i64_shr_s), struct_new(t128))
+        else
+            emit_zeroext!(fc, srcT)
+            r.vt == I32 && emit!(fc, Inst(:i64_extend_i32_u))
+            emit!(fc, i64_const(0), struct_new(t128))
+        end
+    elseif name === :trunc_int
+        # 128 -> narrow: take the low half
+        _is_i128(argtype(fc, args[2])) ||
+            throw(CompileError("trunc_int with 128-bit result unsupported"))
+        rd = scalar_repr(rt)
+        rd === nothing && throw(CompileError("trunc_int 128 -> $rt"))
+        emit_value!(fc, args[2])
+        emit!(fc, struct_get(t128, 0))
+        rd.vt == I32 && emit!(fc, Inst(:i32_wrap_i64))
+        emit_norm!(fc, rt)
+    elseif name === :add_int || name === :sub_int || name === :neg_int
+        local alo, ahi, blo, bhi
+        if name === :neg_int
+            z = scratch_local!(fc, I64)
+            emit!(fc, i64_const(0), local_set(z))
+            alo = ahi = z
+            blo, bhi = _i128_load!(fc, args[1])
+        else
+            alo, ahi = _i128_load!(fc, args[1])
+            blo, bhi = _i128_load!(fc, args[2])
+        end
+        sub = name !== :add_int
+        lo = scratch_local!(fc, I64)
+        op = sub ? Inst(:i64_sub) : Inst(:i64_add)
+        emit!(fc, local_get(alo), local_get(blo), op, local_tee(lo))
+        # carry = lo <u alo (add) | borrow = alo <u blo (sub), as i64 0/1
+        if sub
+            emit!(fc, local_get(ahi), local_get(bhi), Inst(:i64_sub),
+                  local_get(alo), local_get(blo), Inst(:i64_lt_u),
+                  Inst(:i64_extend_i32_u), Inst(:i64_sub))
+        else
+            emit!(fc, local_get(ahi), local_get(bhi), Inst(:i64_add),
+                  local_get(lo), local_get(alo), Inst(:i64_lt_u),
+                  Inst(:i64_extend_i32_u), Inst(:i64_add))
+        end
+        # stack: [lo, hi]
+        emit!(fc, struct_new(t128))
+    elseif name in (:and_int, :or_int, :xor_int)
+        opn = name === :and_int ? "and" : name === :or_int ? "or" : "xor"
+        alo, ahi = _i128_load!(fc, args[1])
+        blo, bhi = _i128_load!(fc, args[2])
+        emit!(fc, local_get(alo), local_get(blo), _op(I64, opn),
+              local_get(ahi), local_get(bhi), _op(I64, opn), struct_new(t128))
+    elseif name === :not_int
+        alo, ahi = _i128_load!(fc, args[1])
+        emit!(fc, local_get(alo), i64_const(-1), Inst(:i64_xor),
+              local_get(ahi), i64_const(-1), Inst(:i64_xor), struct_new(t128))
+    elseif name in (:eq_int, :ne_int)
+        alo, ahi = _i128_load!(fc, args[1])
+        blo, bhi = _i128_load!(fc, args[2])
+        emit!(fc, local_get(alo), local_get(blo), Inst(:i64_eq),
+              local_get(ahi), local_get(bhi), Inst(:i64_eq), Inst(:i32_and))
+        name === :ne_int && emit!(fc, Inst(:i32_eqz))
+    elseif name in (:slt_int, :sle_int, :ult_int, :ule_int)
+        alo, ahi = _i128_load!(fc, args[1])
+        blo, bhi = _i128_load!(fc, args[2])
+        hicmp = name in (:slt_int, :sle_int) ? Inst(:i64_lt_s) : Inst(:i64_lt_u)
+        locmp = name in (:slt_int, :ult_int) ? Inst(:i64_lt_u) : Inst(:i64_le_u)
+        emit!(fc, local_get(ahi), local_get(bhi), hicmp,
+              local_get(ahi), local_get(bhi), Inst(:i64_eq),
+              local_get(alo), local_get(blo), locmp, Inst(:i32_and),
+              Inst(:i32_or))
+    else
+        throw(CompileError("unsupported 128-bit intrinsic $name"))
+    end
+end
+
 # --- checked arithmetic with overflow flag ----------------------------------
 # checked_{s,u}{add,sub,mul}_int return (value, overflowed::Bool); the compiler
 # materializes both into a pair of locals (see ssapair handling).

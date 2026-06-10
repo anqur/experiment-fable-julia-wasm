@@ -56,6 +56,14 @@ Base.Experimental.@overlay WASM_MT @noinline function Base.unsafe_copyto!(
     return (Base.inferencebarrier(dest))::MemoryRef{T}
 end
 
+# String/Char formatting: pure host string -> host string (or scalar -> host
+# string); keeping it opaque offloads the whole escape_string machinery.
+Base.Experimental.@overlay WASM_MT @noinline Base.repr(s::String) =
+    (Base.inferencebarrier(""))::String
+
+Base.Experimental.@overlay WASM_MT @noinline Base.repr(c::Char) =
+    (Base.inferencebarrier(""))::String
+
 # --- semantic overlays ----------------------------------------------------------
 # Unlike the stubs above, these bodies are real Julia implementations that the
 # compiler lowers like any other code; they replace pointer-aliasing tricks
@@ -80,6 +88,130 @@ Base.Experimental.@overlay WASM_MT function Base.Unicode.isgraphemebreak!(
         return true
     end
     return UnicodeNext.grapheme_break_stateful(UInt32(c1), UInt32(c2), state)
+end
+
+# Deprecation warnings are logging-only (and reach for invoke_in_world):
+# drop them in compiled code.
+Base.Experimental.@overlay WASM_MT Base.depwarn(msg, funcsym) = nothing
+
+# --- host byte-buffer bridge ------------------------------------------------
+# Some leaf operations need host C routines over a byte string built inside
+# wasm (e.g. strtod for float literals). The bytes stream out through per-byte
+# pushes into a host-side buffer; a parse call consumes it. The functions
+# below are the host implementations AND the offload targets (the non-const
+# guard keeps their bodies uncompilable, so call sites become host imports).
+_HB_GUARD::Bool = true
+const _HOSTBUF = Ref(UInt8[])
+const _HB_STATUS = Ref(Int32(0))
+
+@noinline function _hb_reset()
+    _HB_GUARD || return nothing
+    empty!(_HOSTBUF[])
+    return nothing
+end
+
+@noinline function _hb_push(b::UInt8)
+    _HB_GUARD || return nothing
+    push!(_HOSTBUF[], b)
+    return nothing
+end
+
+@noinline function _hb_status()
+    _HB_GUARD || return Int32(0)
+    return _HB_STATUS[]
+end
+
+@noinline function _hb_string()
+    _HB_GUARD || return ""
+    return String(copy(_HOSTBUF[]))
+end
+
+# String-backed buffers: plain GC byte arrays in wasm (the string-backing of
+# Base.StringMemory/StringVector is a host allocation optimization, not
+# semantics).
+Base.Experimental.@overlay WASM_MT Base.StringMemory(n::Integer) =
+    Memory{UInt8}(undef, Int(n))
+Base.Experimental.@overlay WASM_MT Base.StringVector(n::Integer) =
+    Vector{UInt8}(undef, Int(n))
+
+# Byte-vector growth: Base's array_new_memory(::Memory{UInt8}, n) special-cases
+# string-backed memory (jl_genericmemory_owner) — in wasm every Memory is a
+# plain GC array, so a fresh allocation is always correct.
+Base.Experimental.@overlay WASM_MT Base.array_new_memory(
+        mem::Memory{UInt8}, newlen::Int) = Memory{UInt8}(undef, newlen)
+
+# Dict lookup: Base hashes via objectid (a foreigncall) for keys without a
+# specialized hash. A linear scan is hash-free and exactly equivalent — Dict
+# keys are unique under isequal — and crucially also works on constant Dicts
+# whose tables were built with native hash values. Read-only lookups only;
+# Dict *mutation* in wasm still fails loudly via ht_keyindex2_shorthash!.
+Base.Experimental.@overlay WASM_MT function Base.ht_keyindex(
+        h::Dict{K,V}, key) where {K,V}
+    keys = h.keys
+    i = 1
+    @inbounds while i <= length(keys)
+        if Base.isslotfilled(h, i) && isequal(key, keys[i])
+            return i
+        end
+        i += 1
+    end
+    return -1
+end
+
+# Byte-fill: Base's versions are memset over an unsafe pointer; a plain loop
+# is wasm-expressible and equivalent.
+Base.Experimental.@overlay WASM_MT function Base.fill!(
+        a::Union{Memory{UInt8},Memory{Int8}}, x::Integer)
+    v = convert(eltype(a), x)
+    i = 1
+    while i <= length(a)
+        @inbounds a[i] = v
+        i += 1
+    end
+    return a
+end
+
+Base.Experimental.@overlay WASM_MT function Base.fill!(
+        a::Union{Array{UInt8},Array{Int8}}, x::Integer)
+    v = convert(eltype(a), x)
+    i = 1
+    while i <= length(a)
+        @inbounds a[i] = v
+        i += 1
+    end
+    return a
+end
+
+# String construction from wasm bytes: stream through the host buffer. Matches
+# Base.String(v)'s buffer-stealing contract by emptying v.
+Base.Experimental.@overlay WASM_MT function Base.String(v::Vector{UInt8})
+    _hb_reset()
+    i = 1
+    while i <= length(v)
+        _hb_push(@inbounds v[i])
+        i += 1
+    end
+    resize!(v, 0)
+    return _hb_string()
+end
+
+# strtod/strtof over the host buffer; status: 0 ok, 1 underflow, 2 overflow
+# (the strtod ERANGE convention, as in Base.parse and JuliaSyntax)
+for (fname, cfn, CT, T) in ((:_hb_parse_f64, :jl_strtod_c, Cdouble, Float64),
+                            (:_hb_parse_f32, :jl_strtof_c, Cfloat, Float32))
+    @eval @noinline function $fname()
+        _HB_GUARD || return zero($T)
+        buf = copy(_HOSTBUF[])
+        push!(buf, 0x00)
+        Base.Libc.errno(0)
+        endptr = Ref{Ptr{UInt8}}(C_NULL)
+        x = GC.@preserve buf ccall($(QuoteNode(cfn)), $CT,
+                                   (Ptr{UInt8}, Ptr{Ptr{UInt8}}),
+                                   pointer(buf), endptr)
+        _HB_STATUS[] = Base.Libc.errno() == Base.Libc.ERANGE ?
+            (abs(x) < 1 ? Int32(1) : Int32(2)) : Int32(0)
+        return $T(x)
+    end
 end
 
 # memchr-backed byte search: plain Julia scan over codeunit hostcalls
@@ -121,6 +253,10 @@ function _register_intercepts!()
         InterceptSpec(:hostcall, Base.codeunit, nothing)
     INTERCEPTS[_overlay_method(Base.ncodeunits, Tuple{String})] =
         InterceptSpec(:hostcall, Base.ncodeunits, nothing)
+    INTERCEPTS[_overlay_method(Base.repr, Tuple{String})] =
+        InterceptSpec(:hostcall, Base.repr, nothing)
+    INTERCEPTS[_overlay_method(Base.repr, Tuple{Char})] =
+        InterceptSpec(:hostcall, Base.repr, nothing)
     INTERCEPTS[_overlay_method(Base.unsafe_copyto!,
                                Tuple{MemoryRef{T},MemoryRef{T},Int64} where {T})] =
         InterceptSpec(:custom, Base.unsafe_copyto!, emit_memref_copy!)
