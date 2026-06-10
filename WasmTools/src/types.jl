@@ -126,6 +126,12 @@ RecGroup(ct::CompositeType) = RecGroup([SubType(ct)])
 Base.:(==)(a::RecGroup, b::RecGroup) = a.types == b.types
 Base.hash(a::RecGroup, h::UInt) = hash(a.types, hash(:RecGroup, h))
 
+"""
+Limits for memories/tables. `shared` maps the threads-proposal flag bit 0x02;
+it is carried as a forward-compatibility extension (the library does not
+otherwise support the threads proposal, and wasm 3.0 proper only defines the
+max-present and address-type flag bits).
+"""
 struct Limits
     min::UInt64
     max::Union{Nothing,UInt64}

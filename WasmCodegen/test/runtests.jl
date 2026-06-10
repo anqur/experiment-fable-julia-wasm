@@ -272,3 +272,74 @@ end
         end
     end
 end
+
+# --- WasmGC: Julia structs/tuples as GC objects --------------------------------
+
+struct Pt; x::Float64; y::Float64; end
+@noinline mkpt(a, b) = Pt(a, b)                 # force materialization
+norm2(a, b) = (p = mkpt(a, b); p.x * p.x + p.y * p.y)
+
+mutable struct Counter; n::Int64; end
+@noinline bump!(c::Counter, i::Int64) = (c.n += i; nothing)
+function count_up(k::Int64)
+    c = Counter(0)
+    for i in 1:k
+        bump!(c, i)
+    end
+    return c.n
+end
+
+struct PairT{T}; a::T; b::T; end
+@noinline mkpair(x::T, y::T) where {T} = PairT(x, y)
+sumpair(x, y) = (p = mkpair(x, y); p.a + p.b)
+
+@noinline minmax2(a::Int64, b::Int64) = a < b ? (a, b) : (b, a)
+spread(a, b) = ((lo, hi) = minmax2(a, b); hi - lo)
+
+mutable struct Node
+    val::Int64
+    next::Union{Nothing,Node}
+end
+function buildsum(n::Int64)
+    head = nothing
+    for i in 1:n
+        head = Node(i, head)
+    end
+    s = 0
+    cur = head
+    while cur !== nothing
+        s += cur.val
+        cur = cur.next
+    end
+    return s
+end
+
+struct Packed; a::Int8; b::UInt8; c::Bool; d::Int16; end
+@noinline mkpacked(x::Int64) = Packed(x % Int8, x % UInt8, x > 0, x % Int16)
+function packsum(x::Int64)
+    p = mkpacked(x)
+    return Int64(p.a) + Int64(p.b) + (p.c ? 10 : 0) + Int64(p.d)
+end
+
+struct Inner; v::Int64; end
+struct Outer; i::Inner; w::Float64; end
+@noinline mkouter(x::Int64) = Outer(Inner(x), 2.0)
+nested_get(x) = mkouter(x).i.v + Int64(round(mkouter(x).w))
+
+@noinline function identity_struct(c::Counter)
+    return c
+end
+mutident(x) = (c = Counter(x); identity_struct(c) === c)
+
+@testset "WasmGC structs" begin
+    @difftest norm2 Tuple{Float64,Float64} [(3.0, 4.0), (0.0, 0.0), (-1.5, 2.5)]
+    @difftest count_up Tuple{Int64} [(0,), (1,), (10,), (100,)]
+    @difftest sumpair Tuple{Int64,Int64} [(3, 4), (-1, 1), (typemax(Int64), 1)]
+    @difftest sumpair Tuple{Float64,Float64} [(1.5, 2.5), (NaN, 1.0)]
+    @difftest spread Tuple{Int64,Int64} [(3, 9), (9, 3), (5, 5), (-2, 7)]
+    @difftest buildsum Tuple{Int64} [(0,), (1,), (10,), (1000,)]
+    @difftest packsum Tuple{Int64} [(0,), (1,), (-1,), (127,), (128,), (255,),
+                                    (256,), (-129,), (65535,), (123456789,)]
+    @difftest nested_get Tuple{Int64} [(5,), (-7,), (0,)]
+    @difftest mutident Tuple{Int64} [(3,), (0,)]
+end

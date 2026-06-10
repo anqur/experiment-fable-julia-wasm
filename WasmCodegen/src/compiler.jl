@@ -25,6 +25,13 @@ struct Offload
     name::String
 end
 
+"""How a Julia struct/tuple type lowers to a WasmGC struct."""
+struct GCStructInfo
+    typeidx::Int
+    fieldmap::Vector{Int}      # julia field idx -> wasm field idx (-1 = ghost)
+    fieldtypes::Vector{Any}    # julia field types
+end
+
 mutable struct ModuleCompiler
     wmod::WasmModule
     order::Vector{Core.MethodInstance}            # discovery order of compiled funcs
@@ -35,10 +42,102 @@ mutable struct ModuleCompiler
     offload_ids::Dict{Core.MethodInstance,Int}
     queue::Vector{Core.MethodInstance}
     failures::Dict{Core.MethodInstance,CompileError}
+    gctypes::Vector{SubType}                      # GC type entries, one rec group
+    gcinfo::IdDict{Any,GCStructInfo}
 end
 ModuleCompiler() = ModuleCompiler(WasmModule(), Core.MethodInstance[],
                                   Dict(), Dict(), Dict(), Offload[], Dict(),
-                                  Core.MethodInstance[], Dict())
+                                  Core.MethodInstance[], Dict(),
+                                  SubType[], IdDict{Any,GCStructInfo}())
+
+# Types with special runtime layouts that must not lower as plain GC structs.
+const _SPECIAL_LAYOUT = Any[String, Symbol, Module, DataType, Core.MethodInstance,
+                            Core.CodeInstance, Task, Core.SimpleVector]
+
+"""Is `T` a Julia type we lower to a WasmGC struct?"""
+function is_gc_struct(@nospecialize T)
+    T isa DataType || return false
+    isconcretetype(T) || return false
+    any(S -> T <: S, _SPECIAL_LAYOUT) && return false
+    (T <: AbstractArray || T <: GenericMemory || T <: Core.GenericMemoryRef ||
+     T <: Ptr) && return false
+    isghost(T) && return false
+    scalar_repr(T) === nothing || return false
+    return isstructtype(T) || T <: Tuple
+end
+
+"""Storage type for a struct field of Julia type `T` (packed sub-words)."""
+function field_storage(mc::ModuleCompiler, @nospecialize T)
+    T === Bool && return I8
+    r = scalar_repr(T)
+    if r !== nothing
+        T === Char && return I32
+        r.isfloat && return r.vt
+        r.bits == 8 && return I8
+        r.bits == 16 && return I16
+        return r.vt
+    end
+    vt = valtype_for(mc, T)
+    vt === nothing && throw(CompileError("ghost field type $T should be skipped"))
+    return vt
+end
+
+"""Register (or look up) the WasmGC struct lowering of `T`."""
+function gc_struct!(mc::ModuleCompiler, @nospecialize T)
+    info = get(mc.gcinfo, T, nothing)
+    info === nothing || return info
+    is_gc_struct(T) || throw(CompileError("type $T does not lower to a GC struct"))
+    # Reserve the index first so self-referential types terminate.
+    idx = length(mc.gctypes)
+    push!(mc.gctypes, SubType(StructType(FieldType[])))
+    n = fieldcount(T)
+    fieldmap = fill(-1, n)
+    ftypes = Any[fieldtype(T, i) for i in 1:n]
+    info = GCStructInfo(idx, fieldmap, ftypes)
+    mc.gcinfo[T] = info
+    fields = FieldType[]
+    mut = ismutabletype(T)
+    for i in 1:n
+        FT = ftypes[i]
+        isghost(FT) && continue
+        st = field_storage(mc, FT)
+        push!(fields, FieldType(st, mut))
+        fieldmap[i] = length(fields) - 1
+    end
+    mc.gctypes[idx+1] = SubType(StructType(fields))
+    return info
+end
+
+"""
+Wasm value type for `T`, or `nothing` for ghosts. Extends `wasm_valtype` with
+GC struct refs and `Union{Nothing,T}` as nullable refs.
+"""
+function valtype_for(mc::ModuleCompiler, @nospecialize T)
+    isghost(T) && return nothing
+    r = scalar_repr(T)
+    r !== nothing && return r.vt
+    if T isa Union
+        U = Base.uniontypes(T)
+        if length(U) == 2 && Nothing in U
+            other = U[1] === Nothing ? U[2] : U[1]
+            if is_gc_struct(other)
+                return RefType(true, HeapType(gc_struct!(mc, other).typeidx))
+            end
+        end
+        throw(CompileError("unsupported union type $T"))
+    end
+    is_gc_struct(T) && return RefType(true, HeapType(gc_struct!(mc, T).typeidx))
+    throw(CompileError("unsupported Julia type $T"))
+end
+
+"""The non-Nothing component of `Union{Nothing,T}`, or `T` itself."""
+function strip_nothing(@nospecialize T)
+    if T isa Union
+        U = Base.uniontypes(T)
+        length(U) == 2 && Nothing in U && return U[1] === Nothing ? U[2] : U[1]
+    end
+    return T
+end
 
 widen(@nospecialize t) = CC.widenconst(t)
 
@@ -50,17 +149,19 @@ function method_ir(mi::Core.MethodInstance)
     return matches[1]   # (IRCode, rettype)
 end
 
-function mi_signature(mi::Core.MethodInstance, @nospecialize(rettype))
+function mi_signature(mc::ModuleCompiler, mi::Core.MethodInstance, @nospecialize(rettype))
     sig = Base.unwrap_unionall(mi.specTypes)
     argts = collect(Any, sig.parameters)
     params = ValType[]
     for T in argts[2:end]
-        isghost(T) && continue
-        push!(params, wasm_valtype(T))
+        vt = valtype_for(mc, T)
+        vt === nothing && continue
+        push!(params, vt)
     end
     results = ValType[]
-    if !isghost(rettype) && rettype !== Union{}
-        push!(results, wasm_valtype(rettype))
+    if rettype !== Union{}
+        vt = valtype_for(mc, rettype)
+        vt === nothing || push!(results, vt)
     end
     return FuncType(params, results)
 end
@@ -205,6 +306,21 @@ function emit_value!(fc::FuncCompiler, @nospecialize ref)
     end
 end
 
+"""
+Push `ref` in a context expecting Julia type `T`. Unlike `emit_value!`, ghost
+values flowing into a nullable-ref context become `ref.null` (e.g. a literal
+`nothing` feeding a `Union{Nothing,Node}` phi or argument).
+"""
+function emit_value_typed!(fc::FuncCompiler, @nospecialize(ref), @nospecialize(T))
+    vt = valtype_for(fc.mc, T)
+    vt === nothing && return            # ghost context: no value at all
+    if vt isa RefType && isghost(argtype(fc, ref))
+        emit!(fc, ref_null(vt.ht))
+        return
+    end
+    emit_value!(fc, ref)
+end
+
 """Resolve the callee of a `:call` expression to a runtime value, or `nothing`."""
 function resolve_callee(fc::FuncCompiler, @nospecialize ref)
     ref isa GlobalRef && isconst(ref.mod, ref.name) && return getglobal(ref.mod, ref.name)
@@ -244,16 +360,36 @@ function emit_call!(fc::FuncCompiler, i::Int, ex::Expr)
         return true
     elseif f === Core.:(===)
         Ta, Tb = argtype(fc, args[1]), argtype(fc, args[2])
-        if isghost(Ta) || isghost(Tb)
+        if isghost(Ta) && isghost(Tb)
             emit!(fc, i32_const(Int32(Ta === Tb)))
+        elseif isghost(Ta) || isghost(Tb)
+            ghostT, valref, valT = isghost(Ta) ? (Ta, args[2], Tb) : (Tb, args[1], Ta)
+            vt = valtype_for(fc.mc, valT)
+            if vt isa RefType && ghostT === Nothing
+                emit_value!(fc, valref)
+                emit!(fc, ref_is_null())
+            else
+                # disjoint: a ghost singleton never equals a non-ghost value
+                emit!(fc, i32_const(0))
+            end
         else
             ra, rb = scalar_repr(Ta), scalar_repr(Tb)
-            (ra === nothing || rb === nothing) &&
-                throw(CompileError("=== on non-scalars $Ta, $Tb"))
-            if ra.isfloat
-                INTRINSIC_HANDLERS[:fpiseq](fc, rt, args)
+            if ra !== nothing && rb !== nothing
+                if ra.isfloat
+                    INTRINSIC_HANDLERS[:fpiseq](fc, rt, args)
+                else
+                    emit_cmp!(fc, "eq", args)
+                end
             else
-                emit_cmp!(fc, "eq", args)
+                va = valtype_for(fc.mc, Ta)
+                vb = valtype_for(fc.mc, Tb)
+                va isa RefType && vb isa RefType ||
+                    throw(CompileError("=== on $Ta, $Tb"))
+                ismutabletype(strip_nothing(Ta)) || ismutabletype(strip_nothing(Tb)) ||
+                    throw(CompileError("=== (structural egal) on immutable structs $Ta"))
+                emit_value!(fc, args[1])
+                emit_value!(fc, args[2])
+                emit!(fc, ref_eq())
             end
         end
         return true
@@ -274,7 +410,48 @@ function emit_call!(fc::FuncCompiler, i::Int, ex::Expr)
             emit!(fc, local_get(k == 1 ? pair[1] : pair[2]))
             return true
         end
-        throw(CompileError("getfield on unsupported value at %$i"))
+        return emit_getfield!(fc, i, args)
+    elseif f === Core.setfield! || f === Base.setfield!
+        return emit_setfield!(fc, i, args)
+    elseif f === Core.tuple
+        TT = widen(rt)
+        is_gc_struct(TT) || throw(CompileError("unsupported tuple type $TT"))
+        info = gc_struct!(fc.mc, TT)
+        for (k, ref) in enumerate(args)
+            emit_value_typed!(fc, ref, info.fieldtypes[k])
+        end
+        emit!(fc, struct_new(info.typeidx))
+        return true
+    elseif f === Core.isa
+        Tv = argtype(fc, args[1])
+        Tt = args[2] isa GlobalRef ? getglobal(args[2].mod, args[2].name) :
+             args[2] isa QuoteNode ? args[2].value : args[2]
+        Tt isa Type || throw(CompileError("isa with non-constant type"))
+        if Tv <: Tt
+            emit!(fc, i32_const(1))
+        elseif typeintersect(Tv, Tt) === Union{}
+            emit!(fc, i32_const(0))
+        elseif Tv isa Union && strip_nothing(Tv) !== Tv
+            # Union{Nothing,T}: isa reduces to a null check
+            other = strip_nothing(Tv)
+            emit_value!(fc, args[1])
+            if other <: Tt
+                emit!(fc, ref_is_null(), Inst(:i32_eqz))
+            elseif Tt === Nothing
+                emit!(fc, ref_is_null())
+            else
+                throw(CompileError("isa $Tv -> $Tt unsupported"))
+            end
+        else
+            throw(CompileError("dynamic isa $Tv -> $Tt unsupported"))
+        end
+        return true
+    elseif f === Core.typeassert
+        Tt = args[2] isa GlobalRef ? getglobal(args[2].mod, args[2].name) : args[2]
+        Tv = argtype(fc, args[1])
+        Tt isa Type && Tv <: Tt || throw(CompileError("dynamic typeassert $Tv::$Tt"))
+        emit_value!(fc, args[1])
+        return true
     elseif f === Core.throw
     else
         throw(CompileError("unsupported call to $(f) at %$i"))
@@ -287,16 +464,84 @@ function emit_invoke!(fc::FuncCompiler, i::Int, ex::Expr)
          ci isa Core.CodeInstance ? ci.def : nothing
     mi isa Core.MethodInstance ||
         throw(CompileError("invoke without a MethodInstance at %$i"))
-    # evaluate arguments (skipping the function-value slot and ghosts)
+    # evaluate arguments (skipping the function-value slot) typed against the
+    # callee signature, so e.g. `nothing` literals become ref.null
     sig = Base.unwrap_unionall(mi.specTypes)
     Base.issingletontype(sig.parameters[1]) ||
         throw(CompileError("invoke of non-singleton callable $(sig.parameters[1])"))
-    for ref in ex.args[3:end]
-        isghost(argtype(fc, ref)) && continue
-        emit_value!(fc, ref)
+    ps = collect(Any, sig.parameters)
+    length(ps) == length(ex.args) - 1 ||
+        throw(CompileError("vararg invoke of $(mi) unsupported"))
+    for (k, ref) in enumerate(ex.args[3:end])
+        emit_value_typed!(fc, ref, ps[k+1])
     end
     request!(fc.mc, mi)
     emit!(fc, Inst(:call, (CallTarget(mi),)))
+    # Whether a value is now on the stack is decided by the *callee* signature:
+    # the call-site statement type can be wider (e.g. `Any` for unused results).
+    rt_callee = ci isa Core.CodeInstance ? widen(ci.rettype) : widen(method_ir(mi)[2])
+    if rt_callee === Union{}
+        emit!(fc, unreachable())
+        return false
+    end
+    return valtype_for(fc.mc, rt_callee) !== nothing
+end
+
+function _const_fieldidx(@nospecialize(To), @nospecialize k)
+    k isa QuoteNode && (k = k.value)
+    k isa Symbol && (k = Base.fieldindex(To, k))
+    k isa Integer || throw(CompileError("non-constant field reference"))
+    return Int(k)
+end
+
+function emit_getfield!(fc::FuncCompiler, i::Int, args)
+    To = strip_nothing(argtype(fc, args[1]))
+    is_gc_struct(To) || throw(CompileError("getfield on unsupported type $To"))
+    info = gc_struct!(fc.mc, To)
+    k = _const_fieldidx(To, args[2])
+    FT = info.fieldtypes[k]
+    isghost(FT) && return true   # ghost field: no value
+    widx = info.fieldmap[k]
+    emit_value!(fc, args[1])
+    st = field_storage(fc.mc, FT)
+    if st isa PackedType
+        r = scalar_repr(FT)
+        signed = FT !== Bool && r.signed
+        emit!(fc, signed ? struct_get_s(info.typeidx, widx) :
+                           struct_get_u(info.typeidx, widx))
+    else
+        emit!(fc, struct_get(info.typeidx, widx))
+    end
+    return true
+end
+
+function emit_setfield!(fc::FuncCompiler, i::Int, args)
+    To = strip_nothing(argtype(fc, args[1]))
+    is_gc_struct(To) && ismutabletype(To) ||
+        throw(CompileError("setfield! on unsupported type $To"))
+    info = gc_struct!(fc.mc, To)
+    k = _const_fieldidx(To, args[2])
+    FT = info.fieldtypes[k]
+    if !isghost(FT)
+        emit_value!(fc, args[1])
+        emit_value_typed!(fc, args[3], FT)
+        emit!(fc, struct_set(info.typeidx, info.fieldmap[k]))
+    end
+    # setfield! evaluates to the assigned value; re-emit it (pure: ssa/arg/const)
+    emit_value_typed!(fc, args[3], widen(type_at(fc, i)))
+    return true
+end
+
+function emit_new!(fc::FuncCompiler, i::Int, ex::Expr)
+    TT = widen(type_at(fc, i))
+    is_gc_struct(TT) || throw(CompileError("unsupported :new of $TT"))
+    info = gc_struct!(fc.mc, TT)
+    length(ex.args) - 1 == length(info.fieldtypes) ||
+        throw(CompileError("partially-initialized :new of $TT"))
+    for (k, ref) in enumerate(ex.args[2:end])
+        emit_value_typed!(fc, ref, info.fieldtypes[k])
+    end
+    emit!(fc, struct_new(info.typeidx))
     return true
 end
 
@@ -309,7 +554,15 @@ function emit_stmt!(fc::FuncCompiler, b::Int, i::Int)
     s isa Core.PhiNode && return true                  # handled on edges
     if s isa Core.PiNode
         fc.ssalocal[i] >= 0 || return true
-        emit_value!(fc, s.val)
+        Tto = type_at(fc, i)
+        vt_to = valtype_for(fc.mc, Tto)
+        Tfrom = widen(argtype(fc, s.val))
+        emit_value_typed!(fc, s.val, Tto)
+        if vt_to isa RefType && !isghost(Tfrom)
+            vt_from = valtype_for(fc.mc, Tfrom)
+            vt_from isa RefType && vt_from.ht != vt_to.ht &&
+                emit!(fc, ref_cast_null(vt_to.ht))
+        end
         emit!(fc, local_set(fc.ssalocal[i]))
         return true
     end
@@ -339,14 +592,22 @@ function emit_stmt!(fc::FuncCompiler, b::Int, i::Int)
         emit_checked!(fc, kind, signed, ex.args[2:end], vloc, floc)
         return true
     end
-    if ex.head === :call || ex.head === :invoke
+    if ex.head === :call || ex.head === :invoke || ex.head === :new
         # statements that cannot return: evaluate as a trap point
         if rt === Union{}
             emit!(fc, unreachable())
             return false
         end
-        try
-            ex.head === :call ? emit_call!(fc, i, ex) : emit_invoke!(fc, i, ex)
+        pushed = try
+            if ex.head === :call
+                emit_call!(fc, i, ex)
+                !isghost(rt)
+            elseif ex.head === :invoke
+                emit_invoke!(fc, i, ex)
+            else
+                emit_new!(fc, i, ex)
+                true
+            end
         catch err
             err isa CompileError || rethrow()
             # if this block inevitably throws later, trapping here is sound
@@ -356,12 +617,14 @@ function emit_stmt!(fc::FuncCompiler, b::Int, i::Int)
             end
             rethrow()
         end
-        if isghost(rt)
-            # ghost result: nothing on stack
+        if pushed
+            if fc.ssalocal[i] >= 0
+                emit!(fc, local_set(fc.ssalocal[i]))
+            else
+                emit!(fc, drop())
+            end
         elseif fc.ssalocal[i] >= 0
-            emit!(fc, local_set(fc.ssalocal[i]))
-        else
-            emit!(fc, drop())
+            throw(CompileError("callee produced no value for stored result at %$i"))
         end
         return true
     end
@@ -382,7 +645,7 @@ function emit_phi_moves!(fc::FuncCompiler, src::Int, dst::Int)
         k === nothing && continue
         isassigned(s.values, k) || continue
         fc.ssalocal[i] >= 0 || continue
-        emit_value!(fc, s.values[k])
+        emit_value_typed!(fc, s.values[k], type_at(fc, i))
         push!(sets, fc.ssalocal[i])
     end
     for l in Iterators.reverse(sets)
@@ -401,8 +664,8 @@ function emit_return!(fc::FuncCompiler, node::Core.ReturnNode)
         return
     end
     rt = widen(fc.rettype)
-    if !(isghost(rt) || rt === Union{})
-        emit_value!(fc, node.val)
+    if rt !== Union{} && valtype_for(fc.mc, rt) !== nothing
+        emit_value_typed!(fc, node.val, rt)
     end
     emit!(fc, return_())
 end
@@ -457,10 +720,11 @@ function compile_function(mc::ModuleCompiler, mi::Core.MethodInstance)
     params = ValType[]
     for n in 1:nargs
         T = widen(ir.argtypes[n])
-        n == 1 && (isghost(T) || throw(CompileError("closure callee with fields: $T"))) &&
-            continue
-        isghost(T) && continue
-        push!(params, wasm_valtype(T))
+        n == 1 && !isghost(T) &&
+            throw(CompileError("closure callee with fields: $T"))
+        vt = valtype_for(mc, T)
+        vt === nothing && continue
+        push!(params, vt)
         fc.argmap[n] = length(params) - 1
     end
     fc.nparams = length(params)
@@ -478,22 +742,27 @@ function compile_function(mc::ModuleCompiler, mi::Core.MethodInstance)
              s isa QuoteNode ||
              !(s isa Union{Core.GotoNode,Core.GotoIfNot,Core.ReturnNode,Nothing}))
         produces || continue
-        r = scalar_repr(T)
-        if r === nothing
-            # checked arithmetic returns (value, overflowed) tuples: two locals
-            if s isa Expr && s.head === :call && T isa DataType && T <: Tuple &&
-               length(T.parameters) == 2 && T.parameters[2] === Bool
-                fcallee = resolve_callee(fc, s.args[1])
-                if fcallee isa Core.IntrinsicFunction &&
-                   haskey(CHECKED_PAIR, Symbol(string(fcallee)))
-                    er = scalar_repr(T.parameters[1])
-                    er === nothing && continue
+        # checked arithmetic returns (value, overflowed) tuples: two locals
+        if s isa Expr && s.head === :call && T isa DataType && T <: Tuple &&
+           length(T.parameters) == 2 && T.parameters[2] === Bool
+            fcallee = try resolve_callee(fc, s.args[1]) catch; nothing end
+            if fcallee isa Core.IntrinsicFunction &&
+               haskey(CHECKED_PAIR, Symbol(string(fcallee)))
+                er = scalar_repr(T.parameters[1])
+                if er !== nothing
                     fc.ssapair[i] = (newlocal!(fc, er.vt), newlocal!(fc, I32))
+                    continue
                 end
             end
-            continue   # other non-scalars get no locals; uses will error loudly
         end
-        fc.ssalocal[i] = newlocal!(fc, r.vt)
+        vt = try
+            valtype_for(mc, T)
+        catch err
+            err isa CompileError || rethrow()
+            nothing   # unsupported types get no local; uses will error loudly
+        end
+        vt === nothing && continue
+        fc.ssalocal[i] = newlocal!(fc, vt)
     end
     fc.nextlocal = newlocal!(fc, I32)
 
@@ -520,7 +789,7 @@ function compile_function(mc::ModuleCompiler, mi::Core.MethodInstance)
     emit!(fc, end_())          # loop
     emit!(fc, unreachable())   # all paths return inside the loop
 
-    ftype = mi_signature(mi, rettype)
+    ftype = mi_signature(mc, mi, rettype)
     func = Func(0, fc.locals, fc.body, string(mi.def.name))
     mc.bodies[mi] = func
     mc.sigs[mi] = ftype
@@ -598,6 +867,10 @@ function compile_wasm(@nospecialize(f), @nospecialize(argtypes::Type{<:Tuple});
     end
     sort!(live; by=m -> findfirst(==(m), mc.order))
     offloads = [off for off in mc.offloads if off.mi in liveoff]
+
+    # GC struct types occupy indices [0, N) as a single rec group, registered
+    # before any function-signature types
+    isempty(mc.gctypes) || push!(mc.wmod.types, RecGroup(mc.gctypes))
 
     # assign final indices: offload imports first, then compiled funcs
     nimports = length(offloads)

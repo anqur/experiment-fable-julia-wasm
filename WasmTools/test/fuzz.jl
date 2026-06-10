@@ -13,8 +13,8 @@
 #   3. `wasm-tools validate --features all` accepts c1
 #   4. encode(decode(c1)) == c1  (byte-stability of self-produced binaries)
 #   5. `wasm-tools print` of the original and of c1 agree after stripping
-#      custom sections from both sides (so name-section loss is ignored) and
-#      normalizing the known element-segment canonicalization (see below).
+#      custom sections from both sides (so loss of non-function name
+#      subsections is ignored).
 #
 # Skips gracefully (exit 0) when wasm-tools is not available. Set the
 # WASM_TOOLS env var to point at the binary explicitly.
@@ -95,30 +95,6 @@ wt_print(path::String) =
 wt_strip(inp::String, outp::String) =
     success(pipeline(`$WASM_TOOLS strip -a -o $outp $inp`, stderr=devnull))
 
-# WasmTools canonicalizes element segments on re-encode (a known, semantics-
-# preserving transformation; the Elem IR does not record which binary flavor
-# was used):
-#   * expr-form segments (flags 4-7) whose initializers are all `ref.func` (or
-#     empty) with element type funcref re-encode in the compact funcidx form
-#     (flags 0-3); `wasm-tools print` shows this as `func i j` vs
-#     `funcref (ref.func i) (ref.func j)`.
-#   * active segments with an explicit table index of 0 (flags 2/6) re-encode
-#     in the implicit-table-0 form (flags 0/4), dropping the printed
-#     `(table 0)`.
-# Normalize both prints so the comparison still catches everything else.
-function _norm_elem_line(line::AbstractString)
-    occursin(r"^\s*\(elem ", line) || return line
-    line = replace(line, r"(\(elem (?:\(;\d+;\) )?)\(table 0\) " => s"\1")
-    m = match(r"^(\s*\(elem .*?)func((?: \d+)*)\)\s*$", line)
-    if m !== nothing && !occursin("funcref", m.captures[1])
-        idxs = split(strip(m.captures[2]))
-        tail = isempty(idxs) ? "" : " " * join(["(ref.func $i)" for i in idxs], " ")
-        line = m.captures[1] * "funcref" * tail * ")"
-    end
-    return String(line)
-end
-norm_print(s::String) = join(map(_norm_elem_line, split(s, '\n')), '\n')
-
 # --- per-module check ---------------------------------------------------------
 
 """
@@ -152,7 +128,7 @@ function check_module(bytes::Vector{UInt8}, dir::String)
     if wt_strip(origpath, so) && wt_strip(c1path, sc)
         po = wt_print(so)
         pc = wt_print(sc)
-        if po !== nothing && pc !== nothing && norm_print(po) != norm_print(pc)
+        if po !== nothing && pc !== nothing && po != pc
             return false, "`wasm-tools print` mismatch after stripping custom sections"
         end
     end
@@ -171,8 +147,7 @@ const REGRESSION_CONCRETE_REF_BLOCKTYPE =
 
 # A declarative element segment in expression form with element type funcref
 # (flag 7, empty init vector): (module (elem declare funcref))
-# Must round-trip to a *valid* module (byte-identity is not required; see the
-# canonicalization note above).
+# The Elem IR records the binary flavor, so this must round-trip byte-identically.
 const REGRESSION_ELEM_FLAG7 =
     hex2bytes("0061736d01000000090401077000")
 
