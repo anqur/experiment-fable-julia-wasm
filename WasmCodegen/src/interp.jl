@@ -239,14 +239,39 @@ end
 
 # --- interception registry ------------------------------------------------------
 
-"""How an overlay method lowers: a host import or a custom wasm sequence."""
+"""How an overlay method lowers: a host import, a fixed engine import, or a
+custom wasm sequence."""
 struct InterceptSpec
-    kind::Symbol      # :hostcall or :custom
-    real::Any         # the native callable (for :hostcall thunks)
-    emit::Any         # (fc, i, ex, mi) -> pushed::Bool (for :custom)
+    kind::Symbol      # :hostcall, :import, or :custom
+    real::Any         # the native callable (for :hostcall/:import thunks)
+    emit::Any         # :custom -> (fc, i, ex, mi) -> pushed::Bool
+                      # :import -> (module::String, name::String)
 end
 
 const INTERCEPTS = IdDict{Method,InterceptSpec}()
+
+"""
+Register a concrete type as host/engine-resident: values flow through wasm
+as opaque `externref`s and may cross the boundary directly. Used by runtime
+packages (e.g. JSRuntime's `JSString`).
+"""
+function register_externref_type!(T::Type)
+    EXTERNREF_TYPES[T] = true
+    return nothing
+end
+const EXTERNREF_TYPES = IdDict{Type,Bool}()
+
+"""
+Lower calls to (the unique specialization of) `m` to a call of the fixed
+import `mod`/`name` — e.g. a js-string builtin from "wasm:js-string". `real`
+is the native implementation, bound as the import's host thunk on engines
+that don't provide it natively (wasmtime); on JS engines instantiated with
+`{builtins: ["js-string"]}` the engine supplies it.
+"""
+function register_import_intercept!(m::Method, mod::String, name::String, real)
+    INTERCEPTS[m] = InterceptSpec(:import, real, (mod, name))
+    return nothing
+end
 
 function _overlay_method(@nospecialize(f), argtypes::Type{<:Tuple})
     tt = Base.signature_type(f, argtypes)

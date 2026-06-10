@@ -4,3 +4,4 @@ tools/
 *.cov
 Manifest.toml
 LocalPreferences.toml
+JSRuntime/test/jsstr_manifest.json

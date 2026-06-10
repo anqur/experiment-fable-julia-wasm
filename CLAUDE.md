@@ -1,8 +1,9 @@
 # Julia → WasmGC project
 
-Monorepo of three layered Julia packages compiling Julia to WebAssembly-with-GC:
+Monorepo of four layered Julia packages compiling Julia to WebAssembly-with-GC:
 `WasmTools` (binary format), `WasmtimeRunner` (wasmtime C-API execution),
-`WasmCodegen` (IRCode → wasm). See README.md for architecture.
+`WasmCodegen` (IRCode → wasm), `JSRuntime` (browser-runtime types — JSString
+over the js-string builtins). See README.md for architecture.
 
 ## Environment
 
@@ -32,6 +33,16 @@ Monorepo of three layered Julia packages compiling Julia to WebAssembly-with-GC:
 - Sub-word integers (Int8/16, UInt8/16) live in i32: signed values
   sign-extended, unsigned zero-extended; renormalize after arithmetic
   (`emit_norm!`). GC struct fields pack them as i8/i16 instead.
+- `String` is wasm-GC-resident: a `{bytes::(array mut i8)}` struct (array
+  shared with `Memory{UInt8}`); literals live in data segments. At the
+  boundary strings externalize (`extern.convert_any`); hosts use the
+  exported `__str_new/__str_set/__str_len/__str_get` accessors, wasmtime
+  embedders via `string_codec(inst)` + `WasmCodegen.string_bridge[]`.
+- `JSRuntime.JSString` is engine-resident (`externref`, real JS strings in
+  browsers); ops lower to `"wasm:js-string"` imports. Compile with
+  `exact_engine_imports=true` for engines with strict builtin type checks
+  (non-null `(ref extern)` results); the default nullable flavor is what
+  wasmtime's C API can bind.
 
 ## Pending / watch
 

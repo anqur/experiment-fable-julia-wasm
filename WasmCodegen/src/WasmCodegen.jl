@@ -35,6 +35,6 @@ include("compiler.jl")
 _register_intercepts!()
 
 export compile_wasm, WasmCompilation, offload_imports, CompileError,
-       string_bridge
+       string_bridge, register_externref_type!, register_import_intercept!
 
 end # module WasmCodegen

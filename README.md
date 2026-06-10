@@ -15,6 +15,7 @@ optimized IR and lexing as you type, entirely client-side:
 | `WasmTools/` | Pure-Julia reader/writer for wasm binaries. Full wasm 3.0: WasmGC (struct/array/ref types, rec groups, subtyping), function references, tail calls, exception handling, bulk memory, multi-memory. Byte-stable round trips; fuzzed against `wasm-tools smith`. Zero dependencies. |
 | `WasmtimeRunner/` | Embeds [wasmtime](https://wasmtime.dev) via `Wasmtime_jll` (pinned to v45): load/validate/instantiate modules, call exports, define host functions backed by Julia callables, bind Julia values into wasm as `externref`. Traps and engine errors surface as Julia exceptions. |
 | `WasmCodegen/` | Translator from Julia's optimized SSA IR to wasm. Engine-agnostic (depends only on WasmTools + vendored UnicodeNext). Untranslatable callees become *offload imports* — host functions calling back into native Julia — so partial programs run end-to-end while the compiler grows. |
+| `JSRuntime/` | Browser-runtime types. `JSString` is a JS-native string (`externref`) whose operations compile to the [js-string builtins](https://github.com/WebAssembly/js-string-builtins) (`"wasm:js-string"` imports) — near-native JS string ops in the browser; the same modules run under wasmtime with the package's native UTF-16 implementations bound as imports. |
 
 ## Quick start
 

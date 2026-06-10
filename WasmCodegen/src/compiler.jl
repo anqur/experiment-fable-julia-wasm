@@ -32,7 +32,10 @@ struct Offload
     params::Vector{Symbol}
     results::Vector{Symbol}
     name::String
+    mod::String                # import module ("julia", or e.g. "wasm:js-string")
 end
+Offload(key, func, argtypes, rettype, params, results, name) =
+    Offload(key, func, argtypes, rettype, params, results, name, "julia")
 
 """How a Julia struct/tuple type lowers to a WasmGC struct."""
 struct GCStructInfo
@@ -279,6 +282,9 @@ function valtype_for(mc::ModuleCompiler, @nospecialize T)
     isghost(T) && return nothing
     r = scalar_repr(T)
     r !== nothing && return r.vt
+    # explicitly registered host/engine-resident types (e.g. JSRuntime's
+    # JSString) stay externref even when they would lower structurally
+    T isa Type && haskey(EXTERNREF_TYPES, T) && return ExternRefT
     if T isa Union
         U = Base.uniontypes(T)
         if length(U) == 2 && Nothing in U
@@ -338,16 +344,21 @@ end
 """
 Register a host import implementing a builtin over host-resident values
 (e.g. `sizeof(::String)`). Returns the `HostCall` immediate to emit.
+Pass `mod`/`name` for fixed engine-provided imports (e.g. the js-string
+builtins, module "wasm:js-string"); the default is a generated name in the
+"julia" namespace bound by the embedder.
 """
 function request_hostcall!(mc::ModuleCompiler, key, func, argtypes::Vector{Any},
-                           @nospecialize rettype)
+                           @nospecialize(rettype); mod::String="julia",
+                           name::Union{Nothing,String}=nothing)
     if !haskey(mc.offload_ids, key)
         params = Symbol[offload_kind(mc, T) for T in argtypes if !isghost(T)]
         results = Symbol[]
         isghost(rettype) || rettype === Union{} || push!(results, offload_kind(mc, rettype))
         tag = key isa Core.MethodInstance ? key.def.name : key isa Tuple ? key[1] : key
-        name = "host_$(length(mc.offloads))_$(tag)"
-        push!(mc.offloads, Offload(key, func, argtypes, rettype, params, results, name))
+        nm = name === nothing ? "host_$(length(mc.offloads))_$(tag)" : name
+        push!(mc.offloads,
+              Offload(key, func, argtypes, rettype, params, results, nm, mod))
         mc.offload_ids[key] = length(mc.offloads) - 1
     end
     return HostCall(key)
@@ -1462,7 +1473,13 @@ function emit_intercept!(fc::FuncCompiler, i::Int, ex::Expr, mi::Core.MethodInst
     for (k, ref) in enumerate(ex.args[3:end])
         emit_value_typed!(fc, ref, ps[k+1])
     end
-    hc = request_hostcall!(fc.mc, mi, spec.real, Any[T for T in ps[2:end]], rt)
+    hc = if spec.kind === :import
+        imod, iname = spec.emit::Tuple{String,String}
+        request_hostcall!(fc.mc, (imod, iname), spec.real,
+                          Any[T for T in ps[2:end]], rt; mod=imod, name=iname)
+    else
+        request_hostcall!(fc.mc, mi, spec.real, Any[T for T in ps[2:end]], rt)
+    end
     emit!(fc, Inst(:call, (hc,)))
     return rt !== Union{} && valtype_for(fc.mc, rt) !== nothing
 end
@@ -2135,7 +2152,7 @@ but have scalar signatures become host imports (module `"julia"`), listed in
 `result.offloads` for binding by the embedder.
 """
 function compile_wasm(@nospecialize(f), @nospecialize(argtypes::Type{<:Tuple});
-                      name::String=string(f))
+                      name::String=string(f), exact_engine_imports::Bool=false)
     tt = Base.signature_type(f, argtypes)
     matches = Base._methods_by_ftype(tt, -1, Base.get_world_counter())
     (matches === nothing || length(matches) != 1) &&
@@ -2275,9 +2292,18 @@ function compile_wasm(@nospecialize(f), @nospecialize(argtypes::Type{<:Tuple});
     offidx = Dict{Any,Int}()
     for (k, off) in enumerate(offloads)
         offidx[off.key] = k - 1
-        importfunc!(mc.wmod, "julia", off.name,
-                    FuncType(ValType[_sym_vt(s) for s in off.params],
-                             ValType[_sym_vt(s) for s in off.results]))
+        ft = FuncType(ValType[_sym_vt(s) for s in off.params],
+                      ValType[_sym_vt(s) for s in off.results])
+        if exact_engine_imports && off.mod != "julia"
+            # spec-exact engine-builtin signatures: string-returning js-string
+            # builtins are typed (ref extern), non-null. Engines with strict
+            # (pre-subtyping) builtin checks require the exact type; the
+            # nullable default stays bindable through wasmtime's C API.
+            ft = FuncType(ft.params,
+                          ValType[vt == ExternRefT ? RefType(false, ExternHT) : vt
+                                  for vt in ft.results])
+        end
+        importfunc!(mc.wmod, off.mod, off.name, ft)
     end
     hostconsts = Pair{String,Any}[]
     for (k, v) in enumerate(mc.hostconsts)
@@ -2455,7 +2481,7 @@ The host imports required by `comp`, as tuples
 wire-level scalars. Bind each as a host function before instantiating.
 """
 function offload_imports(comp::WasmCompilation)
-    return [("julia", off.name, off.params, off.results, _offload_thunk(off))
+    return [(off.mod, off.name, off.params, off.results, _offload_thunk(off))
             for off in comp.offloads]
 end
 

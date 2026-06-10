@@ -1,0 +1,7 @@
+name = "JSRuntime"
+uuid = "9c4e8f2a-1b3d-4d76-a5c8-3e2f1d0b9a87"
+authors = ["Keno Fischer <keno@juliahub.com>"]
+version = "0.1.0"
+
+[deps]
+WasmCodegen = "2a3016f4-244f-4553-97d3-d07103519a17"
