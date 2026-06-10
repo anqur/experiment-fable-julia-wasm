@@ -19,6 +19,13 @@
   }
   #modebar label { cursor: pointer; user-select: none; }
   #modebar input { accent-color: #654ff0; margin-right: .3rem; }
+  #modebar .sep { border-left: 1px solid #d0d7de; height: 1rem; }
+  #modebar button {
+    font: inherit; font-size: .8rem; color: #1f2328; cursor: pointer;
+    background: #f6f8fa; border: 1px solid #d0d7de; border-radius: 6px;
+    padding: .1rem .55rem;
+  }
+  #modebar button:hover { background: #eef1f4; }
   #panes { display: flex; gap: 1rem; align-items: flex-start; flex-wrap: wrap; }
   #editor-wrap {
     flex: 1 1 34rem; min-width: 26rem;
@@ -106,6 +113,9 @@
   Highlight:
   <label><input type="radio" name="hlmode" value="tokens">token colors</label>
   <label><input type="radio" name="hlmode" value="tree" checked>parse-tree boxes</label>
+  <span class="sep"></span>
+  Examples:
+  <span id="examples"></span>
 </div>
 <div id="panes">
   <div id="editor-wrap"><div id="editor"></div></div>
@@ -630,7 +640,8 @@ function selectTreeNode(id, { scrollTree }) {
   }
 }
 
-// deepest non-trivia node containing the byte: ordered-tree descent
+// deepest node containing the byte (trivia leaves included — the outline
+// shows them even though no box is drawn): ordered-tree descent
 function deepestNodeAt(byte) {
   let best = null;
   let nodes = cached.roots;
@@ -638,8 +649,7 @@ function deepestNodeAt(byte) {
     const k = lowerBound(nodes, byte, (n) => n.b);
     if (k >= nodes.length || nodes[k].a > byte) break;
     const n = nodes[k];
-    const e = cached.index[n._id];
-    if (!e.trivia) best = n._id;
+    best = n._id;
     if (n.leaf) break;
     nodes = n.children;
   }
@@ -682,13 +692,25 @@ treeEl.addEventListener("click", (ev) => {
   scheduleHighlight();   // the reveal may have scrolled the viewport
 });
 
-// In tree mode, clicks select by the VISIBLE bounding boxes (paint order:
-// last containing box wins = the innermost one). Monaco clamps clicks past
-// the end of a line to the line's last column, so the cursor position would
-// pick the wrong node for clicks inside a box but beyond the text.
+// In tree mode: a click ON a glyph selects the exact node under it — trivia
+// and delimiters included, even though they get no box (the outline shows
+// them). A click beyond the text (where monaco clamps the cursor to the
+// line's last column) instead picks the innermost VISIBLE box under the
+// pointer, so clicking inside a box past end-of-line isn't misattributed.
 let suppressCursorSync = false;
 editor.onMouseDown((e) => {
   if (mode !== "tree" || !cached || !drawnBoxes) return;
+  if (e.target.type === monaco.editor.MouseTargetType.CONTENT_TEXT &&
+      e.target.position) {
+    const byte = charToByte(model.getOffsetAt(e.target.position)) + 1;
+    const id = deepestNodeAt(byte);
+    if (id !== null) {
+      suppressCursorSync = true;
+      pickDecorations.clear();
+      selectTreeNode(id, { scrollTree: true });
+    }
+    return;
+  }
   const be = e.event.browserEvent;
   const rect = editor.getDomNode().getBoundingClientRect();
   const layout = editor.getLayoutInfo();
@@ -760,6 +782,37 @@ for (const r of document.querySelectorAll('input[name="hlmode"]')) {
     applyHighlight();
   });
 }
+
+// --- larger example sources, fetched straight from GitHub ----------------------
+const JL = "https://raw.githubusercontent.com/JuliaLang/julia/v1.12.1";
+const EXAMPLES = [
+  ["mandel", null],
+  ["sort.jl", `${JL}/base/sort.jl`],
+  ["show.jl", `${JL}/base/show.jl`],
+  ["abstractinterpretation.jl", `${JL}/Compiler/src/abstractinterpretation.jl`],
+];
+const exSpan = document.getElementById("examples");
+for (const [label, url] of EXAMPLES) {
+  const b = document.createElement("button");
+  b.textContent = label;
+  b.title = url ? `julia ${url.slice(JL.length - 7)}` : "the built-in sample";
+  b.addEventListener("click", async () => {
+    if (!url) {
+      editor.setValue(SAMPLE);
+      return;
+    }
+    status.textContent = `fetching ${label}…`;
+    try {
+      const r = await fetch(url);
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      editor.setValue(await r.text());
+    } catch (err) {
+      status.textContent = `failed to fetch ${label}: ${err}`;
+    }
+  });
+  exSpan.appendChild(b);
+}
+
 render();
 </script>
 </body>
