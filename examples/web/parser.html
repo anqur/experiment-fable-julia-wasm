@@ -438,8 +438,19 @@ function renderBoxes() {
   }
 }
 
+// is the parse cache current for the model's content? Between an edit and
+// the (debounced) re-parse, all cache-derived rendering must stand down —
+// stale boxes drawn against new text are just wrong
+const cacheFresh = () =>
+  cached !== null && cached.version === model.getVersionId();
+
 function applyHighlight() {
-  if (!cached) return;
+  if (!cacheFresh()) {
+    decorations.set([]);
+    boxLayer().replaceChildren();
+    drawnBoxes = [];
+    return;
+  }
   if (mode === "tokens") {
     boxLayer().replaceChildren();
     drawnBoxes = null;
@@ -657,14 +668,14 @@ function deepestNodeAt(byte) {
 }
 
 function syncFromCursor() {
-  if (!cached) return;
+  if (!cacheFresh()) return;
   const pos = editor.getPosition();
   const byte = charToByte(model.getOffsetAt(pos)) + 1;
   selectTreeNode(deepestNodeAt(byte), { scrollTree: true });
 }
 
 treeEl.addEventListener("click", (ev) => {
-  if (!cached) return;
+  if (!cacheFresh()) return;
   const li = ev.target.closest("li[data-node]");
   if (!li) return;
   ev.stopPropagation();
@@ -699,7 +710,7 @@ treeEl.addEventListener("click", (ev) => {
 // pointer, so clicking inside a box past end-of-line isn't misattributed.
 let suppressCursorSync = false;
 editor.onMouseDown((e) => {
-  if (mode !== "tree" || !cached || !drawnBoxes) return;
+  if (mode !== "tree" || !cacheFresh() || !drawnBoxes) return;
   if (e.target.type === monaco.editor.MouseTargetType.CONTENT_TEXT &&
       e.target.position) {
     const byte = charToByte(model.getOffsetAt(e.target.position)) + 1;
@@ -755,7 +766,8 @@ function render() {
   lastParseMs = dt;
   const roots = buildTree(ev.tokens, ev.nodes, TOMBSTONE);
   const index = indexNodes(roots);
-  cached = { ev, text, bytes, b2c: byteToCharMap(text), roots, index };
+  cached = { ev, text, bytes, b2c: byteToCharMap(text), roots, index,
+             version: model.getVersionId() };
   pickDecorations.clear();
   applyHighlight();
   renderTree();
@@ -766,11 +778,18 @@ function render() {
 }
 
 // debounce re-parsing when the last parse was slow (big files), so typing
-// stays responsive; small files keep the instant feedback
+// stays responsive; small files keep the instant feedback. Highlights from
+// the now-stale parse clear immediately (applyHighlight stands down on a
+// version mismatch) rather than drawing wrong boxes against the new text.
 let renderTimer = 0;
 editor.onDidChangeModelContent(() => {
   clearTimeout(renderTimer);
-  renderTimer = setTimeout(render, lastParseMs > 150 ? 400 : 0);
+  const delay = lastParseMs > 150 ? 400 : 0;
+  if (delay > 0) {
+    status.textContent = "reparsing…";
+    scheduleHighlight();
+  }
+  renderTimer = setTimeout(render, delay);
 });
 // highlights cover the viewport (+buffer) only: refresh on scroll/layout
 editor.onDidScrollChange(scheduleHighlight);
