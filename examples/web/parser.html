@@ -34,6 +34,8 @@
   .monaco-editor .c4 { background: #c5e8f7; border-radius: 3px; }
   .monaco-editor .c5 { background: #e4d5f7; border-radius: 3px; }
   .monaco-editor .tok-error { background: #d73a49; color: #ffffff !important; }
+  /* range tint when a tree-outline node is clicked */
+  .monaco-editor .tree-pick { background: rgba(255, 211, 61, .45); border-radius: 3px; }
   /* tree mode: 2D bounding boxes drawn into monaco's scrolled content */
   #treeboxes { position: absolute; top: 0; left: 0; pointer-events: none; }
   .bb {
@@ -163,6 +165,7 @@ const editor = monaco.editor.create(document.getElementById("editor"), {
   selectionHighlight: false,
   matchBrackets: "never",
   unicodeHighlight: { ambiguousCharacters: false },
+  renderWhitespace: "none",
   padding: { top: 10, bottom: 10 },
   automaticLayout: true,
 });
@@ -390,13 +393,26 @@ function applyHighlight() {
 // --- editor <-> tree-outline sync ---------------------------------------------
 let selectedLi = null;
 let syncing = false;
+const pickDecorations = editor.createDecorationsCollection([]);
+
+// scroll ONLY the tree pane (scrollIntoView could also scroll the page,
+// which is jarring when zoomed in)
+function scrollTreePane(li) {
+  const wrap = document.getElementById("tree-wrap");
+  const line = li.querySelector(":scope > .nodeline") ?? li;
+  const lr = line.getBoundingClientRect();
+  const wr = wrap.getBoundingClientRect();
+  if (lr.top < wr.top || lr.bottom > wr.bottom) {
+    wrap.scrollTop += lr.top - (wr.top + wr.height / 3);
+  }
+}
 
 function selectTreeNode(id, { scrollTree }) {
   selectedLi?.classList.remove("selected");
   selectedLi = id === null ? null : treeEl.querySelector(`li[data-node="${id}"]`);
   if (selectedLi) {
     selectedLi.classList.add("selected");
-    if (scrollTree) selectedLi.scrollIntoView({ block: "nearest" });
+    if (scrollTree) scrollTreePane(selectedLi);
   }
 }
 
@@ -438,13 +454,18 @@ treeEl.addEventListener("click", (ev) => {
   const range = new monaco.Range(s.lineNumber, s.column, en.lineNumber, en.column);
   syncing = true;
   editor.setSelection(range);
-  editor.revealRangeInCenterIfOutsideViewport(range);
+  editor.revealRangeInCenterIfOutsideViewport(range);   // editor-internal scroll
   syncing = false;
+  // monaco's unfocused selection is nearly invisible: tint the range
+  pickDecorations.set([{ range, options: { className: "tree-pick" } }]);
   selectTreeNode(+li.dataset.node, { scrollTree: false });
 });
 
 editor.onDidChangeCursorPosition(() => {
-  if (!syncing) syncFromCursor();
+  if (!syncing) {
+    pickDecorations.clear();
+    syncFromCursor();
+  }
 });
 
 function render() {
