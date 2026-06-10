@@ -228,7 +228,9 @@ const lowerBound = (arr, key, get) => {
 // --- node index ----------------------------------------------------------------
 // preorder index of all nodes: ids (mirrored as data-node in the outline),
 // depths, parents, trimmed extents, and box heights — everything that is
-// viewport-independent gets computed once per parse here
+// viewport-independent gets computed once per parse here. Horizontal box
+// geometry needs nothing per node: it derives from the per-line measured
+// widths/indents (see rebuildLineWidths) at draw time.
 function indexNodes(roots) {
   const list = [];
   function rec(node, depth, parentId, childIdx) {
@@ -347,69 +349,49 @@ function renderBoxes() {
   const fontSize = editor.getOption(monaco.editor.EditorOption.fontSize);
   const vinset = Math.max(Math.floor((lineH - fontSize) / 2) - 1, 0);
 
-  // horizontal extent measured over the window's lines only; vertical extent
-  // exact (so partially visible boxes keep their true top/bottom offscreen)
-  function measure(a, b) {
-    const s = model.getPositionAt(b2c[a - 1]);
-    const e = model.getPositionAt(Math.max(b2c[b], b2c[a - 1]));
-    let left = Infinity, right = -Infinity;
-    const l0 = Math.max(s.lineNumber, w.sl), l1 = Math.min(e.lineNumber, w.el);
-    for (let ln = l0; ln <= l1; ln++) {
-      const c1 = ln === s.lineNumber ? s.column : 1;
-      const c2 = ln === e.lineNumber ? e.column : model.getLineMaxColumn(ln);
-      left = Math.min(left, editor.getOffsetForColumn(ln, c1));
-      right = Math.max(right, editor.getOffsetForColumn(ln, c2));
+  // geometry derives from the per-parse measured line widths/indents
+  // (stable under scrolling — see rebuildLineWidths): a node's lines other
+  // than the first are fully covered, so its left edge is the minimum of its
+  // start position and those lines' first-non-whitespace x; its right edge
+  // is the maximum of its end position and the full widths of all covered
+  // lines but the last. Only endpoint pixel conversions happen at draw time.
+  function rectOf(e) {
+    const s = model.getPositionAt(b2c[e.lo - 1]);
+    const en = model.getPositionAt(Math.max(b2c[e.hi], b2c[e.lo - 1]));
+    let left = pxAt(s.lineNumber, s.column);
+    let right = pxAt(en.lineNumber, en.column);
+    if (en.lineNumber > s.lineNumber) {
+      left = Math.min(left, cached.minIndentPx(s.lineNumber + 1, en.lineNumber));
+      right = Math.max(right, cached.maxWidthPx(s.lineNumber, en.lineNumber - 1));
     }
-    if (right < left) { left = 0; right = 0; }
-    return { left, right,
-             top: editor.getTopForLineNumber(s.lineNumber) + vinset,
-             bottom: editor.getTopForLineNumber(e.lineNumber) + lineH - vinset };
-  }
-  function verticalExtent(lo, hi) {
-    const s = model.getPositionAt(b2c[lo - 1]);
-    const e = model.getPositionAt(Math.max(b2c[hi], b2c[lo - 1]));
-    return { top: editor.getTopForLineNumber(s.lineNumber) + vinset,
-             bottom: editor.getTopForLineNumber(e.lineNumber) + lineH - vinset };
-  }
-  const union = (u, v) =>
-    v === null ? u : u === null ? { ...v } : {
-      left: Math.min(u.left, v.left), top: Math.min(u.top, v.top),
-      right: Math.max(u.right, v.right), bottom: Math.max(u.bottom, v.bottom),
+    return {
+      left, right,
+      top: editor.getTopForLineNumber(s.lineNumber) + vinset,
+      bottom: editor.getTopForLineNumber(en.lineNumber) + lineH - vinset,
     };
+  }
 
   const out = [];
   function walk(node) {
-    if (node.b < w.vs || node.a > w.ve) return null;
+    if (node.b < w.vs || node.a > w.ve) return;
     const e = index[node._id];
     if (node.leaf) {
-      if (e.trivia) return null;
-      const u = measure(node.a, node.b);
-      if (e.err || (!isDelimName(e.name) && e.name !== "Comment"))
-        out.push({ u: { ...u }, e });
-      return u;
+      if (!e.trivia && (e.err || (!isDelimName(e.name) && e.name !== "Comment")))
+        out.push(e);
+      return;
     }
-    const slot = { u: null, e };
-    out.push(slot);
-    let u = null;
+    out.push(e);
     const kids = node.children;
     let k = lowerBound(kids, w.vs, (c) => c.b);
-    for (; k < kids.length && kids[k].a <= w.ve; k++) {
-      u = union(u, walk(kids[k]));
-    }
-    if (u !== null && e.hasExtent) {
-      const v = verticalExtent(e.lo, e.hi);   // true extent even offscreen
-      slot.u = { left: u.left, right: u.right, top: v.top, bottom: v.bottom };
-    } else {
-      slot.u = u;
-    }
-    return slot.u;
+    for (; k < kids.length && kids[k].a <= w.ve; k++) walk(kids[k]);
   }
   for (const r of roots) walk(r);
 
   const spacey = (c) =>
     c === undefined || c === " " || c === "\n" || c === "\t";
-  for (const { u, e } of out) {
-    if (u === null) continue;
+  for (const e of out) {
+    if (e.b < e.a && !e.err) continue;   // zero-width: only errors marked
+    const u = rectOf(e);
     const pad = Math.min(e.boxh, 3) + 1;
     // horizontal outset only into whitespace: a single-line box knows
     // exactly which characters flank it — when the neighbor is a glyph
@@ -424,6 +406,7 @@ function renderBoxes() {
     const d = document.createElement("div");
     d.className = e.err ? "bb bb-err" : e.leaf ? "bb bb-leaf" : `bb b${e.depth % 6}`;
     d.title = e.leaf ? e.name : `[${e.name}]`;
+    d.dataset.node = e.node._id;
     const left = u.left - padL;
     const top = u.top - pad;
     const width = Math.max(u.right - u.left, 3) + padL + padR;
@@ -751,6 +734,87 @@ editor.onDidChangeCursorPosition(() => {
 // --- parse + render --------------------------------------------------------------
 let lastParseMs = 0;
 
+// Per-line pixel geometry — measured once per parse and again if the font
+// changes: each line's full width and its first-non-whitespace x (Infinity
+// for blank lines), with O(1) range-max/min sparse tables for multi-line
+// box edges. Monaco's own getOffsetForColumn only answers for lines
+// materialized in the viewport (-1 otherwise), so the oracle is a canvas
+// measureText configured with monaco's exact fontInfo — the same font
+// engine the renderer uses (verified to agree within half a pixel, wide
+// CJK/emoji and combining characters included).
+let measureCtx = null;
+let tabW = 8;
+function rebuildMeasurer() {
+  const fi = editor.getOption(monaco.editor.EditorOption.fontInfo);
+  measureCtx = (measureCtx?.canvas ?? document.createElement("canvas"))
+    .getContext("2d");
+  measureCtx.font = `${fi.fontWeight} ${fi.fontSize}px ${fi.fontFamily}`;
+  if (fi.letterSpacing) measureCtx.letterSpacing = fi.letterSpacing + "px";
+  tabW = model.getOptions().tabSize * fi.spaceWidth;
+}
+// pixel x after rendering `text` from x=0, with tab stops
+function measureLine(text) {
+  let x = 0;
+  let start = 0;
+  for (;;) {
+    const t = text.indexOf("\t", start);
+    if (t < 0) {
+      return x + measureCtx.measureText(start ? text.slice(start) : text).width;
+    }
+    x += measureCtx.measureText(text.slice(start, t)).width;
+    x = (Math.floor(x / tabW + 1e-6) + 1) * tabW;
+    start = t + 1;
+  }
+}
+// pixel x of a (line, column) position, memoized per parse/font
+function pxAt(line, col) {
+  const key = line * 1e7 + col;
+  let v = cached.pxMemo.get(key);
+  if (v === undefined) {
+    v = measureLine(model.getLineContent(line).slice(0, col - 1));
+    cached.pxMemo.set(key, v);
+  }
+  return v;
+}
+function buildSparse(arr, n, pick) {
+  const st = [arr];
+  for (let k = 1; (1 << k) <= n; k++) {
+    const prev = st[k - 1];
+    const cur = new Float64Array(n + 1);
+    const half = 1 << (k - 1);
+    for (let i = 1; i + (1 << k) - 1 <= n; i++) {
+      cur[i] = pick(prev[i], prev[i + half]);
+    }
+    st.push(cur);
+  }
+  return (l, r) => {                    // 1-based inclusive, l <= r
+    const k = 31 - Math.clz32(r - l + 1);
+    return pick(st[k][l], st[k][r - (1 << k) + 1]);
+  };
+}
+function rebuildLineWidths() {
+  if (!cached) return;
+  rebuildMeasurer();
+  cached.pxMemo = new Map();
+  const n = model.getLineCount();
+  const w = new Float64Array(n + 1);
+  const ind = new Float64Array(n + 1);
+  for (let ln = 1; ln <= n; ln++) {
+    const content = model.getLineContent(ln);
+    w[ln] = measureLine(content);
+    const c = model.getLineFirstNonWhitespaceColumn(ln);
+    ind[ln] = c === 0 ? Infinity : measureLine(content.slice(0, c - 1));
+  }
+  cached.maxWidthPx = buildSparse(w, n, Math.max);
+  cached.minIndentPx = buildSparse(ind, n, Math.min);
+}
+editor.onDidChangeConfiguration((e) => {
+  if (e.hasChanged(monaco.editor.EditorOption.fontInfo)) {
+    rebuildLineWidths();
+    scheduleHighlight();
+  }
+});
+
 function render() {
   const text = model.getValue();
   const bytes = new TextEncoder().encode(text);
@@ -765,9 +829,11 @@ function render() {
   const dt = performance.now() - t0;
   lastParseMs = dt;
   const roots = buildTree(ev.tokens, ev.nodes, TOMBSTONE);
+  const b2c = byteToCharMap(text);
   const index = indexNodes(roots);
-  cached = { ev, text, bytes, b2c: byteToCharMap(text), roots, index,
+  cached = { ev, text, bytes, b2c, roots, index,
              version: model.getVersionId() };
+  rebuildLineWidths();
   pickDecorations.clear();
   applyHighlight();
   renderTree();
