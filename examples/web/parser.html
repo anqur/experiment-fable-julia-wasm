@@ -166,11 +166,21 @@ const editor = monaco.editor.create(document.getElementById("editor"), {
   matchBrackets: "never",
   unicodeHighlight: { ambiguousCharacters: false },
   renderWhitespace: "none",
+  // no intellisense: the only assistance here is the wasm parser's output
+  quickSuggestions: false,
+  suggestOnTriggerCharacters: false,
+  wordBasedSuggestions: "off",
+  parameterHints: { enabled: false },
+  tabCompletion: "off",
+  snippetSuggestions: "none",
+  acceptSuggestionOnEnter: "off",
   padding: { top: 10, bottom: 10 },
   automaticLayout: true,
 });
 const model = editor.getModel();
 const decorations = editor.createDecorationsCollection([]);
+// swallow the explicit trigger-suggest keybinding as well
+editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Space, () => {});
 
 let parser = null;
 try {
