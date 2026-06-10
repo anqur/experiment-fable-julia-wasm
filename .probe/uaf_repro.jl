@@ -20,8 +20,12 @@ end
 GC.gc(); GC.gc(); GC.gc()   # store unreachable -> finalizer -> wasmtime_store_delete
 sleep(0.1)
 println("reading dangling buffer of length ", length(buf))
-s = UInt64(0)
-for i in 1:length(buf)      # touch every page
-    s += buf[i]
+function touch(buf)
+    s = UInt64(0)
+    for i in 1:length(buf)      # touch every page
+        s += buf[i]
+    end
+    return s
 end
+s = touch(buf)
 println("survived read, sum=", s, " buf[1]=", buf[1], " (silent UAF: value may be garbage)")

@@ -168,7 +168,22 @@ function valtype_for(mc::ModuleCompiler, @nospecialize T)
         return RefType(true, HeapType(gc_memref!(mc, T)))
     end
     is_gc_struct(T) && return RefType(true, HeapType(gc_struct!(mc, T).typeidx))
+    # Fallback: concrete types we cannot lower (String, Symbol, BigInt, ...)
+    # live host-side and flow through wasm as opaque externrefs, crossing the
+    # boundary only at offloaded calls.
+    if T isa DataType && isconcretetype(T) && !(T <: Ptr)
+        return ExternRefT
+    end
     throw(CompileError("unsupported Julia type $T"))
+end
+
+"""Boundary kind for offloaded signatures: scalar kinds or `:externref`."""
+function offload_kind(mc::ModuleCompiler, @nospecialize T)
+    k = valkind_sym(T)
+    k === nothing || return k
+    vt = valtype_for(mc, T)   # throws CompileError if not representable
+    vt == ExternRefT && return :externref
+    throw(CompileError("cannot pass $T across the offload boundary (wasm-GC-resident)"))
 end
 
 """The non-Nothing component of `Union{Nothing,T}`, or `T` itself."""
@@ -226,18 +241,11 @@ function offload!(mc::ModuleCompiler, mi::Core.MethodInstance, why::Exception)
         throw(CompileError("cannot offload non-singleton callee $ftype ($(sprint(showerror, why)))"))
     _, rettype = method_ir(mi)
     rettype = widen(rettype)
-    args = Any[T for T in argts[2:end] if !isghost(T)]
-    params = Symbol[]
-    for T in args
-        k = valkind_sym(T)
-        k === nothing && throw(CompileError("cannot offload $(mi): argument type $T"))
-        push!(params, k)
-    end
+    args = Any[T for T in argts[2:end]]   # full list; ghosts reconstructed in the thunk
+    params = Symbol[offload_kind(mc, T) for T in args if !isghost(T)]
     results = Symbol[]
     if !isghost(rettype) && rettype !== Union{}
-        k = valkind_sym(rettype)
-        k === nothing && throw(CompileError("cannot offload $(mi): return type $rettype"))
-        push!(results, k)
+        push!(results, offload_kind(mc, rettype))
     end
     name = "offload_$(length(mc.offloads))_$(mi.def.name)"
     push!(mc.offloads, Offload(mi, ftype.instance, args, rettype, params, results, name))
@@ -426,6 +434,8 @@ function emit_call!(fc::FuncCompiler, i::Int, ex::Expr)
                 vb = valtype_for(fc.mc, Tb)
                 va isa RefType && vb isa RefType ||
                     throw(CompileError("=== on $Ta, $Tb"))
+                (va == ExternRefT || vb == ExternRefT) &&
+                    throw(CompileError("=== on host-resident (externref) values: $Ta"))
                 ismutabletype(strip_nothing(Ta)) || ismutabletype(strip_nothing(Tb)) ||
                     throw(CompileError("=== (structural egal) on immutable structs $Ta"))
                 emit_value!(fc, args[1])
@@ -1075,7 +1085,9 @@ function compile_wasm(@nospecialize(f), @nospecialize(argtypes::Type{<:Tuple});
     return WasmCompilation(mc.wmod, bytes, name, offloads)
 end
 
-_sym_vt(s::Symbol) = s === :i64 ? I64 : s === :i32 ? I32 : s === :f64 ? F64 : F32
+_sym_vt(s::Symbol) = s === :i64 ? I64 : s === :i32 ? I32 : s === :f64 ? F64 :
+                     s === :f32 ? F32 : s === :externref ? ExternRefT :
+                     error("unknown boundary kind $s")
 
 function patch_calls!(body::Vector{Inst}, fidx::Dict{Core.MethodInstance,Int},
                       offidx::Dict{Core.MethodInstance,Int})
@@ -1101,11 +1113,27 @@ end
 
 function _offload_thunk(off::Offload)
     f, ats, rt = off.func, off.argtypes, off.rettype
+    kinds = off.params
     function thunk(wireargs...)
-        jlargs = Any[from_wire(T, v) for (T, v) in zip(ats, wireargs)]
+        # Reassemble the full positional argument list: ghost parameters (e.g.
+        # singleton function arguments in keyword-sorter methods) are not on the
+        # wire and are reconstructed from their types. :externref values arrive
+        # as the Julia objects themselves; scalars arrive as wire types.
+        jlargs = Any[]
+        wi = 1
+        for T in ats
+            if isghost(T)
+                push!(jlargs, T.instance)
+            else
+                v = wireargs[wi]
+                push!(jlargs, kinds[wi] === :externref ? v : from_wire(T, v))
+                wi += 1
+            end
+        end
         ret = f(jlargs...)
         (isghost(rt) || rt === Union{}) && return nothing
-        return to_wire(rt, ret)
+        isempty(off.results) && return nothing
+        return off.results[1] === :externref ? ret : to_wire(rt, ret)
     end
     return thunk
 end
