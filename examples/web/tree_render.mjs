@@ -48,6 +48,11 @@ export const isExtentSkipName = (name) =>
   name === "Whitespace" || name === "NewlineWs" ||
   name === "EndMarker" || name === "TOMBSTONE";
 
+// pure delimiters: boxing every paren/comma/quote adds noise, not structure
+const DELIMS = new Set(["(", ")", "[", "]", "{", "}", ",", ";",
+                        "\"", "\"\"\"", "`", "```"]);
+export const isDelimName = (name) => DELIMS.has(name);
+
 // Mode 1: each non-whitespace token gets the next color in the palette
 // (token i spans bytes [tokens[i-1].next_byte, tokens[i].next_byte - 1])
 export function renderTokensHTML(tokens, bytes, dec, kindName, TOMBSTONE) {

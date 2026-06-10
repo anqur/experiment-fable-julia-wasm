@@ -58,6 +58,11 @@
   .b4 { border-color: #2f7fc1; background: rgba(47,127,193,.045); }
   .b5 { border-color: #8a5bc7; background: rgba(138,91,199,.045); }
   .bb-err { border: 2px solid #d73a49; background: rgba(215,58,73,.10); }
+  /* leaf tokens: light neutral boxes so the colored structure dominates */
+  .bb-leaf {
+    border: 1px solid rgba(31,35,40,.28); background: rgba(31,35,40,.025);
+    border-radius: 3px;
+  }
   #tree-wrap {
     flex: 1 1 26rem; min-width: 22rem; max-height: 40rem; overflow: auto;
     border: 1px solid #d0d7de; border-radius: 8px; background: #ffffff;
@@ -115,7 +120,7 @@ s = "interpolate: $(mandel(0.3 + 0.5im))"
 import { instantiateParser } from "./parser_host.mjs";
 import { KINDS } from "./parser_meta.js";
 import { esc, buildTree, renderTokensHTML, byteToCharMap, isErrName,
-         isExtentSkipName } from "./tree_render.mjs";
+         isExtentSkipName, isDelimName } from "./tree_render.mjs";
 
 const input = document.getElementById("input");
 const highlight = document.getElementById("highlight");
@@ -194,8 +199,13 @@ function renderBoxesMode() {
     if (node.leaf) {
       if (isExtentSkipName(name) && !err) return { h: 0, u: null, lo: 0, hi: 0 };
       const u = measure(node.a, node.b);
-      if (err) entries.push({ u: { ...u }, depth, height: 0, err, name,
-                              lo: node.a, hi: node.b });
+      if (err) {
+        entries.push({ u: { ...u }, depth, height: 0, err, name,
+                       lo: node.a, hi: node.b });
+      } else if (!isDelimName(name) && name !== "Comment") {
+        entries.push({ u: { ...u }, depth, height: 0, err: false, leaf: true,
+                       name, lo: node.a, hi: node.b });
+      }
       return { h: 0, u, lo: node.a, hi: node.b };
     }
     const entry = { u: null, depth, height: 0, err, name: `[${name}]`,
@@ -239,7 +249,7 @@ function renderBoxesMode() {
     const padL = !oneLine || spacey(text[b2c[e.lo - 1] - 1]) ? pad : 1;
     const padR = !oneLine || spacey(text[b2c[e.hi]]) ? pad : 1;
     const d = document.createElement("div");
-    d.className = e.err ? "bb bb-err" : `bb b${e.depth % 6}`;
+    d.className = e.err ? "bb bb-err" : e.leaf ? "bb bb-leaf" : `bb b${e.depth % 6}`;
     d.title = e.name;
     d.style.left = (e.u.left - preRect.left + highlight.scrollLeft - padL) + "px";
     d.style.top = (e.u.top - preRect.top + highlight.scrollTop - pad) + "px";
