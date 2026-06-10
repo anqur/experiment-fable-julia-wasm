@@ -299,10 +299,13 @@ function measureRange(a, b) {
            bottom: editor.getTopForLineNumber(e.lineNumber) + lineH - vinset };
 }
 
+let drawnBoxes = null;   // visible box rects in paint order, for click hit-tests
+
 function renderBoxes() {
   const { text, b2c, roots } = cached;
   const layer = boxLayer();
   layer.replaceChildren();
+  drawnBoxes = [];
   const union = (u, v) =>
     v === null ? u : u === null ? { ...v } : {
       left: Math.min(u.left, v.left), top: Math.min(u.top, v.top),
@@ -317,15 +320,15 @@ function renderBoxes() {
       const u = measureRange(node.a, node.b);
       if (err) {
         entries.push({ u: { ...u }, depth, height: 0, err, name,
-                       lo: node.a, hi: node.b });
+                       lo: node.a, hi: node.b, id: node._id });
       } else if (!isDelimName(name) && name !== "Comment") {
         entries.push({ u: { ...u }, depth, height: 0, err: false, leaf: true,
-                       name, lo: node.a, hi: node.b });
+                       name, lo: node.a, hi: node.b, id: node._id });
       }
       return { h: 0, u, lo: node.a, hi: node.b };
     }
     const entry = { u: null, depth, height: 0, err, name: `[${name}]`,
-                    lo: node.a, hi: node.b };
+                    lo: node.a, hi: node.b, id: node._id };
     entries.push(entry);
     let h = 0;
     let u = null;
@@ -371,11 +374,17 @@ function renderBoxes() {
     const d = document.createElement("div");
     d.className = e.err ? "bb bb-err" : e.leaf ? "bb bb-leaf" : `bb b${e.depth % 6}`;
     d.title = e.name;
-    d.style.left = (e.u.left - padL) + "px";
-    d.style.top = (e.u.top - pad) + "px";
-    d.style.width = (Math.max(e.u.right - e.u.left, 3) + padL + padR) + "px";
-    d.style.height = (e.u.bottom - e.u.top + 2 * pad) + "px";
+    const left = e.u.left - padL;
+    const top = e.u.top - pad;
+    const width = Math.max(e.u.right - e.u.left, 3) + padL + padR;
+    const height = e.u.bottom - e.u.top + 2 * pad;
+    d.style.left = left + "px";
+    d.style.top = top + "px";
+    d.style.width = width + "px";
+    d.style.height = height + "px";
     layer.appendChild(d);
+    drawnBoxes.push({ left, top, right: left + width, bottom: top + height,
+                      id: e.id });
   }
 }
 
@@ -449,8 +458,11 @@ treeEl.addEventListener("click", (ev) => {
   ev.stopPropagation();
   const e = cached.index[+li.dataset.node];
   const { b2c } = cached;
-  const s = model.getPositionAt(b2c[e.lo - 1]);
-  const en = model.getPositionAt(Math.max(b2c[e.hi], b2c[e.lo - 1]));
+  // highlight the node's FULL source range — including trivia that are
+  // semantically inside it (the boxes trim trivia for visual tightness,
+  // but the node owns those bytes)
+  const s = model.getPositionAt(b2c[e.a - 1]);
+  const en = model.getPositionAt(Math.max(b2c[e.b], b2c[e.a - 1]));
   const range = new monaco.Range(s.lineNumber, s.column, en.lineNumber, en.column);
   syncing = true;
   editor.setSelection(range);
@@ -461,11 +473,37 @@ treeEl.addEventListener("click", (ev) => {
   selectTreeNode(+li.dataset.node, { scrollTree: false });
 });
 
-editor.onDidChangeCursorPosition(() => {
-  if (!syncing) {
-    pickDecorations.clear();
-    syncFromCursor();
+// In tree mode, clicks select by the VISIBLE bounding boxes (paint order:
+// last containing box wins = the innermost one). Monaco clamps clicks past
+// the end of a line to the line's last column, so the cursor position would
+// pick the wrong node for clicks inside a box but beyond the text.
+let suppressCursorSync = false;
+editor.onMouseDown((e) => {
+  if (mode !== "tree" || !cached || !drawnBoxes) return;
+  const be = e.event.browserEvent;
+  const rect = editor.getDomNode().getBoundingClientRect();
+  const layout = editor.getLayoutInfo();
+  const x = be.clientX - rect.left - layout.contentLeft + editor.getScrollLeft();
+  const y = be.clientY - rect.top + editor.getScrollTop();
+  let hit = null;
+  for (const b of drawnBoxes) {
+    if (x >= b.left && x <= b.right && y >= b.top && y <= b.bottom) hit = b;
   }
+  if (hit !== null) {
+    suppressCursorSync = true;   // the click's cursor event must not override
+    pickDecorations.clear();
+    selectTreeNode(hit.id, { scrollTree: true });
+  }
+});
+
+editor.onDidChangeCursorPosition(() => {
+  if (syncing) return;
+  pickDecorations.clear();
+  if (suppressCursorSync) {
+    suppressCursorSync = false;
+    return;
+  }
+  syncFromCursor();
 });
 
 function render() {
