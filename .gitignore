@@ -1,0 +1,6 @@
+.julia/
+tools/
+*.wasm
+*.cov
+Manifest.toml
+LocalPreferences.toml
