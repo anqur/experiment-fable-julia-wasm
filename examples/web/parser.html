@@ -114,8 +114,8 @@ s = "interpolate: $(mandel(0.3 + 0.5im))"
 <script type="module">
 import { instantiateParser } from "./parser_host.mjs";
 import { KINDS } from "./parser_meta.js";
-import { esc, buildTree, renderTokensHTML, collectBoxes, byteToCharMap }
-  from "./tree_render.mjs";
+import { esc, buildTree, renderTokensHTML, byteToCharMap, isErrName,
+         isExtentSkipName } from "./tree_render.mjs";
 
 const input = document.getElementById("input");
 const highlight = document.getElementById("highlight");
@@ -158,11 +158,12 @@ function renderNode(node, bytes, dec) {
 let mode = "tokens";
 let cached = null;   // { ev, text, bytes, roots } for re-render on toggle/resize
 
-// 2D boxes: plain text goes into the layer, each node's byte range is
-// measured with a DOM Range (its bounding rect spans the node's full
-// multi-line extent), and rectangles are drawn behind the text — parents
-// first, enclosing boxes outset by tree height so coincident extents nest
-// visibly
+// 2D boxes: plain text goes into the layer; each non-trivia leaf token is
+// measured once with a DOM Range, and every interior node's box is the
+// UNION of its descendant leaf rects (a single multi-line Range would
+// include full intermediate line boxes and leading indentation, bloating
+// the box). Rectangles are drawn behind the text — parents painted first,
+// enclosing boxes outset by tree height so coincident extents nest visibly.
 function renderBoxesMode() {
   const { text, roots } = cached;
   highlight.replaceChildren();
@@ -174,21 +175,53 @@ function renderBoxesMode() {
   const b2c = byteToCharMap(text);
   const preRect = highlight.getBoundingClientRect();
   const range = document.createRange();
-  for (const box of collectBoxes(roots, kindName)) {
-    const cs = b2c[box.a - 1];
-    const ce = Math.max(b2c[box.b], cs);
-    if (ce === cs && !box.err) continue;   // zero-width: only errors marked
+  const measure = (a, b) => {       // 1-based inclusive byte range
+    const cs = b2c[a - 1];
     range.setStart(tnode, cs);
-    range.setEnd(tnode, ce);
+    range.setEnd(tnode, Math.max(b2c[b], cs));
     const r = range.getBoundingClientRect();
-    const pad = Math.min(box.height, 4) + 1;
+    return { left: r.left, top: r.top, right: r.right, bottom: r.bottom };
+  };
+  const union = (u, v) =>
+    v === null ? u : u === null ? { ...v } : {
+      left: Math.min(u.left, v.left), top: Math.min(u.top, v.top),
+      right: Math.max(u.right, v.right), bottom: Math.max(u.bottom, v.bottom),
+    };
+  const entries = [];
+  function rec(node, depth) {       // -> {h, u}
+    const name = kindName(node.head & 0xffff);
+    const err = isErrName(name);
+    if (node.leaf) {
+      if (isExtentSkipName(name) && !err) return { h: 0, u: null };
+      const u = measure(node.a, node.b);
+      if (err) entries.push({ u: { ...u }, depth, height: 0, err, name });
+      return { h: 0, u };
+    }
+    const entry = { u: null, depth, height: 0, err, name: `[${name}]` };
+    entries.push(entry);
+    let h = 0;
+    let u = null;
+    for (const c of node.children) {
+      const r = rec(c, depth + 1);
+      h = Math.max(h, r.h + 1);
+      u = union(u, r.u);
+    }
+    entry.height = h;
+    // all-trivia node (e.g. an empty block): fall back to its full range
+    entry.u = u ?? (node.b >= node.a ? measure(node.a, node.b) : null);
+    return { h, u: entry.u };
+  }
+  for (const r of roots) rec(r, 0);
+  for (const e of entries) {
+    if (e.u === null) continue;
+    const pad = Math.min(e.height, 3) + 1;
     const d = document.createElement("div");
-    d.className = box.err ? "bb bb-err" : `bb b${box.depth % 6}`;
-    d.title = box.name;
-    d.style.left = (r.left - preRect.left + highlight.scrollLeft - pad) + "px";
-    d.style.top = (r.top - preRect.top + highlight.scrollTop - pad) + "px";
-    d.style.width = (Math.max(r.width, 3) + 2 * pad) + "px";
-    d.style.height = (r.height + 2 * pad) + "px";
+    d.className = e.err ? "bb bb-err" : `bb b${e.depth % 6}`;
+    d.title = e.name;
+    d.style.left = (e.u.left - preRect.left + highlight.scrollLeft - pad) + "px";
+    d.style.top = (e.u.top - preRect.top + highlight.scrollTop - pad) + "px";
+    d.style.width = (Math.max(e.u.right - e.u.left, 3) + 2 * pad) + "px";
+    d.style.height = (e.u.bottom - e.u.top + 2 * pad) + "px";
     boxdiv.appendChild(d);
   }
 }

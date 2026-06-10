@@ -39,7 +39,14 @@ export function buildTree(tokens, ranges, TOMBSTONE) {
 }
 
 const NCOLORS = 6;
-const isErrName = (name) => name.startsWith("Error") || name === "error";
+export const isErrName = (name) => name.startsWith("Error") || name === "error";
+
+// tokens that don't contribute to a node's visual extent: whitespace trivia
+// and the zero-width sentinels. Comments DO count — they sit inside the
+// node's span, and excluding them would put box edges mid-comment.
+export const isExtentSkipName = (name) =>
+  name === "Whitespace" || name === "NewlineWs" ||
+  name === "EndMarker" || name === "TOMBSTONE";
 
 // Mode 1: each non-whitespace token gets the next color in the palette
 // (token i spans bytes [tokens[i-1].next_byte, tokens[i].next_byte - 1])
@@ -71,25 +78,48 @@ export function renderTokensHTML(tokens, bytes, dec, kindName, TOMBSTONE) {
 // Mode 2: 2D bounding boxes around parse-tree nodes. This collects the flat
 // paint-order list (parents before children, so deeper boxes draw on top);
 // the page measures each byte range with a DOM Range and draws
-// absolutely-positioned rectangles. `height` is the node's distance to its
-// deepest boxed descendant — used to outset enclosing boxes so chains of
-// nodes with identical extents stay distinguishable.
+// absolutely-positioned rectangles.
+//
+// A node's *display* range trims leading/trailing trivia (whitespace,
+// newlines, comments): the green tree attaches surrounding trivia to
+// interior nodes, but a box should hug the code — and a range that ends in
+// a newline would measure as a full-container-width rect. Trimming also
+// leaves whitespace for box edges to breathe in, so outset borders don't
+// overlap neighboring glyphs.
+//
+// `height` is the node's distance to its deepest boxed descendant — used to
+// outset enclosing boxes so chains of nodes with identical extents stay
+// distinguishable.
 export function collectBoxes(roots, kindName) {
   const out = [];
+  // returns {h, lo, hi}: subtree box height and non-trivia byte extent
   function rec(node, depth) {
     const name = kindName(node.head & 0xffff);
     const err = isErrName(name);
     if (node.leaf) {
       if (err) out.push({ a: node.a, b: node.b, depth, height: 0, err, name });
-      return 0;
+      const trivia = isExtentSkipName(name) && !err;
+      return { h: 0, lo: trivia ? null : node.a, hi: trivia ? null : node.b };
     }
     const entry = { a: node.a, b: node.b, depth, height: 0, err,
                     name: `[${name}]` };
     out.push(entry);
     let h = 0;
-    for (const c of node.children) h = Math.max(h, rec(c, depth + 1) + 1);
+    let lo = null, hi = null;
+    for (const c of node.children) {
+      const r = rec(c, depth + 1);
+      h = Math.max(h, r.h + 1);
+      if (r.lo !== null) {
+        if (lo === null) lo = r.lo;
+        hi = r.hi;
+      }
+    }
     entry.height = h;
-    return h;
+    if (lo !== null) {
+      entry.a = lo;
+      entry.b = hi;
+    }
+    return { h, lo, hi };
   }
   for (const r of roots) rec(r, 0);
   return out;
