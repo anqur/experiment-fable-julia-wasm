@@ -4,9 +4,13 @@ A layered stack for compiling Julia to WebAssembly using wasm's GC proposal,
 with wasmtime as the reference execution engine and the browser as the
 ultimate target.
 
-**Live demo:** the actual `JuliaSyntax.Tokenize` lexer, compiled from Julia's
-optimized IR and lexing as you type, entirely client-side:
-**<https://kenoaistaging.github.io/experiment-fable-julia-wasm/>**
+**Live demos**, compiled from Julia's optimized IR and running entirely
+client-side:
+- the `JuliaSyntax.Tokenize` lexer, tokenizing as you type:
+  **<https://kenoaistaging.github.io/experiment-fable-julia-wasm/>**
+- the complete `JuliaSyntax.jl` parser with a live parse tree (Monaco
+  editor, nested node boxes, synced outline):
+  **<https://kenoaistaging.github.io/experiment-fable-julia-wasm/parser.html>**
 
 ## Packages
 
