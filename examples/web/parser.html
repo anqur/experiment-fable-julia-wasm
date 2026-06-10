@@ -98,8 +98,8 @@
 <div id="status">loading parser.wasm…</div>
 <div id="modebar">
   Highlight:
-  <label><input type="radio" name="hlmode" value="tokens" checked>token colors</label>
-  <label><input type="radio" name="hlmode" value="tree">parse-tree boxes</label>
+  <label><input type="radio" name="hlmode" value="tokens">token colors</label>
+  <label><input type="radio" name="hlmode" value="tree" checked>parse-tree boxes</label>
 </div>
 <div id="panes">
   <div id="editor-wrap"><div id="editor"></div></div>
@@ -235,7 +235,10 @@ function renderNode(node, bytes, dec) {
          `<ul>${inner}</ul></li>`;
 }
 
-let mode = "tokens";
+// highlight mode: default to the parse-tree boxes, remember the choice
+let mode = localStorage.getItem("parser-demo-hlmode");
+if (mode !== "tokens" && mode !== "tree") mode = "tree";
+document.querySelector(`input[name="hlmode"][value="${mode}"]`).checked = true;
 let cached = null;   // { ev, text, bytes, b2c, roots, index }
 
 // --- token mode: monaco inline decorations -----------------------------------
@@ -536,6 +539,7 @@ editor.onDidLayoutChange(() => { mode === "tree" && applyHighlight(); });
 for (const r of document.querySelectorAll('input[name="hlmode"]')) {
   r.addEventListener("change", () => {
     mode = r.value;
+    localStorage.setItem("parser-demo-hlmode", mode);
     applyHighlight();
   });
 }
