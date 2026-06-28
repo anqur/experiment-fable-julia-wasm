@@ -5,3 +5,4 @@ tools/
 Manifest.toml
 LocalPreferences.toml
 JSRuntime/test/jsstr_manifest.json
+target/
