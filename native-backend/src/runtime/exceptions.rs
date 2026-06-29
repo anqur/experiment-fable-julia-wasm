@@ -1,24 +1,89 @@
-// Exception handling — Phase 1: abort, Phase 3: setjmp/longjmp catch frames.
+// Exception handling — Phase 4: basic setjmp/longjmp exception handling.
 
 use std::process;
+use std::cell::RefCell;
 
-/// Throw an exception. Phase 1: just abort.
-/// Phase 3: longjmp to the nearest catch frame.
+// Define jmp_buf type (size is platform-specific, but we use a buffer large enough)
+#[repr(C)]
+pub struct JmpBuf {
+    // Platform-specific jmp_buf storage
+    // For x86_64 Linux, this is typically 8 words
+    data: [i64; 8],
+}
+
+extern "C" {
+    fn setjmp(env: *mut JmpBuf) -> i32;
+    fn longjmp(env: *mut JmpBuf, val: i32) -> !;
+}
+
+/// Maximum depth of nested try/catch frames
+const MAX_CATCH_DEPTH: usize = 16;
+
+/// Thread-local catch frame stack
+thread_local! {
+    static CATCH_STACK: RefCell<Vec<*mut JmpBuf>> = RefCell::new(Vec::with_capacity(MAX_CATCH_DEPTH));
+}
+
+/// Throw an exception. Longjmp to the nearest catch frame.
 #[no_mangle]
 pub unsafe extern "C" fn __jl_throw() -> ! {
-    eprintln!("FATAL: uncaught exception in compiled Julia code");
+    CATCH_STACK.with(|stack| {
+        let catch_stack = stack.borrow_mut();
+        if let Some(&jmp_buf_ptr) = catch_stack.last() {
+            drop(catch_stack); // release the borrow before longjmp
+            longjmp(jmp_buf_ptr, 1);
+        } else {
+            eprintln!("FATAL: uncaught exception in compiled Julia code");
+            process::abort();
+        }
+    });
+    // This should never be reached due to longjmp or abort
     process::abort();
 }
 
-/// Enter a catch frame. Phase 1: stub (returns 0 = no catch active).
-/// Phase 3: setjmp-based implementation.
+/// Enter a catch frame. Returns 1 if this is the initial entry, 0 if returning from longjmp.
 #[no_mangle]
-pub unsafe extern "C" fn __jl_try_enter(_catch_frame: *mut u8) -> i32 {
-    0 // Phase 1: never catch
+pub unsafe extern "C" fn __jl_try_enter(catch_frame: *mut u8) -> i32 {
+    if catch_frame.is_null() {
+        return 0;
+    }
+
+    let jmp_buf_ptr = catch_frame as *mut JmpBuf;
+    let result = setjmp(jmp_buf_ptr);
+
+    if result == 0 {
+        // Initial entry - register this catch frame
+        CATCH_STACK.with(|stack| {
+            let mut catch_stack = stack.borrow_mut();
+            if catch_stack.len() < MAX_CATCH_DEPTH {
+                catch_stack.push(jmp_buf_ptr);
+            } else {
+                eprintln!("FATAL: catch frame stack overflow (depth > {})", MAX_CATCH_DEPTH);
+                process::abort();
+            }
+        });
+    }
+
+    // result == 0 means initial entry, result == 1 means returning from longjmp
+    if result == 0 { 1 } else { 0 }
 }
 
-/// Exit a catch frame. Phase 1: no-op.
+/// Exit a catch frame. Remove from the catch stack.
 #[no_mangle]
-pub unsafe extern "C" fn __jl_try_exit(_catch_frame: *mut u8) {
-    // Phase 3: pop catch frame stack
+pub unsafe extern "C" fn __jl_try_exit(catch_frame: *mut u8) {
+    if catch_frame.is_null() {
+        return;
+    }
+
+    let jmp_buf_ptr = catch_frame as *mut JmpBuf;
+    CATCH_STACK.with(|stack| {
+        let mut catch_stack = stack.borrow_mut();
+        if let Some(&top) = catch_stack.last() {
+            if top == jmp_buf_ptr {
+                catch_stack.pop();
+            } else {
+                eprintln!("WARNING: catch frame stack mismatch on exit");
+            }
+        }
+    });
 }

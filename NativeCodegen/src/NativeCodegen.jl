@@ -71,7 +71,7 @@ function compile_native(f, argtypes::Type{<:Tuple}; name::String="entry")
 end
 
 # Helper: check if return type needs Ptr{Cvoid} (pointer to GC object)
-_is_ptr_type(T) = T isa DataType && Base.ismutabletype(T) && !(T <: Ptr)
+_is_ptr_type(T) = (T isa DataType && (Base.ismutabletype(T) || T === String) && !(T <: Ptr))
 
 # For pointer returns, use Ptr{Cvoid} instead of from_wire
 function _ret(ptr, raw, rettype)

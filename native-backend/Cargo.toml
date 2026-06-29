@@ -16,6 +16,7 @@ cranelift-module = "0.133"
 target-lexicon = "0.12"
 libc = "0.2"
 libloading = "0.8"
+bdwgc-alloc = "0.6.13"  # Boehm GC for garbage collection
 
 [build-dependencies]
 # none yet (bdwgc will be added in Phase 2)

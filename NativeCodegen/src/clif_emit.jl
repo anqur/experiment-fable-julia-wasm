@@ -109,7 +109,8 @@ function clif_intrinsic(ctx, result, name::Symbol, a, b)
     ca = _to_ssa(ctx, a; isfloat=false)
     cb = isempty(b) ? b : _to_ssa(ctx, b; isfloat=isfloat)
     if iscmp
-        t = freshv(ctx); emit(ctx, "$t = $op $ca, $cb"); emit(ctx, "$result = uextend.i32 $t")
+        # For comparisons, don't extend - keep as i8 for brif compatibility
+        emit(ctx, "$result = $op $ca, $cb")
     else
         emit(ctx, "$result = $op $ca, $cb")
     end
@@ -144,7 +145,7 @@ function emit_clif_function(ir::CC.IRCode, argtypes::Vector{Type}, rettype, entr
         end
     end
 
-    emit(ctx, "block0($(join(["$(n): $(t)" for (n,t) in bb_params[1]], ", "))):")
+    emit_raw(ctx, "block0($(join(["$(n): $(t)" for (n,t) in bb_params[1]], ", "))):\n")
     ctx.indent += 1
 
     # Terminators
@@ -153,18 +154,23 @@ function emit_clif_function(ir::CC.IRCode, argtypes::Vector{Type}, rettype, entr
         lst = ir.stmts[last(block.stmts)][:stmt]
         lst isa Core.GotoNode && (bb_term[bi] = (:goto, lst.label))
         lst isa Core.GotoIfNot && (bb_term[bi] = (:gotoifnot, lst.cond, lst.dest))
-        lst isa Core.ReturnNode && (bb_term[bi] = (:return, lst.val))
+        if lst isa Core.ReturnNode
+            # Handle both ReturnNode with and without value
+            val = try lst.val; catch; nothing end
+            bb_term[bi] = (:return, val)
+        end
     end
 
     ssa_v = Dict{Int,String}()
 
     for (bi, block) in enumerate(cfg.blocks)
         if bi > 1
-            ctx.indent -= 1; emit(ctx, "")
+            # Emit block headers with zero indentation (same as block0)
+            ctx.indent -= 1
             if isempty(bb_params[bi])
-                emit(ctx, "$(bb_name[bi]):")
+                emit_raw(ctx, "$(bb_name[bi]):\n")
             else
-                emit(ctx, "$(bb_name[bi])($(join(["$(n): $(t)" for (n,t) in bb_params[bi]], ", "))):")
+                emit_raw(ctx, "$(bb_name[bi])($(join(["$(n): $(t)" for (n,t) in bb_params[bi]], ", "))):\n")
             end
             ctx.indent += 1
         end
@@ -191,12 +197,46 @@ function emit_clif_function(ir::CC.IRCode, argtypes::Vector{Type}, rettype, entr
                     fn = field isa Core.QuoteNode ? field.value : field
                     so = _resolve(ssa_v, arg_v, obj)
                     T = (obj isa Core.Argument) && (idx=obj.n-2+1; idx>=1 && idx<=length(argtypes)) ? argtypes[idx] : Any
+
+                    # Handle String field access (simplified String model)
+                    if T === String
+                        # In our simplified String model, String pointers point to data directly
+                        # The GC header is at -HEADER_SIZE offset
+                        # String layout: {data*, length, flags} where:
+                        # - "data" is actually the pointer we have (so, points to character data)
+                        # - "length" is stored in GC header at -4 offset (so - 4)
+                        # - "flags" would be at -8 offset (so - 8)
+
+                        if fn == :data || fn == :payload
+                            # For String, "data" field is the pointer we already have
+                            emit(ctx, "$v = $so")
+                        elseif fn == :length
+                            # Load length from GC header (offset -4 from data pointer)
+                            v_offset = freshv(ctx); emit(ctx, "$v_offset = iconst.i64 -4")
+                            v_header_ptr = freshv(ctx); emit(ctx, "$v_header_ptr = iadd $so, $v_offset")
+                            v_len32 = freshv(ctx); emit(ctx, "$v_len32 = load.i32 $v_header_ptr")
+                            emit(ctx, "$v = uextend.i64 $v_len32")
+                        elseif fn == :flags || fn == :flag
+                            # Load flags from GC header (offset -8 from data pointer)
+                            v_offset = freshv(ctx); emit(ctx, "$v_offset = iconst.i64 -8")
+                            v_header_ptr = freshv(ctx); emit(ctx, "$v_header_ptr = iadd $so, $v_offset")
+                            v_flags32 = freshv(ctx); emit(ctx, "$v_flags32 = load.i32 $v_header_ptr")
+                            emit(ctx, "$v = uextend.i64 $v_flags32")
+                        else
+                            emit(ctx, "; getfield unknown String field $fn")
+                            emit(ctx, "$v = 0")
+                        end
+                        continue
+                    end
+
+                    # Original mutable struct handling
                     if T isa DataType && Base.ismutabletype(T)
                         off = fieldoffset(T, fieldindex(T, fn))
                         vi = freshv(ctx); emit(ctx, "$vi = iconst.i64 $off")
                         vo = freshv(ctx); emit(ctx, "$vo = iadd $so, $vi")
                         emit(ctx, "$v = load.i64 $vo"); continue
                     end
+
                     emit(ctx, "; getfield unknown"); emit(ctx, "$v = 0"); continue
                 end
                 # setfield!
@@ -205,28 +245,355 @@ function emit_clif_function(ir::CC.IRCode, argtypes::Vector{Type}, rettype, entr
                     fn = field isa Core.QuoteNode ? field.value : field
                     so, sv = _resolve(ssa_v, arg_v, obj), _resolve(ssa_v, arg_v, fv)
                     T = (obj isa Core.Argument) && (idx=obj.n-2+1; idx>=1 && idx<=length(argtypes)) ? argtypes[idx] : Any
+
+                    # Handle String field setting (simplified String model)
+                    if T === String
+                        if fn == :length
+                            # Store length to GC header (offset -4 from data pointer)
+                            v_offset = freshv(ctx); emit(ctx, "$v_offset = iconst.i64 -4")
+                            v_header_ptr = freshv(ctx); emit(ctx, "$v_header_ptr = iadd $so, $v_offset")
+                            emit(ctx, "store.i32 $sv, $v_header_ptr")
+                            ssa_v[si] = so  # setfield! returns the modified object
+                        elseif fn == :flags || fn == :flag
+                            # Store flags to GC header (offset -8 from data pointer)
+                            v_offset = freshv(ctx); emit(ctx, "$v_offset = iconst.i64 -8")
+                            v_header_ptr = freshv(ctx); emit(ctx, "$v_header_ptr = iadd $so, $v_offset")
+                            emit(ctx, "store.i32 $sv, $v_header_ptr")
+                            ssa_v[si] = so  # setfield! returns the modified object
+                        else
+                            emit(ctx, "; setfield! unknown String field $fn")
+                            emit(ctx, "$v = 0")
+                        end
+                        continue
+                    end
+
+                    # Original mutable struct handling
                     if T isa DataType && Base.ismutabletype(T)
                         off = fieldoffset(T, fieldindex(T, fn))
                         vi = freshv(ctx); emit(ctx, "$vi = iconst.i64 $off")
                         vo = freshv(ctx); emit(ctx, "$vo = iadd $so, $vi")
                         emit(ctx, "store.i64 $sv, $vo"); ssa_v[si] = so; continue
                     end
+
                     emit(ctx, "; setfield! unknown"); emit(ctx, "$v = 0"); continue
                 end
                 # Intrinsic
                 name = nothing
                 f isa Core.IntrinsicFunction && (name = f.name)
                 f isa Core.GlobalRef && haskey(CLIF_INTR_OPS, f.name) && (name = f.name)
+                f isa Core.GlobalRef && name === nothing && (name = f.name)  # Handle other GlobalRef functions
+                # Handle built-in functions like sizeof that appear literally
+                name === nothing && f === sizeof && (name = :sizeof)
+                name === nothing && f === Core.sizeof && (name = :sizeof)
+
+                # Handle string-specific intrinsics
+                if name == :sizeof || name == :sizeof_unaligned
+                    # Check if this is sizeof(String)
+                    obj = e.args[2]
+                    obj_type = nothing
+                    if obj isa Core.Argument
+                        obj_idx = obj.n - 2 + 1
+                        if obj_idx >= 1 && obj_idx <= length(argtypes)
+                            obj_type = argtypes[obj_idx]
+                        end
+                    end
+
+                    if obj_type === String
+                        # For String, sizeof should load the length from Julia's String layout
+                        # Based on debug output, the length is at offset 0 for the string data pointer
+                        so = _resolve(ssa_v, arg_v, obj)
+
+                        # Load the length directly from offset 0 (as seen in debug)
+                        # Load the length (i32) and extend to i64
+                        v_len32 = freshv(ctx)
+                        emit(ctx, "$v_len32 = load.i32 $so")
+                        emit(ctx, "$v = uextend.i64 $v_len32")
+
+                        ssa_v[si] = v
+                        continue
+                    end
+                end
+
                 name === nothing && (emit(ctx, "; call $f"); emit(ctx, "$v = 0"); continue)
                 a1 = length(e.args)>=2 ? e.args[2] : nothing
                 a2 = length(e.args)>=3 ? e.args[3] : nothing
+
+                # String operations (Phase 2)
+                if name == :getindex && length(e.args) >= 3
+                    obj, idx = e.args[2], e.args[3]
+                    so = _resolve(ssa_v, arg_v, obj)
+                    si = _resolve(ssa_v, arg_v, idx)
+
+                    # Check if this is a string index operation
+                    obj_type = nothing
+                    if obj isa Core.Argument
+                        obj_idx = obj.n - 2 + 1
+                        if obj_idx >= 1 && obj_idx <= length(argtypes)
+                            obj_type = argtypes[obj_idx]
+                        end
+                    end
+
+                    if obj_type === String
+                        # Call __jl_string_get
+                        emit(ctx, "call __jl_string_get, $v, $so, $si")
+                        ssa_v[si] = v
+                        continue
+                    end
+
+                    # Array operations (Phase 3)
+                    if obj_type isa DataType && obj_type.name === Array
+                        # For arrays, emit load operation
+                        # TODO: handle different element types
+                        emit(ctx, "$v = load.i64 $so")  # simplified for now
+                        ssa_v[si] = v
+                        continue
+                    end
+                end
+
+                if name == :setindex! && length(e.args) >= 4
+                    obj, idx, val = e.args[2], e.args[3], e.args[4]
+                    so = _resolve(ssa_v, arg_v, obj)
+                    si = _resolve(ssa_v, arg_v, idx)
+                    sv = _resolve(ssa_v, arg_v, val)
+
+                    # Check if this is a string setindex operation
+                    obj_type = nothing
+                    if obj isa Core.Argument
+                        obj_idx = obj.n - 2 + 1
+                        if obj_idx >= 1 && obj_idx <= length(argtypes)
+                            obj_type = argtypes[obj_idx]
+                        end
+                    end
+
+                    if obj_type === String
+                        # Call __jl_string_set
+                        emit(ctx, "call __jl_string_set, $so, $si, $sv")
+                        ssa_v[si] = so
+                        continue
+                    end
+
+                    # Array operations (Phase 3)
+                    if obj_type isa DataType && obj_type.name === Array
+                        # For arrays, emit store operation
+                        emit(ctx, "store.i64 $sv, $so")  # simplified for now
+                        ssa_v[si] = so
+                        continue
+                    end
+                end
+
                 clif_intrinsic(ctx, v, name,
                     a1 !== nothing ? _resolve(ssa_v, arg_v, a1) : "",
                     a2 !== nothing ? _resolve(ssa_v, arg_v, a2) : "")
                 continue
             end
             e isa Expr && e.head == :invoke &&
-                (v=freshv(ctx); ssa_v[si]=v; emit(ctx, "; invoke"); emit(ctx, "$v = 0"))
+                let invoke_func = e.args[1]
+                    # Define v for invoke expressions (similar to call expressions)
+                    v = freshv(ctx); ssa_v[si] = v
+
+                    # The invoke expression structure is:
+                    # args[1]: CodeInstance (function being called)
+                    # args[2]: GlobalRef (function reference like Base.ncodeunits)
+                    # args[3:]: actual arguments to the function
+                    invoke_args_all = e.args[2:end]
+                    # Skip the first element (the GlobalRef function reference)
+                    invoke_args = length(invoke_args_all) >= 2 ? invoke_args_all[2:end] : []
+
+                    # Check if this is length(String) - we can handle this specially
+                    is_length_string = false
+                    # Check if this calls length function
+                    # invoke_func can be CodeInstance or GlobalRef
+                    func_name = nothing
+                    if invoke_func isa Core.GlobalRef
+                        func_name = invoke_func.name
+                    elseif invoke_func isa Core.CodeInstance
+                        # Try to extract the function name from CodeInstance
+                        mi_def = invoke_func.def.def
+                        if mi_def isa Function
+                            func_name = mi_def.name
+                        elseif mi_def isa Method
+                            func_name = mi_def.name
+                        end
+                    end
+
+                    # Check if this is string equality (_str_egal)
+                    is_string_eq = false
+                    if func_name == :_str_egal || (func_name !== nothing && string(func_name) == "==")
+                        # Check if we have String arguments
+                        if length(invoke_args) >= 2
+                            arg1 = invoke_args[1]
+                            arg2 = invoke_args[2]
+                            if arg1 isa Core.Argument && arg2 isa Core.Argument
+                                arg1_idx = arg1.n - 2 + 1
+                                arg2_idx = arg2.n - 2 + 1
+                                if arg1_idx >= 1 && arg1_idx <= length(argtypes) && arg2_idx >= 1 && arg2_idx <= length(argtypes)
+                                    arg1_type = argtypes[arg1_idx]
+                                    arg2_type = argtypes[arg2_idx]
+                                    is_string_eq = (arg1_type === String && arg2_type === String)
+                                end
+                            end
+                        end
+                    end
+
+                    # Check if this is ncodeunits (used by isempty)
+                    is_ncodeunits = false
+                    if func_name == :ncodeunits
+                        if length(invoke_args) >= 1
+                            arg = invoke_args[1]
+                            if arg isa Core.Argument
+                                arg_idx = arg.n - 2 + 1
+                                if arg_idx >= 1 && arg_idx <= length(argtypes)
+                                    arg_type = argtypes[arg_idx]
+                                    is_ncodeunits = (arg_type === String)
+                                end
+                            end
+                        end
+                    end
+
+                    # Check if this is codeunit (get character from string)
+                    is_codeunit = false
+                    if func_name == :codeunit
+                        if length(invoke_args) >= 2
+                            str_arg = invoke_args[1]
+                            idx_arg = invoke_args[2]
+                            if str_arg isa Core.Argument && idx_arg isa Core.Argument
+                                str_idx = str_arg.n - 2 + 1
+                                if str_idx >= 1 && str_idx <= length(argtypes)
+                                    str_type = argtypes[str_idx]
+                                    is_codeunit = (str_type === String)
+                                end
+                            end
+                        end
+                    end
+
+                    # Check if this is lastindex
+                    is_lastindex = false
+                    if func_name == :lastindex
+                        if length(invoke_args) >= 1
+                            arg = invoke_args[1]
+                            if arg isa Core.Argument
+                                arg_idx = arg.n - 2 + 1
+                                if arg_idx >= 1 && arg_idx <= length(argtypes)
+                                    arg_type = argtypes[arg_idx]
+                                    is_lastindex = (arg_type === String)
+                                end
+                            end
+                        end
+                    end
+
+                    if func_name == :length
+                        # Check if we have a String argument
+                        if length(invoke_args) >= 1
+                            arg = invoke_args[1]  # Second arg is the actual data
+                            if arg isa Core.Argument
+                                arg_idx = arg.n - 2 + 1
+                                if arg_idx >= 1 && arg_idx <= length(argtypes)
+                                    arg_type = argtypes[arg_idx]
+                                    is_length_string = (arg_type === String)
+                                end
+                            end
+                        end
+                    end
+
+                    if is_string_eq
+                        # String equality: compare both length and content
+                        obj1 = invoke_args[1]
+                        obj2 = invoke_args[2]
+                        s1 = _resolve(ssa_v, arg_v, obj1)
+                        s2 = _resolve(ssa_v, arg_v, obj2)
+
+                        # Simple implementation: compare pointers first
+                        v_cmp_ptr = freshv(ctx)
+                        emit(ctx, "$v_cmp_ptr = icmp eq $s1, $s2")
+
+                        # Load lengths for both strings
+                        v_len1_offset = freshv(ctx); emit(ctx, "$v_len1_offset = iconst.i64 -4")
+                        v_len1_ptr = freshv(ctx); emit(ctx, "$v_len1_ptr = iadd $s1, $v_len1_offset")
+                        v_len1 = freshv(ctx); emit(ctx, "$v_len1 = load.i32 $v_len1_ptr")
+
+                        v_len2_offset = freshv(ctx); emit(ctx, "$v_len2_offset = iconst.i64 -4")
+                        v_len2_ptr = freshv(ctx); emit(ctx, "$v_len2_ptr = iadd $s2, $v_len2_offset")
+                        v_len2 = freshv(ctx); emit(ctx, "$v_len2 = load.i32 $v_len2_ptr")
+
+                        # Compare lengths
+                        v_cmp_len = freshv(ctx)
+                        emit(ctx, "$v_cmp_len = icmp eq $v_len1, $v_len2")
+
+                        # Combine comparisons: both must be equal for strings to be equal
+                        v_and = freshv(ctx)
+                        emit(ctx, "$v_and = band $v_cmp_ptr, $v_cmp_len")
+
+                        # For simplicity, we'll just use pointer comparison for now
+                        # A proper implementation would also compare content byte-by-byte
+                        emit(ctx, "$v = $v_and")
+
+                        ssa_v[si] = v
+                        continue
+                    end
+
+                    if is_ncodeunits
+                        # ncodeunits(String) = sizeof(String) for our purposes
+                        obj = invoke_args[1]
+                        so = _resolve(ssa_v, arg_v, obj)
+
+                        # Use the same logic as sizeof(String)
+                        v_len32 = freshv(ctx)
+                        emit(ctx, "$v_len32 = load.i32 $so")
+                        emit(ctx, "$v = uextend.i64 $v_len32")
+
+                        ssa_v[si] = v
+                        continue
+                    end
+
+                    if is_codeunit
+                        # codeunit(String, index) - simplified approach for now
+                        # TODO: Implement proper string data access or runtime call
+                        # For now, return a placeholder to keep compilation working
+                        str_obj = invoke_args[1]
+                        idx_obj = invoke_args[2]
+                        # s = _resolve(ssa_v, arg_v, str_obj)
+                        idx = _resolve(ssa_v, arg_v, idx_obj)
+
+                        # Placeholder: return index value cast to i32 (just for testing)
+                        emit(ctx, "$v = ireduce.i32 $idx")
+                        ssa_v[si] = v
+                        continue
+
+                        ssa_v[si] = v
+                        continue
+                    end
+
+                    if is_lastindex
+                        # lastindex(String) = ncodeunits(String) (same as length for strings)
+                        obj = invoke_args[1]
+                        so = _resolve(ssa_v, arg_v, obj)
+
+                        # Load length - this is the correct lastindex for strings
+                        v_len32 = freshv(ctx)
+                        emit(ctx, "$v_len32 = load.i32 $so")
+                        emit(ctx, "$v = uextend.i64 $v_len32")
+
+                        ssa_v[si] = v
+                        continue
+                    end
+
+                    if is_length_string
+                        # length(String) = sizeof(String) for our purposes
+                        obj = invoke_args[1]
+                        so = _resolve(ssa_v, arg_v, obj)
+
+                        # Use the same logic as sizeof(String)
+                        v_len32 = freshv(ctx)
+                        emit(ctx, "$v_len32 = load.i32 $so")
+                        emit(ctx, "$v = uextend.i64 $v_len32")
+
+                        ssa_v[si] = v
+                        continue
+                    end
+
+                    # Default: unsupported invoke
+                    (v=freshv(ctx); ssa_v[si]=v; emit(ctx, "; invoke - unsupported $(invoke_func)"); emit(ctx, "$v = 0"))
+                end
         end
         # Emit terminator with phi args
         if haskey(bb_term, bi)
@@ -305,7 +672,27 @@ function emit_clif_function(ir::CC.IRCode, argtypes::Vector{Type}, rettype, entr
                 end
                 emit(ctx, "brif $s_cond, $(bb_name[t1])$(phi_args(t1)), $(bb_name[t2])$(phi_args(t2))")
             elseif term[1] == :return
-                emit(ctx, "return $(_resolve(ssa_v, arg_v, term[2]))")
+                ret_val = _resolve(ssa_v, arg_v, term[2])
+                # Check if we need to extend boolean i8 to i32 for function return
+                if rettype === Bool
+                    # For Bool returns, ensure the value is extended to i32
+                    # Check if this is a raw SSA value that might be i8
+                    if term[2] isa Core.SSAValue
+                        si = term[2].id
+                        if haskey(ssa_v, si)
+                            # Create an extended version
+                            v_ext = freshv(ctx)
+                            emit(ctx, "$v_ext = uextend.i32 $ret_val")
+                            emit(ctx, "return $v_ext")
+                        else
+                            emit(ctx, "return $ret_val")
+                        end
+                    else
+                        emit(ctx, "return $ret_val")
+                    end
+                else
+                    emit(ctx, "return $ret_val")
+                end
             end
         elseif bi < nbb
             # Unterminated block: fall through with phi args

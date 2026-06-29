@@ -10,3 +10,10 @@
 pub mod compile;
 pub mod runtime;
 pub mod types;
+
+/// Initialize the Boehm GC. Call this once at program startup.
+/// The GC allocator initializes automatically on first use.
+#[no_mangle]
+pub unsafe extern "C" fn native_gc_init() {
+    // GC allocator is self-initializing
+}

@@ -1,0 +1,8 @@
+[package]
+name = "native-demo-string"
+version = "0.1.0"
+edition = "2021"
+description = "Demo: Native Julia string operations called from Rust"
+
+[dependencies]
+libloading = "0.8"
