@@ -3,13 +3,11 @@
     "allow": [
       "Bash(cargo build *)",
       "Bash(cargo doc *)",
-      "Bash(export JULIA_DEPOT_PATH=/workspace/.julia:$HOME/.julia)",
-      "Bash(julia --project=. --color=yes -e 'using NativeCodegen; include\\(\"NativeCodegen/test/runtests.jl\"\\)')",
-      "Bash(julia --project=. --color=yes -e 'using Pkg; Pkg.instantiate\\(\\)')",
-      "Bash(julia +nightly *)"
+      "Bash(julia +nightly *)",
+      "Bash(/home/anqur/.julia/juliaup/julia-nightly/libexec/julia/lld *)",
+      "WebSearch"
     ]
   },
   "enabledPlugins": {
-    "frontend-design@claude-plugins-official": true
   }
 }

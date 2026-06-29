@@ -5,7 +5,7 @@ edition = "2021"
 description = "Native codegen backend: Cranelift JIT + Rust runtime for compiled Julia packages"
 
 [lib]
-crate-type = ["cdylib"]  # C ABI shared library for Julia ccall
+crate-type = ["staticlib"]  # Static library for runtime (.a file)
 
 [dependencies]
 cranelift-codegen = "0.133"

@@ -27,47 +27,70 @@ include("reprs.jl")
 include("interp.jl")
 include("intrinsics.jl")
 include("clif_types.jl")
-include("clif_emit.jl")
+include("builder_emit.jl")
 
 # === Bridge: native compilation + FFI ===
 
 struct NativeCompilation
-    handle::Ptr{Cvoid}
-    lib::Ptr{Cvoid}
-    entry_ptr::Ptr{Cvoid}
-    name::String
+    so_path::String      # Path to generated .so file
+    func_name::String    # Function name (e.g., "entry")
 end
 
-const _NATIVE_LIB_PATH = Ref{String}()
+const _BUILDER_LIB_PATH = Ref{String}()
+const _RUNTIME_LIB_PATH = Ref{String}()
 
-function _init_native_lib()
-    isassigned(_NATIVE_LIB_PATH) && return _NATIVE_LIB_PATH[]
-    lib_name = Sys.isapple() ? "libnative_backend.dylib" :
-               Sys.islinux()  ? "libnative_backend.so" :
+function _init_builder_lib()
+    isassigned(_BUILDER_LIB_PATH) && return _BUILDER_LIB_PATH[]
+    lib_name = Sys.isapple() ? "libnative_builder.dylib" :
+               Sys.islinux()  ? "libnative_builder.so" :
                error("unsupported platform")
-    dir = joinpath(dirname(@__DIR__), "..", "native-backend", "target")
-    for profile in ("debug", "release")
+    dir = joinpath(dirname(@__DIR__), "..", "native-builder", "target")
+    for profile in ("release", "debug")
         path = joinpath(dir, profile, lib_name)
         isfile(path) || continue
-        _NATIVE_LIB_PATH[] = path
+        _BUILDER_LIB_PATH[] = path
         return path
     end
-    error("native-backend library not found. Build with: cd native-backend && cargo build")
+    error("native-builder library not found. Build with: cd native-builder && cargo build --release")
+end
+
+function _init_runtime_lib()
+    isassigned(_RUNTIME_LIB_PATH) && return _RUNTIME_LIB_PATH[]
+    lib_name = Sys.isapple() ? "libnative_backend.a" :
+               Sys.islinux()  ? "libnative_backend.a" :
+               error("unsupported platform")
+    dir = joinpath(dirname(@__DIR__), "..", "native-backend", "target")
+    for profile in ("release", "debug")
+        path = joinpath(dir, profile, lib_name)
+        isfile(path) || continue
+        _RUNTIME_LIB_PATH[] = path
+        return path
+    end
+    error("native-backend runtime library not found. Build with: cd native-backend && cargo build --release")
 end
 
 function compile_native(f, argtypes::Type{<:Tuple}; name::String="entry")
     interp = WasmInterp()
-    clif_text = compile_to_clif(interp, f, argtypes; entry_name=name)
-    lib_path = _init_native_lib()
-    lib = Libdl.dlopen(lib_path)
-    compile_ptr = Libdl.dlsym(lib, :native_compile)
-    lookup_ptr = Libdl.dlsym(lib, :native_lookup)
-    handle = ccall(compile_ptr, Ptr{Cvoid}, (Ptr{UInt8}, Csize_t),
-                   pointer(clif_text), sizeof(clif_text))
-    handle == C_NULL && (Libdl.dlclose(lib); error("native_compile failed"))
-    entry_ptr = ccall(lookup_ptr, Ptr{Cvoid}, (Ptr{Cvoid}, Cstring), handle, "%$name")
-    entry_ptr == C_NULL && error("entry '$name' not found (tried %$name)")
-    return NativeCompilation(handle, lib, entry_ptr, name)
+
+    # Generate object file via eDSL builder
+    temp_obj = tempname() * ".o"
+    emit_function_via_builder(interp, f, argtypes; name=name, output_path=temp_obj)
+
+    # Link object file with runtime library to create final .so
+    builder_lib = _init_builder_lib()
+    runtime_lib = _init_runtime_lib()
+    lib = Libdl.dlopen(builder_lib)
+    link_ptr = Libdl.dlsym(lib, :link_object_to_so)
+
+    so_path = tempname() * ".so"
+    status = ccall(link_ptr, Cint, (Ptr{UInt8}, Ptr{UInt8}, Ptr{UInt8}),
+                  temp_obj, runtime_lib, so_path)
+    status != 0 && error("Linking failed")
+
+    # Clean up temporary object file
+    rm(temp_obj)
+
+    return NativeCompilation(so_path, name)
 end
 
 # Helper: check if return type needs Ptr{Cvoid} (pointer to GC object)
@@ -218,6 +241,63 @@ function native_callable(comp::NativeCompilation, rettype, argtypes::Type...)
     end
 end
 
-export compile_native, native_callable, NativeCompilation, CompileError
+# Direct .so loading from Julia (no Rust needed for testing)
+function native_callable_from_so(comp::NativeCompilation, rettype::Type, argtypes::Type...)
+    lib = Libdl.dlopen(comp.so_path)
+    func_ptr = Libdl.dlsym(lib, comp.func_name)
+
+    nargs = length(argtypes)
+    if nargs == 0
+        return () -> _call0(func_ptr, rettype)
+    elseif nargs == 1
+        T1 = argtypes[1]
+        rt = rettype
+        if _is_ptr_type(T1)
+            return (a1 -> _ret(func_ptr, ccall(func_ptr, Int64, (Ptr{Cvoid},), pointer_from_objref(a1)), rettype))
+        end
+        if _is_f64(T1) || _is_f32(T1)
+            return (a1 -> _call1_f64(func_ptr, rt, Float64(a1)))
+        end
+        if _is_i64(T1)
+            return (a1 -> _call1_i64(func_ptr, rt, T1, a1))
+        else
+            return (a1 -> _call1_i32(func_ptr, rt, T1, a1))
+        end
+    elseif nargs == 2
+        T1, T2 = argtypes[1], argtypes[2]
+        rt = rettype
+        if _is_ptr_type(T1) && !_is_ptr_type(T2)
+            if _is_i64(T2)
+                return ((a1,a2) -> _call2_pi(func_ptr, rt, T2, pointer_from_objref(a1), a2, Int64))
+            else
+                return ((a1,a2) -> _call2_pi(func_ptr, rt, T2, pointer_from_objref(a1), a2, Int32))
+            end
+        end
+        # Float + Float
+        if _is_f64(T1) && _is_f64(T2)
+            return ((a1,a2) -> _call2_ff(func_ptr, rt, a1, a2))
+        end
+        # Float + Int
+        if _is_f64(T1) && _is_i64(T2)
+            return ((a1,a2) -> _call2_fi(func_ptr, rt, T2, a1, a2, Int64))
+        end
+        i641, i642 = _is_i64(T1), _is_i64(T2)
+        VT1 = i641 ? Int64 : Int32
+        VT2 = i642 ? Int64 : Int32
+        if i641 && i642
+            return ((a1,a2) -> _call2_ii(func_ptr, rt, T1, T2, a1, a2, VT1, VT2))
+        elseif i641 && !i642
+            return ((a1,a2) -> _call2_ij(func_ptr, rt, T1, T2, a1, a2, VT1, VT2))
+        elseif !i641 && i642
+            return ((a1,a2) -> _call2_ji(func_ptr, rt, T1, T2, a1, a2, VT1, VT2))
+        else
+            return ((a1,a2) -> _call2_jj(func_ptr, rt, T1, T2, a1, a2, VT1, VT2))
+        end
+    else
+        error("unsupported arg count $nargs for eDSL approach")
+    end
+end
+
+export compile_native, native_callable, native_callable_from_so, NativeCompilation, CompileError
 
 end # module NativeCodegen

@@ -1,0 +1,22 @@
+[package]
+name = "native-builder"
+version = "0.1.0"
+edition = "2021"
+description = "Native object file builder: Cranelift eDSL API + lld linker for Julia compilation"
+
+[lib]
+crate-type = ["cdylib"]  # C ABI shared library for Julia FFI
+
+[dependencies]
+cranelift-codegen = "0.133"
+cranelift-frontend = "0.133"
+cranelift-object = "0.133"   # NEW: object file generation
+cranelift-module = "0.133"   # Need for Module trait and Linkage
+cranelift-native = "0.133"   # For native ISA
+target-lexicon = "0.13"      # Updated to match cranelift 0.133
+libc = "0.2"
+bdwgc-alloc = "0.6.13"       # Keep existing GC
+
+[profile.release]
+lto = true
+opt-level = 3
