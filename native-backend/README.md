@@ -1,20 +1,26 @@
 # native-backend — Cranelift JIT + Rust Runtime
 
 Compiles Cranelift CLIF text to native x86-64 machine code via the Cranelift
-JIT engine (v0.133). Provides a C ABI shared library (`libnative_backend.so` /
-`.dylib`) that the Julia `NativeCodegen` package calls via `ccall`.
+JIT engine (v0.133). Produces a static library (`libnative_backend.a`) with
+Boehm GC, exception handling (setjmp/longjmp), and string/array runtime support.
+
+**Note:** The `crate-type` is currently `"staticlib"`. If the Julia
+`NativeCodegen` package needs to `dlopen` this at runtime, change
+`Cargo.toml` back to `crate-type = ["cdylib"]` and update
+`_native_backend_lib()` in `NativeCodegen/src/NativeCodegen.jl`.
 
 ## Prerequisites
 
 - **Rust** 1.80+ (tested with 1.94.0)
 - macOS (ARM64) or Linux (x86-64). Cranelift auto-detects the host ISA.
+- **Boehm GC** — pulled automatically via `bdwgc-alloc` crate.
 
 ## Build
 
 ```bash
 cd native-backend
-cargo build          # debug build → target/debug/libnative_backend.dylib
-cargo build --release  # release build → target/release/libnative_backend.dylib
+cargo build          # debug build → target/debug/libnative_backend.a
+cargo build --release  # release build → target/release/libnative_backend.a
 ```
 
 ## C ABI exports
@@ -97,7 +103,7 @@ libloading = "0.8"             # Dynamic library loading (for demo)
 - **`brif` condition type** — the condition must be `i8` (boolean). Integer
   comparisons produce `i8` directly; extended values need `ireduce.i8`.
   Better approach: trace through `not_int` and use raw `icmp` with swapped targets.
-- **Boehm GC** not yet integrated — using plain `malloc` for now.
+- **Boehm GC** integrated via `bdwgc-alloc` crate (global allocator).
 - **ARM64** — not tested. Cranelift supports it but the JIT memory management
   may need adjustments for ARM64's different page protection model.
 

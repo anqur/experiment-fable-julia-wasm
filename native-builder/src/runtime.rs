@@ -4,6 +4,7 @@ use cranelift_object::ObjectBuilder;
 
 /// Register runtime symbols that compiled code can call
 /// TODO: Implement proper symbol importing when Cranelift API is clearer
+#[allow(dead_code)]
 pub fn register_runtime_symbols(_obj_builder: &mut ObjectBuilder) {
     // For now, this is a placeholder
     // The actual runtime symbols will be linked from the static library

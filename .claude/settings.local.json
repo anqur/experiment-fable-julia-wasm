@@ -5,9 +5,12 @@
       "Bash(cargo doc *)",
       "Bash(julia +nightly *)",
       "Bash(/home/anqur/.julia/juliaup/julia-nightly/libexec/julia/lld *)",
-      "WebSearch"
+      "WebSearch",
+      "Bash(cargo check *)",
+      "WebFetch(domain:docs.rs)",
+      "Bash(grep -n \"function emit_globalref\\\\|end$\" /Users/anqur/workspace/experiment-fable-julia-wasm/NativeCodegen/src/builder_emit.jl)",
+      "Bash(grep -n '^end$' /Users/anqur/workspace/experiment-fable-julia-wasm/NativeCodegen/src/builder_emit.jl)"
     ]
   },
-  "enabledPlugins": {
-  }
+  "enabledPlugins": {}
 }

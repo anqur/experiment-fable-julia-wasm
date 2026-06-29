@@ -1,204 +1,185 @@
 // Native Builder: eDSL API for Julia → Native compilation
-// Phase 1: Basic FFI interface stubs
+// Direct Cranelift IR emission via transient FunctionBuilder
 
 use std::ffi::CStr;
 use std::os::raw::{c_char, c_int};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-// Import our modules (to be implemented)
 mod builder;
 mod linker;
 mod runtime;
 
-// Re-exports for FFI
-use builder::{BuilderContext, EdslFunctionBuilder as FunctionBuilder};
-use linker::link_object_to_so as linker_link_object_to_so;
+use builder::{BuilderContext, FunctionCtx, map_icmp_cond, map_fcmp_cond};
 
-// Global builder registry (thread-safe)
-static BUILDERS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+// Thread-safe builder registry
+struct Bp(*mut BuilderContext); unsafe impl Send for Bp {}
+static BUILDERS: Mutex<Vec<Bp>> = Mutex::new(Vec::new());
 
-/// Create a new builder context for compilation
-/// Returns: pointer to BuilderContext or NULL on failure
 #[no_mangle]
 pub extern "C" fn create_builder() -> *mut BuilderContext {
     let ctx = Box::new(BuilderContext::new());
-    let ctx_ptr = Box::into_raw(ctx);
-    let ctx_addr = ctx_ptr as usize;
-
-    // Register in global list for cleanup
-    if let Ok(mut builders) = BUILDERS.lock() {
-        builders.push(ctx_addr);
-    }
-
-    ctx_ptr
+    let ptr = Box::into_raw(ctx);
+    if let Ok(mut b) = BUILDERS.lock() { b.push(Bp(ptr)); }
+    ptr
 }
 
-/// Free a builder context and release all resources
 #[no_mangle]
 pub extern "C" fn free_builder(ctx: *mut BuilderContext) {
-    if ctx.is_null() {
-        return;
-    }
-
-    let ctx_addr = ctx as usize;
-
-    // Remove from global registry
-    if let Ok(mut builders) = BUILDERS.lock() {
-        builders.retain(|&b| b != ctx_addr);
-    }
-
-    // Convert back to Box and drop
-    unsafe {
-        let _ = Box::from_raw(ctx);
-    }
+    if ctx.is_null() { return; }
+    if let Ok(mut b) = BUILDERS.lock() { b.retain(|bp| bp.0 != ctx); }
+    unsafe { let _ = Box::from_raw(ctx); }
 }
 
-/// Add a function to the builder
-/// - ctx: Builder context pointer
-/// - name: Function name (null-terminated UTF-8 string)
-/// - ret_type: Return type as Cranelift type enum
-/// - param_types: Array of parameter types
-/// - num_params: Number of parameters
-/// Returns: pointer to FunctionBuilder or NULL on failure
 #[no_mangle]
 pub extern "C" fn builder_add_function(
-    ctx: *mut BuilderContext,
-    name: *const c_char,
-    ret_type: u32,
-    param_types: *const u32,
-    num_params: usize,
-) -> *mut FunctionBuilder {
-    if ctx.is_null() || name.is_null() || param_types.is_null() {
+    ctx: *mut BuilderContext, name: *const c_char,
+    ret_type: u32, param_types: *const u32, num_params: usize,
+) -> *mut FunctionCtx {
+    if ctx.is_null() || name.is_null() || (num_params > 0 && param_types.is_null()) {
         return std::ptr::null_mut();
     }
-
     unsafe {
-        let builder = &mut *ctx;
-        let name_str = CStr::from_ptr(name).to_str().unwrap_or("unnamed");
+        let nm = CStr::from_ptr(name).to_str().unwrap_or("fn");
         let types = std::slice::from_raw_parts(param_types, num_params);
-
-        match builder.add_function(name_str, ret_type, types) {
-            Some(func_builder) => Box::into_raw(Box::new(func_builder)),
-            None => std::ptr::null_mut(),
-        }
+        (*ctx).add_function(nm, ret_type, types).unwrap_or(std::ptr::null_mut())
     }
 }
 
-/// Add a block to a function
-/// - fb: FunctionBuilder pointer
-/// - name: Block name (null-terminated UTF-8 string)
-/// Returns: pointer to BlockBuilder or NULL on failure
 #[no_mangle]
-pub extern "C" fn function_add_block(
-    fb: *mut FunctionBuilder,
-    name: *const c_char,
-) -> *mut builder::BlockBuilder {
-    if fb.is_null() || name.is_null() {
-        return std::ptr::null_mut();
-    }
-
-    unsafe {
-        let func_builder = &mut *fb;
-        let name_str = CStr::from_ptr(name).to_str().unwrap_or("block0");
-
-        Box::into_raw(Box::new(func_builder.add_block(name_str)))
-    }
-}
-
-/// Add integer addition instruction
-#[no_mangle]
-pub extern "C" fn block_add_iadd(
-    bb: *mut builder::BlockBuilder,
-    result: *mut u32,
-    lhs: u32,
-    rhs: u32,
-) {
-    if bb.is_null() || result.is_null() {
-        return;
-    }
-
-    unsafe {
-        let block = &mut *bb;
-        let result_id = block.add_iadd(lhs, rhs);
-        *result = result_id;
-    }
-}
-
-/// Add return instruction
-#[no_mangle]
-pub extern "C" fn block_add_return(bb: *mut builder::BlockBuilder, value: u32) {
-    if bb.is_null() {
-        return;
-    }
-
-    unsafe {
-        let block = &mut *bb;
-        block.add_return(value);
-    }
-}
-
-/// Finalize builder and generate object file
-/// - ctx: Builder context pointer
-/// - obj_path: Output object file path (null-terminated UTF-8 string)
-/// Returns: 0 on success, negative on failure
-#[no_mangle]
-pub extern "C" fn builder_finalize(ctx: *mut BuilderContext, obj_path: *const c_char) -> c_int {
-    if ctx.is_null() || obj_path.is_null() {
+pub extern "C" fn builder_declare_import(
+    ctx: *mut BuilderContext, name: *const c_char,
+    ret_type: u32, param_types: *const u32, num_params: usize,
+) -> c_int {
+    if ctx.is_null() || name.is_null() || (num_params > 0 && param_types.is_null()) {
         return -1;
     }
-
     unsafe {
-        let builder = &mut *ctx;
-        let path_str = CStr::from_ptr(obj_path).to_str().unwrap_or("output.o");
-        let path = PathBuf::from(path_str);
-
-        match builder.finalize(&path) {
+        let nm = CStr::from_ptr(name).to_str().unwrap_or("import");
+        let types = std::slice::from_raw_parts(param_types, num_params);
+        match (*ctx).declare_import(nm, ret_type, types) {
             Ok(()) => 0,
-            Err(_) => -1,
+            Err(e) => { eprintln!("[native-builder] {}", e); -1 }
         }
     }
 }
 
-/// Link user code object with runtime static library to create final .so
-/// - user_object: User-compiled object file path (null-terminated UTF-8 string)
-/// - runtime_lib: Runtime static library path (.a file) (null-terminated UTF-8 string)
-/// - so_path: Final output shared library path (null-terminated UTF-8 string)
-/// Returns: 0 on success, negative on failure
 #[no_mangle]
-pub extern "C" fn link_object_to_so(user_object: *const c_char, runtime_lib: *const c_char, so_path: *const c_char) -> c_int {
-    if user_object.is_null() || runtime_lib.is_null() || so_path.is_null() {
-        return -1;
+pub extern "C" fn block_add_call(
+    fctx: *mut FunctionCtx, ctx: *mut BuilderContext,
+    name: *const c_char, args: *const u32, nargs: usize,
+) -> u32 {
+    if fctx.is_null() || ctx.is_null() || name.is_null() || (nargs > 0 && args.is_null()) {
+        return 0;
     }
-
     unsafe {
-        let obj_str = CStr::from_ptr(user_object).to_str().unwrap_or("user.o");
-        let lib_str = CStr::from_ptr(runtime_lib).to_str().unwrap_or("libnative_runtime.a");
-        let so_str = CStr::from_ptr(so_path).to_str().unwrap_or("output.so");
+        let nm = CStr::from_ptr(name).to_str().unwrap_or("");
+        let arg_slice = std::slice::from_raw_parts(args, nargs);
+        (*fctx).emit_call_import((*ctx).module_mut(), &(*ctx).imports, nm, arg_slice)
+    }
+}
 
-        let user_path = PathBuf::from(obj_str);
-        let lib_path = PathBuf::from(lib_str);
-        let so_path = PathBuf::from(so_str);
+#[no_mangle]
+pub extern "C" fn function_add_block(fctx: *mut FunctionCtx, name: *const c_char) {
+    if fctx.is_null() || name.is_null() { return; }
+    unsafe { (*fctx).create_block_named(CStr::from_ptr(name).to_str().unwrap_or("b")) }
+}
 
-        match linker_link_object_to_so(&user_path, &lib_path, &so_path) {
+#[no_mangle]
+pub extern "C" fn function_switch_block(fctx: *mut FunctionCtx, name: *const c_char) -> c_int {
+    if fctx.is_null() || name.is_null() { return 0; }
+    unsafe { if (*fctx).switch_to_named(CStr::from_ptr(name).to_str().unwrap_or("")) { 1 } else { 0 } }
+}
+
+#[no_mangle]
+pub extern "C" fn function_seal_block(fctx: *mut FunctionCtx, name: *const c_char) {
+    if fctx.is_null() || name.is_null() { return; }
+    unsafe { (*fctx).seal_block(CStr::from_ptr(name).to_str().unwrap_or("")) }
+}
+
+macro_rules! ffi_binop {
+    ($name:ident, $method:ident) => {
+        #[no_mangle] pub extern "C" fn $name(fctx: *mut FunctionCtx, l: u32, r: u32) -> u32 {
+            if fctx.is_null() { return 0; } unsafe { (*fctx).$method(l, r) }
+        }
+    };
+}
+macro_rules! ffi_unop {
+    ($name:ident, $method:ident) => {
+        #[no_mangle] pub extern "C" fn $name(fctx: *mut FunctionCtx, v: u32) -> u32 {
+            if fctx.is_null() { return 0; } unsafe { (*fctx).$method(v) }
+        }
+    };
+}
+macro_rules! ffi_convert {
+    ($name:ident, $method:ident) => {
+        #[no_mangle] pub extern "C" fn $name(fctx: *mut FunctionCtx, v: u32, tt: u32) -> u32 {
+            if fctx.is_null() { return 0; } unsafe { (*fctx).$method(v, tt) }
+        }
+    };
+}
+
+ffi_binop!(block_add_iadd, emit_iadd);
+ffi_binop!(block_add_isub, emit_isub);
+ffi_binop!(block_add_imul, emit_imul);
+ffi_binop!(block_add_sdiv, emit_sdiv);
+ffi_binop!(block_add_udiv, emit_udiv);
+ffi_binop!(block_add_srem, emit_srem);
+ffi_binop!(block_add_urem, emit_urem);
+ffi_binop!(block_add_band, emit_band);
+ffi_binop!(block_add_bor, emit_bor);
+ffi_binop!(block_add_bxor, emit_bxor);
+ffi_binop!(block_add_ishl, emit_ishl);
+ffi_binop!(block_add_ushr, emit_ushr);
+ffi_binop!(block_add_sshr, emit_sshr);
+ffi_binop!(block_add_fadd, emit_fadd);
+ffi_binop!(block_add_fsub, emit_fsub);
+ffi_binop!(block_add_fmul, emit_fmul);
+ffi_binop!(block_add_fdiv, emit_fdiv);
+ffi_unop!(block_add_fneg, emit_fneg);
+ffi_convert!(block_add_uextend, emit_uextend);
+ffi_convert!(block_add_sextend, emit_sextend);
+ffi_convert!(block_add_ireduce, emit_ireduce);
+
+#[no_mangle] pub extern "C" fn block_add_iconst(fctx: *mut FunctionCtx, val: i64, ty: u32) -> u32 { if fctx.is_null() { 0 } else { unsafe { (*fctx).emit_iconst(val, ty) } } }
+#[no_mangle] pub extern "C" fn block_add_f64const(fctx: *mut FunctionCtx, val: f64) -> u32 { if fctx.is_null() { 0 } else { unsafe { (*fctx).emit_f64const(val) } } }
+#[no_mangle] pub extern "C" fn block_add_f32const(fctx: *mut FunctionCtx, val: f32) -> u32 { if fctx.is_null() { 0 } else { unsafe { (*fctx).emit_f32const(val) } } }
+
+#[no_mangle] pub extern "C" fn block_add_icmp(fctx: *mut FunctionCtx, c: u32, l: u32, r: u32) -> u32 { if fctx.is_null() { 0 } else { let cc = map_icmp_cond(c); unsafe { (*fctx).emit_icmp(cc, l, r) } } }
+#[no_mangle] pub extern "C" fn block_add_fcmp(fctx: *mut FunctionCtx, c: u32, l: u32, r: u32) -> u32 { if fctx.is_null() { 0 } else { let cc = map_fcmp_cond(c); unsafe { (*fctx).emit_fcmp(cc, l, r) } } }
+
+#[no_mangle] pub extern "C" fn block_add_load(fctx: *mut FunctionCtx, ptr: u32, off: i32, ty: u32) -> u32 { if fctx.is_null() { 0 } else { unsafe { (*fctx).emit_load(ptr, off, ty) } } }
+#[no_mangle] pub extern "C" fn block_add_store(fctx: *mut FunctionCtx, ptr: u32, off: i32, val: u32, ty: u32) { if !fctx.is_null() { unsafe { (*fctx).emit_store(ptr, off, val, ty) } } }
+
+#[no_mangle] pub extern "C" fn block_add_return(fctx: *mut FunctionCtx, val: u32) { if !fctx.is_null() { unsafe { (*fctx).emit_return(val) } } }
+#[no_mangle] pub extern "C" fn block_add_return_void(fctx: *mut FunctionCtx) { if !fctx.is_null() { unsafe { (*fctx).emit_return_void() } } }
+#[no_mangle] pub extern "C" fn block_add_trap(fctx: *mut FunctionCtx) { if !fctx.is_null() { unsafe { (*fctx).emit_trap() } } }
+
+#[no_mangle] pub extern "C" fn block_add_jump(fctx: *mut FunctionCtx, tgt: *const c_char) { if !fctx.is_null() && !tgt.is_null() { unsafe { (*fctx).emit_jump(CStr::from_ptr(tgt).to_str().unwrap_or("")) } } }
+#[no_mangle] pub extern "C" fn block_add_jump_args(fctx: *mut FunctionCtx, tgt: *const c_char, args: *const u32, nargs: usize) { if !fctx.is_null() && !tgt.is_null() { unsafe { (*fctx).emit_jump_with_args(CStr::from_ptr(tgt).to_str().unwrap_or(""), std::slice::from_raw_parts(args, nargs)) } } }
+#[no_mangle] pub extern "C" fn block_add_brif(fctx: *mut FunctionCtx, cond: u32, t: *const c_char, e: *const c_char) { if !fctx.is_null() && !t.is_null() && !e.is_null() { unsafe { (*fctx).emit_brif(cond, CStr::from_ptr(t).to_str().unwrap_or(""), CStr::from_ptr(e).to_str().unwrap_or("")) } } }
+#[no_mangle] pub extern "C" fn block_add_brif_args(fctx: *mut FunctionCtx, cond: u32, t: *const c_char, t_args: *const u32, tn: usize, e: *const c_char, e_args: *const u32, en: usize) { if !fctx.is_null() && !t.is_null() && !e.is_null() { unsafe { (*fctx).emit_brif_with_args(cond, CStr::from_ptr(t).to_str().unwrap_or(""), std::slice::from_raw_parts(t_args, tn), CStr::from_ptr(e).to_str().unwrap_or(""), std::slice::from_raw_parts(e_args, en)) } } }
+#[no_mangle] pub extern "C" fn function_add_block_param(fctx: *mut FunctionCtx, block_name: *const c_char, ty: u32) -> u32 { if fctx.is_null() || block_name.is_null() { 0 } else { unsafe { (*fctx).append_block_param(CStr::from_ptr(block_name).to_str().unwrap_or(""), ty) } } }
+
+#[no_mangle] pub extern "C" fn builder_finalize(ctx: *mut BuilderContext, path: *const c_char) -> c_int {
+    if ctx.is_null() || path.is_null() { return -1; }
+    unsafe {
+        match (*ctx).finalize(&PathBuf::from(CStr::from_ptr(path).to_str().unwrap_or("o"))) {
             Ok(()) => 0,
-            Err(_) => -1,
+            Err(e) => { eprintln!("[native-builder] finalize error: {}", e); -1 },
         }
     }
 }
 
-// Clean up all remaining builders (for shutdown)
-#[no_mangle]
-pub extern "C" fn cleanup_all_builders() {
-    if let Ok(mut builders) = BUILDERS.lock() {
-        for &ctx_addr in builders.iter() {
-            if ctx_addr != 0 {
-                unsafe {
-                    let ctx_ptr = ctx_addr as *mut BuilderContext;
-                    let _ = Box::from_raw(ctx_ptr);
-                }
-            }
+#[no_mangle] pub extern "C" fn link_object_to_so(uo: *const c_char, rl: *const c_char, so: *const c_char) -> c_int {
+    if uo.is_null() || rl.is_null() || so.is_null() { -1 } else { unsafe {
+        match linker::link_object_to_so(&PathBuf::from(CStr::from_ptr(uo).to_str().unwrap_or("")), &PathBuf::from(CStr::from_ptr(rl).to_str().unwrap_or("")), &PathBuf::from(CStr::from_ptr(so).to_str().unwrap_or(""))) {
+            Ok(()) => 0,
+            Err(e) => { eprintln!("[native-builder] link error: {}", e); -1 },
         }
-        builders.clear();
-    }
+    }}
+}
+
+#[no_mangle] pub extern "C" fn cleanup_all_builders() {
+    if let Ok(mut b) = BUILDERS.lock() { for bp in b.drain(..) { if !bp.0.is_null() { unsafe { let _ = Box::from_raw(bp.0); } } } }
 }

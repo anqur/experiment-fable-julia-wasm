@@ -1,59 +1,94 @@
-# eDSL builder emitter for Julia IRCode → Rust builder API calls
-# Replaces CLIF text generation with direct Rust FFI calls
+# eDSL builder emitter for Julia IRCode → Cranelift IR via Rust FFI
+# Direct Cranelift emission: each FFI call immediately emits one instruction.
 
 using WasmCodegen: ScalarRepr, scalar_repr, isghost, wasm_valtype
 
-# Type enums matching Rust side (must match builder.rs)
-const TYPE_I32 = 0
-const TYPE_I64 = 1
-const TYPE_F32 = 2
-const TYPE_F64 = 3
-const TYPE_PTR = 4
+# === Type enums (must match Rust builder.rs) ===
+const TYPE_I32 = UInt32(0)
+const TYPE_I64 = UInt32(1)
+const TYPE_F32 = UInt32(2)
+const TYPE_F64 = UInt32(3)
+const TYPE_PTR = UInt32(4)
+const TYPE_I8  = UInt32(5)
 
-# Julia type to Cranelift type enum mapping (kept from original)
+# === IntCC condition enums ===
+const ICMP_EQ  = UInt32(0)
+const ICMP_NE  = UInt32(1)
+const ICMP_SLT = UInt32(2)
+const ICMP_SGE = UInt32(3)
+const ICMP_SGT = UInt32(4)
+const ICMP_SLE = UInt32(5)
+const ICMP_ULT = UInt32(6)
+const ICMP_UGE = UInt32(7)
+const ICMP_UGT = UInt32(8)
+const ICMP_ULE = UInt32(9)
+
+# === FloatCC condition enums ===
+const FCMP_EQ = UInt32(0)
+const FCMP_NE = UInt32(1)
+const FCMP_LT = UInt32(2)
+const FCMP_LE = UInt32(3)
+const FCMP_GT = UInt32(4)
+const FCMP_GE = UInt32(5)
+
+# Julia type → Cranelift type enum
 const CRANELIFT_TYPE_MAP = IdDict{Any,UInt32}(
     Int64=>TYPE_I64, UInt64=>TYPE_I64, Int32=>TYPE_I32, UInt32=>TYPE_I32,
     Int16=>TYPE_I32, UInt16=>TYPE_I32, Int8=>TYPE_I32, UInt8=>TYPE_I32,
     Bool=>TYPE_I32, Char=>TYPE_I32, Float64=>TYPE_F64, Float32=>TYPE_F32,
 )
 
-# Get Cranelift type enum for Julia type
 function cranelift_type(T)
     t = get(CRANELIFT_TYPE_MAP, T, nothing)
     t !== nothing && return t
     T isa DataType && Base.ismutabletype(T) && !(T <: Ptr) && return TYPE_PTR
-    r = scalar_repr(T); r === nothing && throw(CompileError("unsupported type $T"))
-    return r.vt == WasmTools.I64 ? TYPE_I64 : r.vt == WasmTools.I32 ? TYPE_I32 :
-           r.vt == WasmTools.F64 ? TYPE_F64 : TYPE_F32
+    r = scalar_repr(T)
+    if r !== nothing
+        return r.vt == WasmTools.I64 ? TYPE_I64 : r.vt == WasmTools.I32 ? TYPE_I32 :
+               r.vt == WasmTools.F64 ? TYPE_F64 : TYPE_F32
+    end
+    # Bitstypes: map to Cranelift type by sizeof
+    if T isa DataType && isbitstype(T)
+        sz = sizeof(T)
+        sz == 8 && return TYPE_I64
+        sz == 4 && return TYPE_I32
+        sz == 1 && return TYPE_I8
+    end
+    throw(CompileError("unsupported type $T"))
 end
 
-# Type mapping for return type compatibility (kept from original)
 function is_ptr_type(T)
     T isa DataType && (Base.ismutabletype(T) || T === String) && !(T <: Ptr)
 end
 
-# Context for building functions via Rust API
+# === BuilderCtx: tracks a Rust FunctionCtx for one Julia function ===
+
 mutable struct BuilderCtx
-    builder_handle::Ptr{Cvoid}  # Pointer to Rust BuilderContext
-    lib_handle::Ptr{Cvoid}       # Pointer to loaded native-builder library
-    func_handle::Ptr{Cvoid}       # Pointer to current FunctionBuilder
-    current_block::Ptr{Cvoid}    # Pointer to current BlockBuilder
-    next_value_id::UInt32         # Counter for SSA values
+    builder_handle::Ptr{Cvoid}  # *mut BuilderContext (Rust side)
+    fctx_handle::Ptr{Cvoid}     # *mut FunctionCtx (Rust side, current function)
+    lib_handle::Ptr{Cvoid}      # dlopen handle for native-builder library
     # SSA value tracking
-    ssa_values::Dict{Core.SSAValue, UInt32}  # SSA → value ID mapping
-    arg_values::Dict{Core.Argument, UInt32}  # Arguments → value ID mapping
-    const_values::Dict{Any, UInt32}           # Constants → value ID mapping
-    ir::Any  # Store reference to IRCode for constant resolution
+    ssa_values::Dict{Core.SSAValue, UInt32}
+    arg_values::Dict{Core.Argument, UInt32}
+    const_values::Dict{Any, UInt32}
+    blocks::Dict{Int, String}   # Julia block index → Cranelift block name
+    ir::Any
+    # Composed offset tracking: SSA value → (base_ptr_id, composed_offset, struct_type)
+    # Used when getfield loads a non-loadable type like MemoryRef — subsequent
+    # getfield on that SSA value recomposes the full offset from the base pointer.
+    ref_tracking::Dict{Core.SSAValue, Tuple{UInt32, Int, DataType}}
 end
 
 function BuilderCtx(lib_path::String)
     lib = Libdl.dlopen(lib_path)
     create_ptr = Libdl.dlsym(lib, :create_builder)
     ctx = ccall(create_ptr, Ptr{Cvoid}, ())
-    BuilderCtx(ctx, lib, C_NULL, C_NULL, 0,
-                Dict{Core.SSAValue, UInt32}(),
-                Dict{Core.Argument, UInt32}(),
-                Dict{Any, UInt32}(), nothing)
+    BuilderCtx(ctx, C_NULL, lib,
+               Dict{Core.SSAValue, UInt32}(),
+               Dict{Core.Argument, UInt32}(),
+               Dict{Any, UInt32}(),
+               Dict{Int, String}(), nothing,
+               Dict{Core.SSAValue, Tuple{UInt32, Int, DataType}}())
 end
 
 function free_builder(bc::BuilderCtx)
@@ -66,8 +101,10 @@ function free_builder(bc::BuilderCtx)
     end
 end
 
-# Main entry point: compile Julia function to object file via eDSL
-function emit_function_via_builder(interp::WasmInterp, f, argtypes::Type{<:Tuple}; name::String="entry", output_path::String=tempname()*".o")
+# === Main entry point ===
+
+function emit_function_via_builder(interp::WasmInterp, f, argtypes::Type{<:Tuple};
+                                   name::String="entry", output_path::String=tempname()*".o")
     tt = Base.signature_type(f, argtypes)
     matches = Base._methods_by_ftype(tt, -1, interp.world)
     matches === nothing && error("no method found for $f")
@@ -76,42 +113,108 @@ function emit_function_via_builder(interp::WasmInterp, f, argtypes::Type{<:Tuple
     length(result) == 1 || throw(CompileError("expected unique match"))
     ir, rettype = result[1]
 
-    # Get native-builder library path
     builder_lib = get_native_builder_lib()
-
-    # Create builder context
     bc = BuilderCtx(builder_lib)
-    bc.ir = ir  # Store IR reference for constant resolution
+    bc.ir = ir
 
     try
-        # Initialize argument mappings for all possible arguments Julia might use
-        # Julia can reference arguments beyond the function parameters (like Argument(0), Argument(1), etc.)
-        for i in 1:10  # Support up to 10 arguments for now
-            arg = Core.Argument(i)
-            bc.arg_values[arg] = UInt32(i - 1)  # Rust uses 0-based indexing
-        end
+        # Declare runtime imports (GC allocation, string ops, etc.)
+        _declare_imports(bc)
 
-        # Add function
+        # Register argument values: Julia Argument(1)=function, Argument(2)=first param, ...
+        # Map to 0-based: Argument(2) → 0, Argument(3) → 1, etc.
+        nparams = length(mi.specTypes.parameters) - 1  # first is Tuple type
+        for i in 1:nparams
+            bc.arg_values[Core.Argument(i + 1)] = UInt32(i - 1)  # first param → 0
+        end
+        # Also map Argument(1) to a sentinel (shouldn't be referenced but just in case)
+        bc.arg_values[Core.Argument(1)] = UInt32(0)
+
+        # Add function to builder
         ret_type_enum = cranelift_type(rettype)
-        param_type_enums = UInt32[cranelift_type(t) for t in mi.specTypes.parameters[2:end]]  # Skip tuple type
+        param_type_enums = UInt32[cranelift_type(t) for t in mi.specTypes.parameters[2:end]]
 
         add_func_ptr = Libdl.dlsym(bc.lib_handle, :builder_add_function)
-        bc.func_handle = ccall(add_func_ptr, Ptr{Cvoid},
-                               (Ptr{Cvoid}, Ptr{UInt8}, UInt32, Ptr{UInt32}, Csize_t),
-                               bc.builder_handle, name, ret_type_enum, param_type_enums, length(param_type_enums))
+        bc.fctx_handle = ccall(add_func_ptr, Ptr{Cvoid},
+                                (Ptr{Cvoid}, Ptr{UInt8}, UInt32, Ptr{UInt32}, Csize_t),
+                                bc.builder_handle, name, ret_type_enum,
+                                param_type_enums, length(param_type_enums))
 
-        bc.func_handle == C_NULL && error("Failed to add function")
+        bc.fctx_handle == C_NULL && error("Failed to add function")
 
-        # Process IRCode blocks
+        # Pre-create Cranelift blocks for each Julia basic block
+        # Skip block 1 (→ block0) — already created by Rust FunctionCtx::new()
         cfg = ir.cfg
+        for bi in 1:length(cfg.blocks)
+            block_name = "block$(bi-1)"  # Julia 1-based → Rust 0-based
+            bc.blocks[bi] = block_name
+            if bi == 1
+                # Entry block already exists with function params
+                continue
+            end
+            add_block_ptr = Libdl.dlsym(bc.lib_handle, :function_add_block)
+            ccall(add_block_ptr, Cvoid, (Ptr{Cvoid}, Ptr{UInt8}),
+                  bc.fctx_handle, block_name)
+        end
+
+        # Pre-scan for phi nodes: create Cranelift block params
+        add_bp = Libdl.dlsym(bc.lib_handle, :function_add_block_param)
         for (bi, block) in enumerate(cfg.blocks)
-            emit_block(bc, block, bi, ir)
+            block_name = bc.blocks[bi]
+            for si in block.stmts
+                e = ir.stmts[si][:stmt]
+                if e isa Core.PhiNode
+                    phi_type_enum = cranelift_type(ir.stmts[si][:type])
+                    param_id = ccall(add_bp, UInt32, (Ptr{Cvoid}, Ptr{UInt8}, UInt32),
+                                    bc.fctx_handle, block_name, phi_type_enum)
+                    bc.ssa_values[Core.SSAValue(si)] = param_id
+                end
+            end
+        end
+
+        # Process each block
+        for (bi, block) in enumerate(cfg.blocks)
+            block_name = bc.blocks[bi]
+            # Switch to this block
+            switch_ptr = Libdl.dlsym(bc.lib_handle, :function_switch_block)
+            ccall(switch_ptr, Cint, (Ptr{Cvoid}, Ptr{UInt8}),
+                  bc.fctx_handle, block_name)
+
+            # Process statements
+            had_terminator = false
+            for si in block.stmts
+                e = ir.stmts[si][:stmt]
+                emit_instruction(bc, e, ir, si)
+                if e isa Core.GotoNode || e isa Core.GotoIfNot || e isa Core.ReturnNode
+                    had_terminator = true
+                end
+            end
+
+            # Implicit jump: block has successors but no explicit terminator
+            if !had_terminator && length(block.succs) == 1
+                target_bi = block.succs[1]
+                target_name = bc.blocks[target_bi]
+                phi_args = get_phi_args(ir, bc, bi, target_bi)
+                if isempty(phi_args)
+                    jump_ptr = Libdl.dlsym(bc.lib_handle, :block_add_jump)
+                    ccall(jump_ptr, Cvoid, (Ptr{Cvoid}, Ptr{UInt8}), bc.fctx_handle, target_name)
+                else
+                    jump_ptr = Libdl.dlsym(bc.lib_handle, :block_add_jump_args)
+                    ccall(jump_ptr, Cvoid, (Ptr{Cvoid}, Ptr{UInt8}, Ptr{UInt32}, Csize_t),
+                          bc.fctx_handle, target_name, phi_args, length(phi_args))
+                end
+            end
+
+            # Seal the block
+            seal_ptr = Libdl.dlsym(bc.lib_handle, :function_seal_block)
+            ccall(seal_ptr, Cvoid, (Ptr{Cvoid}, Ptr{UInt8}),
+                  bc.fctx_handle, block_name)
         end
 
         # Finalize to object file
         finalize_ptr = Libdl.dlsym(bc.lib_handle, :builder_finalize)
         status = ccall(finalize_ptr, Cint, (Ptr{Cvoid}, Ptr{UInt8}),
-                      bc.builder_handle, output_path)
+                       bc.builder_handle, output_path)
         status != 0 && error("Builder finalization failed")
 
         return output_path
@@ -120,149 +223,886 @@ function emit_function_via_builder(interp::WasmInterp, f, argtypes::Type{<:Tuple
     end
 end
 
-# Emit a single block
-function emit_block(bc::BuilderCtx, block, block_index::Int, ir)
-    # Add block
-    block_name = "block$(block_index-1)"
-    add_block_ptr = Libdl.dlsym(bc.lib_handle, :function_add_block)
-    bc.current_block = ccall(add_block_ptr, Ptr{Cvoid},
-                            (Ptr{Cvoid}, Ptr{UInt8}),
-                            bc.func_handle, block_name)
+# === Emit a single IR instruction ===
 
-    bc.current_block == C_NULL && error("Failed to add block")
-
-    # Process instructions
-    for (idx, si) in enumerate(block.stmts)
-        e = ir.stmts[si][:stmt]
-        emit_instruction(bc, e, ir, si)
-    end
-end
-
-# Emit individual instructions
 function emit_instruction(bc::BuilderCtx, e, ir, stmt_idx::Int)
     if e isa Expr && e.head == :call
-        # Handle function calls (intrinsics, etc.)
         f = e.args[1]
         args = e.args[2:end]
-
-        if f isa Core.GlobalRef && f.name == :add_int
-            # Example: integer addition
-            if length(args) >= 2
-                lhs = resolve_operand(bc, args[1], ir)
-                rhs = resolve_operand(bc, args[2], ir)
-
-                result_ptr = Ref{UInt32}()
-                add_iadd_ptr = Libdl.dlsym(bc.lib_handle, :block_add_iadd)
-                ccall(add_iadd_ptr, Cvoid,
-                      (Ptr{Cvoid}, Ptr{UInt32}, UInt32, UInt32),
-                      bc.current_block, result_ptr, lhs, rhs)
-
-                # Track the resulting SSA value
-                result_id = result_ptr[]
-                ssa_val = Core.SSAValue(stmt_idx)
-                bc.ssa_values[ssa_val] = result_id
-            end
-        elseif f isa Core.IntrinsicFunction
-            # Handle intrinsics (add_float, sub_int, etc.)
-            emit_intrinsic(bc, f, args, ir, stmt_idx)
+        if f isa Core.IntrinsicFunction
+            result_id = emit_intrinsic(bc, f, args, ir, stmt_idx)
+        elseif f isa Core.GlobalRef
+            result_id = emit_globalref(bc, f, args, ir, stmt_idx)
+        elseif f === Core.sizeof || f === sizeof
+            # sizeof(s::String) == ncodeunits(s) — emit load from ptr+0
+            result_id = emit_string_ncodeunits(bc, args, ir)
+        else
+            error("Unsupported call: $(f)")
+        end
+        if result_id !== nothing
+            bc.ssa_values[Core.SSAValue(stmt_idx)] = result_id
+        end
+    elseif e isa Expr && e.head == :invoke
+        mi = e.args[1]  # MethodInstance or CodeInstance
+        f = e.args[2]   # Function being called
+        invoke_args = e.args[3:end]  # Call arguments
+        result_id = emit_invoke(bc, mi, f, invoke_args, ir, stmt_idx)
+        if result_id !== nothing
+            bc.ssa_values[Core.SSAValue(stmt_idx)] = result_id
+        end
+    elseif e isa Expr && e.head == :new
+        # %new(T, fields...) — construct a new struct (mutable or immutable)
+        T = e.args[1]
+        field_args = e.args[2:end]
+        result_id = emit_new(bc, T, field_args, ir, stmt_idx)
+        if result_id !== nothing
+            bc.ssa_values[Core.SSAValue(stmt_idx)] = result_id
         end
     elseif e isa Core.ReturnNode
-        # Handle return statement
         val = try e.val; catch; nothing end
         if val !== nothing
             value_id = resolve_operand(bc, val, ir)
-            add_return_ptr = Libdl.dlsym(bc.lib_handle, :block_add_return)
-            ccall(add_return_ptr, Cvoid, (Ptr{Cvoid}, UInt32), bc.current_block, value_id)
+            return_ptr = Libdl.dlsym(bc.lib_handle, :block_add_return)
+            ccall(return_ptr, Cvoid, (Ptr{Cvoid}, UInt32), bc.fctx_handle, value_id)
+        else
+            # Check if this is unreachable (return type is Union{})
+            stmt_type = ir.stmts[stmt_idx][:type]
+            if stmt_type == Union{}
+                trap_ptr = Libdl.dlsym(bc.lib_handle, :block_add_trap)
+                ccall(trap_ptr, Cvoid, (Ptr{Cvoid},), bc.fctx_handle)
+            else
+                return_ptr = Libdl.dlsym(bc.lib_handle, :block_add_return_void)
+                ccall(return_ptr, Cvoid, (Ptr{Cvoid},), bc.fctx_handle)
+            end
         end
     elseif e isa Core.GotoNode
-        # Handle unconditional jumps
-        # TODO: Implement jump emission
-    elseif e isa Core.GotoIfNot
-        # Handle conditional branches
-        # TODO: Implement conditional jump emission
-    end
-end
-
-# Emit intrinsic operations
-function emit_intrinsic(bc::BuilderCtx, f, args, ir, stmt_idx)
-    if f === Core Intrinsics.add_int
-        # Integer addition
-        if length(args) >= 2
-            lhs = resolve_operand(bc, args[1], ir)
-            rhs = resolve_operand(bc, args[2], ir)
-
-            result_ptr = Ref{UInt32}()
-            add_iadd_ptr = Libdl.dlsym(bc.lib_handle, :block_add_iadd)
-            ccall(add_iadd_ptr, Cvoid,
-                  (Ptr{Cvoid}, Ptr{UInt32}, UInt32, UInt32),
-                  bc.current_block, result_ptr, lhs, rhs)
-
-            # Track the resulting SSA value
-            result_id = result_ptr[]
-            ssa_val = Core.SSAValue(stmt_idx + 1)
-            bc.ssa_values[ssa_val] = result_id
+        target_bi = e.label
+        target_name = bc.blocks[target_bi]
+        current_bi = find_block_for_stmt(ir, stmt_idx)
+        phi_args = current_bi !== nothing ? get_phi_args(ir, bc, current_bi, target_bi) : UInt32[]
+        if isempty(phi_args)
+            jump_ptr = Libdl.dlsym(bc.lib_handle, :block_add_jump)
+            ccall(jump_ptr, Cvoid, (Ptr{Cvoid}, Ptr{UInt8}), bc.fctx_handle, target_name)
+        else
+            jump_ptr = Libdl.dlsym(bc.lib_handle, :block_add_jump_args)
+            ccall(jump_ptr, Cvoid, (Ptr{Cvoid}, Ptr{UInt8}, Ptr{UInt32}, Csize_t),
+                  bc.fctx_handle, target_name, phi_args, length(phi_args))
         end
-    elseif f === Core Intrinsics.sub_int
-        # Integer subtraction - needs implementation
-        # TODO: Add sub_int handling when implemented in Rust side
-    elseif f === Core Intrinsics.mul_int
-        # Integer multiplication - needs implementation
-        # TODO: Add mul_int handling when implemented in Rust side
-    elseif f === Core Intrinsics.eq_int
-        # Integer equality comparison
-        # TODO: Implement comparison operations
+    elseif e isa Expr && e.head == :boundscheck
+        # boundscheck true/false — emit as Bool constant
+        flag = length(e.args) >= 1 ? e.args[1] : true
+        val = flag == true ? Int64(1) : Int64(0)
+        iconst_ptr = Libdl.dlsym(bc.lib_handle, :block_add_iconst)
+        result_id = ccall(iconst_ptr, UInt32, (Ptr{Cvoid}, Int64, UInt32),
+                          bc.fctx_handle, val, TYPE_I32)
+        bc.ssa_values[Core.SSAValue(stmt_idx)] = result_id
+    elseif e isa Core.PiNode
+        # PiNode is a type assertion — pass the value through unchanged.
+        # Track the input value under the PiNode's SSA slot.
+        input_val = e.val
+        if input_val !== nothing
+            input_id = resolve_operand(bc, input_val, ir)
+            bc.ssa_values[Core.SSAValue(stmt_idx)] = input_id
+        end
+    elseif e isa Core.GotoIfNot
+        cond_id = resolve_operand(bc, e.cond, ir)
+        dest_bi = e.dest
+        dest_name = bc.blocks[dest_bi]
+        current_bi = find_block_for_stmt(ir, stmt_idx)
+        fallthrough_bi = nothing
+        if current_bi !== nothing && length(ir.cfg.blocks[current_bi].succs) >= 2
+            succs = ir.cfg.blocks[current_bi].succs
+            fallthrough_bi = succs[2]
+        end
+        if fallthrough_bi === nothing
+            fallthrough_name = dest_name
+            fallthrough_phi = UInt32[]
+        else
+            fallthrough_name = bc.blocks[fallthrough_bi]
+            fallthrough_phi = get_phi_args(ir, bc, current_bi, fallthrough_bi)
+        end
+        dest_phi = current_bi !== nothing ? get_phi_args(ir, bc, current_bi, dest_bi) : UInt32[]
+        if isempty(fallthrough_phi) && isempty(dest_phi)
+            brif_ptr = Libdl.dlsym(bc.lib_handle, :block_add_brif)
+            ccall(brif_ptr, Cvoid, (Ptr{Cvoid}, UInt32, Ptr{UInt8}, Ptr{UInt8}),
+                  bc.fctx_handle, cond_id, fallthrough_name, dest_name)
+        else
+            brif_ptr = Libdl.dlsym(bc.lib_handle, :block_add_brif_args)
+            ccall(brif_ptr, Cvoid,
+                  (Ptr{Cvoid}, UInt32, Ptr{UInt8}, Ptr{UInt32}, Csize_t, Ptr{UInt8}, Ptr{UInt32}, Csize_t),
+                  bc.fctx_handle, cond_id,
+                  fallthrough_name, fallthrough_phi, length(fallthrough_phi),
+                  dest_name, dest_phi, length(dest_phi))
+        end
     else
-        # Unsupported intrinsic
-        error("Unsupported intrinsic: $f")
+        # Constants or other simple values — ignore
     end
 end
 
-# Resolve operand to SSA value ID
+# Get phi value IDs to pass from source_bi to target_bi
+function get_phi_args(ir, bc::BuilderCtx, source_bi::Int, target_bi::Int)
+    args = UInt32[]
+    target_block = ir.cfg.blocks[target_bi]
+    for si in target_block.stmts
+        e = ir.stmts[si][:stmt]
+        if e isa Core.PhiNode
+            for (j, edge_bi) in enumerate(e.edges)
+                if edge_bi == source_bi
+                    push!(args, resolve_operand(bc, e.values[j], ir))
+                    break
+                end
+            end
+        end
+    end
+    return args
+end
+
+# Find which basic block contains a given statement
+function find_block_for_stmt(ir, stmt_idx::Int)
+    for (bi, block) in enumerate(ir.cfg.blocks)
+        if stmt_idx in block.stmts
+            return bi
+        end
+    end
+    return nothing
+end
+
+# === Resolve operands to SSA value IDs ===
+
 function resolve_operand(bc::BuilderCtx, val, ir)
     if val isa Core.SSAValue
-        # Look up SSA value in our tracking dictionary
-        if haskey(bc.ssa_values, val)
-            return bc.ssa_values[val]
-        else
-            error("SSA value $val not found in tracking")
-        end
+        haskey(bc.ssa_values, val) && return bc.ssa_values[val]
+        error("SSA value $val not found in tracking")
     elseif val isa Core.Argument
-        # Look up argument value in our tracking dictionary
-        if haskey(bc.arg_values, val)
-            return bc.arg_values[val]
-        else
-            error("Argument $val not found in tracking")
-        end
+        haskey(bc.arg_values, val) && return bc.arg_values[val]
+        error("Argument $val not found in tracking")
     elseif isa(val, Number)
-        # For constants, check if we've already created one
-        if haskey(bc.const_values, val)
-            return bc.const_values[val]
-        else
-            # TODO: Add constant creation via FFI
-            # For now, use a simple hash-based ID
-            const_id = bc.next_value_id
-            bc.next_value_id += 1
-            bc.const_values[val] = const_id
-            return const_id
-        end
+        # Create constant each time (caching causes cross-block dominance issues)
+        return emit_constant(bc, val)
+    elseif val === nothing || isghost(typeof(val))
+        iconst_ptr = Libdl.dlsym(bc.lib_handle, :block_add_iconst)
+        return ccall(iconst_ptr, UInt32, (Ptr{Cvoid}, Int64, UInt32),
+                   bc.fctx_handle, Int64(0), TYPE_I32)
+    elseif val isa Bool
+        iconst_ptr = Libdl.dlsym(bc.lib_handle, :block_add_iconst)
+        return ccall(iconst_ptr, UInt32, (Ptr{Cvoid}, Int64, UInt32),
+                   bc.fctx_handle, Int64(val ? 1 : 0), TYPE_I32)
     else
         error("Unsupported operand type: $(typeof(val))")
     end
 end
 
-# Find native-builder library
-function get_native_builder_lib()
-    # Look in the native-builder target directory
-    base_dir = joinpath(dirname(@__DIR__), "..", "native-builder", "target")
+function emit_constant(bc::BuilderCtx, val)
+    if val isa Float64
+        f64_ptr = Libdl.dlsym(bc.lib_handle, :block_add_f64const)
+        return ccall(f64_ptr, UInt32, (Ptr{Cvoid}, Float64), bc.fctx_handle, Float64(val))
+    elseif val isa Float32
+        f32_ptr = Libdl.dlsym(bc.lib_handle, :block_add_f32const)
+        return ccall(f32_ptr, UInt32, (Ptr{Cvoid}, Float32), bc.fctx_handle, Float32(val))
+    elseif val isa Integer
+        iconst_ptr = Libdl.dlsym(bc.lib_handle, :block_add_iconst)
+        ty = val isa Int64 || val isa UInt64 ? TYPE_I64 : TYPE_I32
+        return ccall(iconst_ptr, UInt32, (Ptr{Cvoid}, Int64, UInt32),
+                     bc.fctx_handle, Int64(val), ty)
+    else
+        error("Unsupported constant type: $(typeof(val))")
+    end
+end
 
-    # Try both release and debug profiles
+# === Intrinsic emission ===
+
+function emit_intrinsic(bc::BuilderCtx, f::Core.IntrinsicFunction, args, ir, stmt_idx)
+    # Map intrinsic to Rust FFI call
+    fn_name = ccall(:jl_intrinsic_name, Ptr{UInt8}, (Any,), f)
+    fn_sym = unsafe_string(fn_name) |> Symbol
+
+    # Arithmetic
+    fn_sym == :add_int && return emit_binop(bc, :block_add_iadd, args, ir)
+    fn_sym == :sub_int && return emit_binop(bc, :block_add_isub, args, ir)
+    fn_sym == :mul_int && return emit_binop(bc, :block_add_imul, args, ir)
+    fn_sym == :sdiv_int && return emit_binop(bc, :block_add_sdiv, args, ir)
+    fn_sym == :udiv_int && return emit_binop(bc, :block_add_udiv, args, ir)
+    fn_sym == :srem_int && return emit_binop(bc, :block_add_srem, args, ir)
+    fn_sym == :urem_int && return emit_binop(bc, :block_add_urem, args, ir)
+
+    # Comparisons
+    fn_sym == :eq_int  && return emit_icmp(bc, ICMP_EQ, args, ir)
+    fn_sym == :ne_int  && return emit_icmp(bc, ICMP_NE, args, ir)
+    fn_sym == :slt_int && return emit_icmp(bc, ICMP_SLT, args, ir)
+    fn_sym == :sle_int && return emit_icmp(bc, ICMP_SLE, args, ir)
+    fn_sym == :ult_int && return emit_icmp(bc, ICMP_ULT, args, ir)
+    fn_sym == :ule_int && return emit_icmp(bc, ICMP_ULE, args, ir)
+
+    # Bitwise
+    fn_sym == :and_int && return emit_binop(bc, :block_add_band, args, ir)
+    fn_sym == :or_int  && return emit_binop(bc, :block_add_bor, args, ir)
+    fn_sym == :xor_int && return emit_binop(bc, :block_add_bxor, args, ir)
+    fn_sym == :shl_int && return emit_binop(bc, :block_add_ishl, args, ir)
+    fn_sym == :lshr_int && return emit_binop(bc, :block_add_ushr, args, ir)
+    fn_sym == :ashr_int && return emit_binop(bc, :block_add_sshr, args, ir)
+
+    # Conversions
+    fn_sym == :zext_int && return emit_convert(bc, :block_add_uextend, args, ir)
+    fn_sym == :sext_int && return emit_convert(bc, :block_add_sextend, args, ir)
+    fn_sym == :trunc_int && return emit_trunc(bc, args, ir)
+
+    # Float arithmetic
+    fn_sym == :add_float && return emit_binop(bc, :block_add_fadd, args, ir)
+    fn_sym == :sub_float && return emit_binop(bc, :block_add_fsub, args, ir)
+    fn_sym == :mul_float && return emit_binop(bc, :block_add_fmul, args, ir)
+    fn_sym == :div_float && return emit_binop(bc, :block_add_fdiv, args, ir)
+    fn_sym == :neg_float && return emit_unop(bc, :block_add_fneg, args, ir)
+
+    # Float comparisons
+    fn_sym == :eq_float && return emit_fcmp(bc, FCMP_EQ, args, ir)
+    fn_sym == :ne_float && return emit_fcmp(bc, FCMP_NE, args, ir)
+    fn_sym == :lt_float && return emit_fcmp(bc, FCMP_LT, args, ir)
+    fn_sym == :le_float && return emit_fcmp(bc, FCMP_LE, args, ir)
+
+    # neg_int = 0 - x
+    fn_sym == :neg_int && return emit_neg_int(bc, args, ir)
+    # not_int = x ⊻ -1
+    fn_sym == :not_int && return emit_not_int(bc, args, ir)
+
+    error("Unsupported intrinsic: $fn_sym")
+end
+
+# === FFI helpers ===
+
+function emit_binop(bc::BuilderCtx, ffi_sym::Symbol, args, ir)
+    length(args) < 2 && error("Binary op needs 2 args")
+    lhs = resolve_operand(bc, args[1], ir)
+    rhs = resolve_operand(bc, args[2], ir)
+    fn_ptr = Libdl.dlsym(bc.lib_handle, ffi_sym)
+    return ccall(fn_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
+                 bc.fctx_handle, lhs, rhs)
+end
+
+function emit_unop(bc::BuilderCtx, ffi_sym::Symbol, args, ir)
+    length(args) < 1 && error("Unary op needs 1 arg")
+    val = resolve_operand(bc, args[1], ir)
+    fn_ptr = Libdl.dlsym(bc.lib_handle, ffi_sym)
+    return ccall(fn_ptr, UInt32, (Ptr{Cvoid}, UInt32), bc.fctx_handle, val)
+end
+
+function emit_icmp(bc::BuilderCtx, cond::UInt32, args, ir)
+    length(args) < 2 && error("icmp needs 2 args")
+    lhs = resolve_operand(bc, args[1], ir)
+    rhs = resolve_operand(bc, args[2], ir)
+    fn_ptr = Libdl.dlsym(bc.lib_handle, :block_add_icmp)
+    result = ccall(fn_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32, UInt32),
+                   bc.fctx_handle, cond, lhs, rhs)
+    # Cranelift icmp produces i8; extend to i32 for compatibility with Julia Bool
+    ext_ptr = Libdl.dlsym(bc.lib_handle, :block_add_uextend)
+    return ccall(ext_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
+                 bc.fctx_handle, result, TYPE_I32)
+end
+
+function emit_fcmp(bc::BuilderCtx, cond::UInt32, args, ir)
+    length(args) < 2 && error("fcmp needs 2 args")
+    lhs = resolve_operand(bc, args[1], ir)
+    rhs = resolve_operand(bc, args[2], ir)
+    fn_ptr = Libdl.dlsym(bc.lib_handle, :block_add_fcmp)
+    result = ccall(fn_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32, UInt32),
+                   bc.fctx_handle, cond, lhs, rhs)
+    # fcmp produces i8; extend to i32
+    ext_ptr = Libdl.dlsym(bc.lib_handle, :block_add_uextend)
+    return ccall(ext_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
+                 bc.fctx_handle, result, TYPE_I32)
+end
+
+function emit_convert(bc::BuilderCtx, ffi_sym::Symbol, args, ir)
+    length(args) < 2 && error("Convert needs 2 args")
+    val = resolve_operand(bc, args[1], ir)
+    to_T = args[2]
+    to_type_enum = cranelift_type(to_T)
+    fn_ptr = Libdl.dlsym(bc.lib_handle, ffi_sym)
+    return ccall(fn_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
+                 bc.fctx_handle, val, to_type_enum)
+end
+
+function emit_trunc(bc::BuilderCtx, args, ir)
+    length(args) < 2 && error("trunc needs 2 args")
+    val = resolve_operand(bc, args[1], ir)
+    to_T = args[2]
+    to_type_enum = cranelift_type(to_T)
+    fn_ptr = Libdl.dlsym(bc.lib_handle, :block_add_ireduce)
+    return ccall(fn_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
+                 bc.fctx_handle, val, to_type_enum)
+end
+
+# neg_int: 0 - x
+function emit_neg_int(bc::BuilderCtx, args, ir)
+    val = resolve_operand(bc, args[1], ir)
+    # Create constant 0 of same "size" — use i64 for now
+    zero_id = emit_constant(bc, Int64(0))
+    fn_ptr = Libdl.dlsym(bc.lib_handle, :block_add_isub)
+    return ccall(fn_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
+                 bc.fctx_handle, zero_id, val)
+end
+
+# not_int: for Bool → logical NOT using icmp_eq(val, 0)
+function emit_not_int(bc::BuilderCtx, args, ir)
+    val = resolve_operand(bc, args[1], ir)
+    # Use i32 zero since not_int operates on Bool (i32 after extend)
+    zero = emit_constant(bc, Int32(0))
+    fn_ptr = Libdl.dlsym(bc.lib_handle, :block_add_icmp)
+    # Return raw i8 (no uextend) — brif handles the reduce itself
+    return ccall(fn_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32, UInt32),
+                 bc.fctx_handle, ICMP_EQ, val, zero)
+end
+
+# === Invoke handling (overlay method calls) ===
+
+function emit_invoke(bc::BuilderCtx, invoke_target, f, args, ir, stmt_idx)
+    # invoke_target can be CodeInstance or MethodInstance
+    if invoke_target isa Core.CodeInstance
+        method = invoke_target.def.def     # CodeInstance → MethodInstance → Method
+    elseif invoke_target isa Core.MethodInstance
+        method = invoke_target.def          # MethodInstance → Method
+    else
+        error("Unknown invoke target type: $(typeof(invoke_target))")
+    end
+    fn_name = method.name
+
+    # String operations — emit loads from known Julia String layout:
+    #   ptr = pointer_from_objref(s) points to:
+    #     offset 0: size_t length (Int64)
+    #     offset 8: char data[] (inline, null-terminated)
+    if fn_name == :ncodeunits && length(args) >= 1
+        return emit_string_ncodeunits(bc, args, ir)
+    elseif fn_name == :codeunit && length(args) >= 2
+        return emit_string_codeunit(bc, args, ir)
+    elseif fn_name == :sizeof && length(args) >= 1
+        # sizeof(s::String) == ncodeunits(s)
+        return emit_string_ncodeunits(bc, args, ir)
+    elseif fn_name == :isempty && length(args) >= 1
+        ncu_id = emit_string_ncodeunits(bc, args, ir)
+        zero_id = emit_constant(bc, Int64(0))
+        fn_ptr = Libdl.dlsym(bc.lib_handle, :block_add_icmp)
+        cmp_id = ccall(fn_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32, UInt32),
+                       bc.fctx_handle, ICMP_EQ, ncu_id, zero_id)
+        ext_ptr = Libdl.dlsym(bc.lib_handle, :block_add_uextend)
+        return ccall(ext_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
+                     bc.fctx_handle, cmp_id, TYPE_I32)
+    end
+
+    # Unknown invoke — emit sentinel (e.g. bounds-error path, unreachable)
+    iconst_ptr = Libdl.dlsym(bc.lib_handle, :block_add_iconst)
+    return ccall(iconst_ptr, UInt32, (Ptr{Cvoid}, Int64, UInt32),
+                 bc.fctx_handle, Int64(0), TYPE_I32)
+end
+
+function emit_string_ncodeunits(bc, args, ir)
+    ptr_id = resolve_operand(bc, args[1], ir)
+    load_ptr = Libdl.dlsym(bc.lib_handle, :block_add_load)
+    return ccall(load_ptr, UInt32, (Ptr{Cvoid}, UInt32, Int32, UInt32),
+                 bc.fctx_handle, ptr_id, Int32(0), TYPE_I64)
+end
+
+function emit_string_codeunit(bc, args, ir)
+    ptr_id = resolve_operand(bc, args[1], ir)
+    idx_id = resolve_operand(bc, args[2], ir)
+
+    # Byte position: ptr + 8 + (idx - 1) = ptr + idx + 7
+    # Step 1: compute addr = ptr + idx (one iadd)
+    iadd_ptr = Libdl.dlsym(bc.lib_handle, :block_add_iadd)
+    addr_id = ccall(iadd_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
+                    bc.fctx_handle, ptr_id, idx_id)
+    # Step 2: load byte from addr + 7 (static offset)
+    load_ptr = Libdl.dlsym(bc.lib_handle, :block_add_load)
+    byte_id = ccall(load_ptr, UInt32, (Ptr{Cvoid}, UInt32, Int32, UInt32),
+                    bc.fctx_handle, addr_id, Int32(7), TYPE_I8)
+    # Step 3: uextend to i32 for return compatibility
+    ext_ptr = Libdl.dlsym(bc.lib_handle, :block_add_uextend)
+    return ccall(ext_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
+                 bc.fctx_handle, byte_id, TYPE_I32)
+end
+
+# === GlobalRef handling (external function calls) ===
+
+function emit_globalref(bc::BuilderCtx, f::Core.GlobalRef, args, ir, stmt_idx)
+    fn = f.name
+    mod = f.mod
+
+    # === Integer arithmetic ===
+    if fn == :add_int || fn == :+ ; return emit_binop(bc, :block_add_iadd, args, ir) end
+    if fn == :sub_int || fn == :- ; return emit_binop(bc, :block_add_isub, args, ir) end
+    if fn == :mul_int || fn == :* ; return emit_binop(bc, :block_add_imul, args, ir) end
+    if fn == :sdiv_int ; return emit_binop(bc, :block_add_sdiv, args, ir) end
+    if fn == :udiv_int ; return emit_binop(bc, :block_add_udiv, args, ir) end
+    if fn == :srem_int || fn == :checked_srem_int ; return emit_binop(bc, :block_add_srem, args, ir) end
+    if fn == :urem_int ; return emit_binop(bc, :block_add_urem, args, ir) end
+    if fn == :checked_sdiv_int ; return emit_binop(bc, :block_add_sdiv, args, ir) end
+
+    # === Integer comparisons ===
+    if fn == :eq_int || fn === Symbol("===") ; return emit_icmp(bc, ICMP_EQ, args, ir) end
+    if fn == :ne_int ; return emit_icmp(bc, ICMP_NE, args, ir) end
+    if fn == :slt_int || fn == :< ; return emit_icmp(bc, ICMP_SLT, args, ir) end
+    if fn == :sle_int || fn == :<= ; return emit_icmp(bc, ICMP_SLE, args, ir) end
+    if fn == :ult_int ; return emit_icmp(bc, ICMP_ULT, args, ir) end
+    if fn == :ule_int ; return emit_icmp(bc, ICMP_ULE, args, ir) end
+
+    # === Integer bitwise (may also be used as not_int) ===
+    if fn == :not_int ; return emit_not_int(bc, args, ir) end
+    if fn == :and_int || fn == :& ; return emit_binop(bc, :block_add_band, args, ir) end
+    if fn == :or_int || fn == :|  ; return emit_binop(bc, :block_add_bor, args, ir) end
+    if fn == :xor_int ; return emit_binop(bc, :block_add_bxor, args, ir) end
+    if fn == :shl_int ; return emit_binop(bc, :block_add_ishl, args, ir) end
+    if fn == :lshr_int ; return emit_binop(bc, :block_add_ushr, args, ir) end
+    if fn == :ashr_int ; return emit_binop(bc, :block_add_sshr, args, ir) end
+
+    # === Float arithmetic ===
+    if fn == :add_float ; return emit_binop(bc, :block_add_fadd, args, ir) end
+    if fn == :sub_float ; return emit_binop(bc, :block_add_fsub, args, ir) end
+    if fn == :mul_float ; return emit_binop(bc, :block_add_fmul, args, ir) end
+    if fn == :div_float ; return emit_binop(bc, :block_add_fdiv, args, ir) end
+    if fn == :neg_float ; return emit_unop(bc, :block_add_fneg, args, ir) end
+
+    # === Float comparisons ===
+    if fn == :eq_float ; return emit_fcmp(bc, FCMP_EQ, args, ir) end
+    if fn == :ne_float ; return emit_fcmp(bc, FCMP_NE, args, ir) end
+    if fn == :lt_float ; return emit_fcmp(bc, FCMP_LT, args, ir) end
+    if fn == :le_float ; return emit_fcmp(bc, FCMP_LE, args, ir) end
+
+    # === Conversions ===
+    if fn == :zext_int ; return emit_convert(bc, :block_add_uextend, args, ir) end
+    if fn == :sext_int ; return emit_convert(bc, :block_add_sextend, args, ir) end
+    if fn == :trunc_int ; return emit_trunc(bc, args, ir) end
+
+    # === Struct field access ===
+    if fn == :getfield && length(args) >= 2
+        return emit_struct_getfield(bc, args, ir, stmt_idx)
+    end
+    if fn == :setfield! && length(args) >= 3
+        return emit_struct_setfield(bc, args, ir)
+    end
+
+    # === Pointer / memory operations ===
+    if fn == :bitcast && length(args) >= 2
+        # bitcast is a no-op at the IR level — same bits, different type
+        return resolve_operand(bc, args[2], ir)
+    end
+
+    if fn == :pointerref && length(args) >= 2
+        return emit_pointerref(bc, args, ir)
+    end
+
+    if fn == :pointerset && length(args) >= 3
+        return emit_pointerset(bc, args, ir)
+    end
+
+    # === Runtime allocation intrinsics ===
+    if fn == :memorynew
+        # Core.memorynew(Memory{T}, n) → allocates raw memory for n elements
+        return emit_memorynew(bc, args, ir)
+    end
+    if fn == :memoryrefnew && length(args) == 1
+        # Core.memoryrefnew(mem::Memory{T}) → creates MemoryRef from raw memory
+        return emit_memoryref_from_mem(bc, args, ir, stmt_idx)
+    end
+    if fn == :tuple && length(args) >= 1
+        # Core.tuple(elements...) → create a tuple value
+        return emit_core_tuple(bc, args, ir)
+    end
+
+    # === MemoryRef managed-memory operators ===
+    if fn == :memoryrefnew && length(args) >= 2
+        return emit_memoryrefnew(bc, args, ir, stmt_idx)
+    end
+    if fn == :memoryrefget && length(args) >= 1
+        return emit_memoryrefget(bc, args, ir)
+    end
+    if fn == :memoryrefset! && length(args) >= 2
+        return emit_memoryrefset(bc, args, ir)
+    end
+
+    error("Unsupported GlobalRef: $(mod).$(fn)")
+end
+
+# === Struct field helpers ===
+
+function get_operand_type(val, ir)
+    if val isa Core.Argument
+        return ir.argtypes[val.n]
+    elseif val isa Core.SSAValue
+        return ir.stmts[val.id][:type]
+    else
+        return typeof(val)
+    end
+end
+
+function emit_struct_getfield(bc::BuilderCtx, args, ir, stmt_idx)
+    obj = args[1]
+    field_sym = args[2] isa QuoteNode ? args[2].value :
+                args[2] isa Symbol ? args[2] :
+                args[2] isa Integer ? args[2] :
+                error("Expected QuoteNode/Symbol/Integer for field, got $(typeof(args[2]))")
+
+    T = get_operand_type(obj, ir)
+    T = T isa Core.Const ? T.val : T
+
+    # Case 1: composed offset from ref_tracking (e.g. memref.ptr_or_offset)
+    if obj isa Core.SSAValue && haskey(bc.ref_tracking, obj)
+        base_id, base_off, parent_T = bc.ref_tracking[obj]
+        field_off = fieldoffset(parent_T, field_sym)
+        field_T = fieldtype(parent_T, field_sym)
+        field_type_enum = cranelift_type(field_T)
+        load_ptr = Libdl.dlsym(bc.lib_handle, :block_add_load)
+        return ccall(load_ptr, UInt32, (Ptr{Cvoid}, UInt32, Int32, UInt32),
+                     bc.fctx_handle, base_id, Int32(base_off + field_off), field_type_enum)
+    end
+
+    obj_id = resolve_operand(bc, obj, ir)
+
+    # Case 2: field is a non-loadable type (e.g. MemoryRef) — track composed offset
+    field_T = fieldtype(T, field_sym)
+    field_loadable = try
+        cranelift_type(field_T); true
+    catch _
+        false
+    end
+
+    if !field_loadable && (T isa DataType)
+        # Track composed offset for later getfield sub-accesses
+        offset = fieldoffset(T, field_sym)
+        bc.ref_tracking[Core.SSAValue(stmt_idx)] = (obj_id, offset, field_T)
+        # Return a sentinel Cranelift value — the real value is in ref_tracking
+        return obj_id
+    end
+
+    # Case 3: bitstype struct field — extract from value (not memory load)
+    if T isa DataType && isbitstype(T)
+        # Bitstype getfield: value is in register, extract field by offset
+        # For single-field types at offset 0, the value IS the field
+        offset = fieldoffset(T, field_sym)
+        if offset == 0
+            return obj_id  # value is the field itself
+        end
+        # Multi-field bitstype: need to extract with ireduce/ishift — NYI
+        error("Multi-field bitstype getfield not yet supported: $T")
+    end
+
+    # Case 4: regular mutable struct field — load from memory
+    offset = fieldoffset(T, field_sym)
+    field_type_enum = cranelift_type(field_T)
+    load_ptr = Libdl.dlsym(bc.lib_handle, :block_add_load)
+    return ccall(load_ptr, UInt32, (Ptr{Cvoid}, UInt32, Int32, UInt32),
+                 bc.fctx_handle, obj_id, Int32(offset), field_type_enum)
+end
+
+function emit_struct_setfield(bc::BuilderCtx, args, ir)
+    obj = args[1]
+    field_sym = args[2] isa QuoteNode ? args[2].value :
+                args[2] isa Symbol ? args[2] :
+                error("Expected QuoteNode or Symbol for field name, got $(typeof(args[2]))")
+    value = args[3]
+
+    T = get_operand_type(obj, ir)
+    T = T isa Core.Const ? T.val : T
+
+    obj_id = resolve_operand(bc, obj, ir)
+    val_id = resolve_operand(bc, value, ir)
+
+    offset = fieldoffset(T, field_sym)
+    field_T = fieldtype(T, field_sym)
+    field_type_enum = cranelift_type(field_T)
+
+    store_ptr = Libdl.dlsym(bc.lib_handle, :block_add_store)
+    ccall(store_ptr, Cvoid, (Ptr{Cvoid}, UInt32, Int32, UInt32, UInt32),
+          bc.fctx_handle, obj_id, Int32(offset), val_id, field_type_enum)
+
+    # setfield! returns the stored value
+    return val_id
+end
+
+# === Pointer operations ===
+
+function emit_pointerref(bc::BuilderCtx, args, ir)
+    # pointerref(ptr::Ptr{T}, i::Int, align) — load element at 1-based index i
+    ptr_id = resolve_operand(bc, args[1], ir)
+    idx_id = resolve_operand(bc, args[2], ir)
+
+    # Determine element type from the pointer type
+    ptr_type = get_operand_type(args[1], ir)
+    ptr_type = ptr_type isa Core.Const ? ptr_type.val : ptr_type
+    elem_T = ptr_type isa DataType && ptr_type <: Ptr && length(ptr_type.parameters) > 0 ?
+             ptr_type.parameters[1] : Int64
+    elem_size = sizeof(elem_T)
+
+    # Compute element address: ptr + (idx - 1) * elem_size
+    # idx - 1
+    one_id = if elem_size == 8
+        emit_constant(bc, Int64(1))
+    else
+        emit_constant(bc, Int32(1))
+    end
+    sub_ptr = Libdl.dlsym(bc.lib_handle, :block_add_isub)
+    idx_0_id = ccall(sub_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
+                     bc.fctx_handle, idx_id, one_id)
+
+    # (idx - 1) * elem_size
+    if elem_size != 1
+        size_id = if elem_size == 8
+            emit_constant(bc, Int64(elem_size))
+        else
+            emit_constant(bc, Int32(elem_size))
+        end
+        mul_ptr = Libdl.dlsym(bc.lib_handle, :block_add_imul)
+        byte_off_id = ccall(mul_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
+                             bc.fctx_handle, idx_0_id, size_id)
+    else
+        byte_off_id = idx_0_id  # elem_size == 1, no multiply needed
+    end
+
+    # ptr + byte_offset
+    iadd_ptr = Libdl.dlsym(bc.lib_handle, :block_add_iadd)
+    elem_addr_id = ccall(iadd_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
+                          bc.fctx_handle, ptr_id, byte_off_id)
+
+    # Load element at elem_addr + 0
+    elem_type_enum = cranelift_type(elem_T)
+    load_ptr = Libdl.dlsym(bc.lib_handle, :block_add_load)
+    return ccall(load_ptr, UInt32, (Ptr{Cvoid}, UInt32, Int32, UInt32),
+                 bc.fctx_handle, elem_addr_id, Int32(0), elem_type_enum)
+end
+
+function emit_pointerset(bc::BuilderCtx, args, ir)
+    # pointerset(ptr::Ptr{T}, val, i::Int, align) — store val at 1-based index i
+    ptr_id = resolve_operand(bc, args[1], ir)
+    val_id = resolve_operand(bc, args[2], ir)
+    idx_id = resolve_operand(bc, args[3], ir)
+
+    # Determine element type from the pointer type
+    ptr_type = get_operand_type(args[1], ir)
+    ptr_type = ptr_type isa Core.Const ? ptr_type.val : ptr_type
+    elem_T = ptr_type isa DataType && ptr_type <: Ptr && length(ptr_type.parameters) > 0 ?
+             ptr_type.parameters[1] : Int64
+    elem_size = sizeof(elem_T)
+
+    # Compute element address: ptr + (idx - 1) * elem_size
+    one_id = if elem_size == 8
+        emit_constant(bc, Int64(1))
+    else
+        emit_constant(bc, Int32(1))
+    end
+    sub_ptr = Libdl.dlsym(bc.lib_handle, :block_add_isub)
+    idx_0_id = ccall(sub_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
+                     bc.fctx_handle, idx_id, one_id)
+
+    if elem_size != 1
+        size_id = if elem_size == 8
+            emit_constant(bc, Int64(elem_size))
+        else
+            emit_constant(bc, Int32(elem_size))
+        end
+        mul_ptr = Libdl.dlsym(bc.lib_handle, :block_add_imul)
+        byte_off_id = ccall(mul_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
+                             bc.fctx_handle, idx_0_id, size_id)
+    else
+        byte_off_id = idx_0_id
+    end
+
+    iadd_ptr = Libdl.dlsym(bc.lib_handle, :block_add_iadd)
+    elem_addr_id = ccall(iadd_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
+                          bc.fctx_handle, ptr_id, byte_off_id)
+
+    # Store val at elem_addr + 0
+    elem_type_enum = cranelift_type(elem_T)
+    store_ptr = Libdl.dlsym(bc.lib_handle, :block_add_store)
+    ccall(store_ptr, Cvoid, (Ptr{Cvoid}, UInt32, Int32, UInt32, UInt32),
+          bc.fctx_handle, elem_addr_id, Int32(0), val_id, elem_type_enum)
+
+    # pointerset returns the pointer (first argument)
+    return ptr_id
+end
+
+# === MemoryRef managed-memory operators ===
+
+function emit_memoryrefnew(bc::BuilderCtx, args, ir, stmt_idx)
+    # memoryrefnew(memref::MemoryRef{T}, idx::Int, ordered::Bool) → MemoryRef{T}
+    # Creates a new MemoryRef pointing to element at 1-based index idx.
+    memref_val = args[1]
+    idx_val = args[2]
+
+    # Get the MemoryRef's base info from ref_tracking
+    tracked = (memref_val isa Core.SSAValue && haskey(bc.ref_tracking, memref_val)) ?
+              bc.ref_tracking[memref_val] : nothing
+    tracked === nothing && error("memoryrefnew: operand not a tracked MemoryRef")
+
+    base_id, base_off, memref_T = tracked
+    elem_T = memref_T isa DataType && length(memref_T.parameters) >= 2 ?
+             memref_T.parameters[2] : Int64  # param 1=ordering, param 2=T
+    elem_size = sizeof(elem_T)
+
+    # Load data pointer from base + base_off (field ptr_or_offset at offset 0)
+    load_ptr = Libdl.dlsym(bc.lib_handle, :block_add_load)
+    data_ptr_id = ccall(load_ptr, UInt32, (Ptr{Cvoid}, UInt32, Int32, UInt32),
+                        bc.fctx_handle, base_id, Int32(base_off), TYPE_I64)
+
+    # Compute element offset: (idx - 1) * elem_size
+    idx_id = resolve_operand(bc, idx_val, ir)
+    one_id = emit_constant(bc, Int64(1))
+    sub_ptr = Libdl.dlsym(bc.lib_handle, :block_add_isub)
+    idx_0_id = ccall(sub_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
+                     bc.fctx_handle, idx_id, one_id)
+
+    if elem_size != 1
+        size_id = emit_constant(bc, Int64(elem_size))
+        mul_ptr = Libdl.dlsym(bc.lib_handle, :block_add_imul)
+        byte_off_id = ccall(mul_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
+                             bc.fctx_handle, idx_0_id, size_id)
+    else
+        byte_off_id = idx_0_id
+    end
+
+    # Compute element address = data_ptr + byte_offset
+    iadd_ptr = Libdl.dlsym(bc.lib_handle, :block_add_iadd)
+    elem_addr_id = ccall(iadd_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
+                          bc.fctx_handle, data_ptr_id, byte_off_id)
+
+    # Track the new MemoryRef — offset 0 since elem_addr_id IS the exact address
+    bc.ref_tracking[Core.SSAValue(stmt_idx)] = (elem_addr_id, 0, memref_T)
+    return elem_addr_id
+end
+
+function emit_memoryrefget(bc::BuilderCtx, args, ir)
+    # memoryrefget(memref::MemoryRef{T}, ordering, ordered) → T
+    memref_val = args[1]
+
+    tracked = (memref_val isa Core.SSAValue && haskey(bc.ref_tracking, memref_val)) ?
+              bc.ref_tracking[memref_val] : nothing
+    tracked === nothing && error("memoryrefget: operand not a tracked MemoryRef")
+
+    base_id, base_off, memref_T = tracked
+    elem_T = memref_T isa DataType && length(memref_T.parameters) >= 2 ?
+             memref_T.parameters[2] : Int64  # param 1=ordering, param 2=T
+    elem_type_enum = cranelift_type(elem_T)
+
+    load_ptr = Libdl.dlsym(bc.lib_handle, :block_add_load)
+    return ccall(load_ptr, UInt32, (Ptr{Cvoid}, UInt32, Int32, UInt32),
+                 bc.fctx_handle, base_id, Int32(base_off), elem_type_enum)
+end
+
+function emit_memoryrefset(bc::BuilderCtx, args, ir)
+    # memoryrefset!(memref::MemoryRef{T}, val, ordering, ordered) → T
+    memref_val = args[1]
+    val = args[2]
+
+    tracked = (memref_val isa Core.SSAValue && haskey(bc.ref_tracking, memref_val)) ?
+              bc.ref_tracking[memref_val] : nothing
+    tracked === nothing && error("memoryrefset!: operand not a tracked MemoryRef")
+
+    base_id, base_off, memref_T = tracked
+    elem_T = memref_T isa DataType && length(memref_T.parameters) >= 2 ?
+             memref_T.parameters[2] : Int64  # param 1=ordering, param 2=T
+    elem_type_enum = cranelift_type(elem_T)
+
+    val_id = resolve_operand(bc, val, ir)
+
+    store_ptr = Libdl.dlsym(bc.lib_handle, :block_add_store)
+    ccall(store_ptr, Cvoid, (Ptr{Cvoid}, UInt32, Int32, UInt32, UInt32),
+          bc.fctx_handle, base_id, Int32(base_off), val_id, elem_type_enum)
+
+    # memoryrefset! returns the stored value
+    return val_id
+end
+
+# === Runtime allocation ===
+
+function _declare_imports(bc::BuilderCtx)
+    declare_ptr = Libdl.dlsym(bc.lib_handle, :builder_declare_import)
+    # __jl_gc_alloc_array(type_tag: u32, length: i32, elem_size: u32) -> *mut u8
+    int32s = UInt32[TYPE_I32, TYPE_I32, TYPE_I32]
+    ccall(declare_ptr, Cint, (Ptr{Cvoid}, Ptr{UInt8}, UInt32, Ptr{UInt32}, Csize_t),
+          bc.builder_handle, "__jl_gc_alloc_array", TYPE_PTR, int32s, length(int32s))
+    # __jl_gc_alloc(type_tag: u32, data_size: u32) -> *mut u8
+    int32_2 = UInt32[TYPE_I32, TYPE_I32]
+    ccall(declare_ptr, Cint, (Ptr{Cvoid}, Ptr{UInt8}, UInt32, Ptr{UInt32}, Csize_t),
+          bc.builder_handle, "__jl_gc_alloc", TYPE_PTR, int32_2, length(int32_2))
+end
+
+function emit_call_runtime(bc::BuilderCtx, func_name::String, arg_ids::Vector{UInt32})
+    call_ptr = Libdl.dlsym(bc.lib_handle, :block_add_call)
+    nargs = length(arg_ids)
+    return ccall(call_ptr, UInt32,
+                 (Ptr{Cvoid}, Ptr{Cvoid}, Ptr{UInt8}, Ptr{UInt32}, Csize_t),
+                 bc.fctx_handle, bc.builder_handle, func_name, arg_ids, nargs)
+end
+
+const ARRAY_TYPE_TAG = UInt32(2)
+const VECTOR_TYPE_TAG = UInt32(3)
+
+function emit_memorynew(bc::BuilderCtx, args, ir)
+    # Core.memorynew(Memory{T}, n) → allocate raw memory
+    mem_T = args[1]  # Memory{Int64} DataType
+    n = args[2]      # length
+
+    elem_T = mem_T isa DataType && length(mem_T.parameters) >= 2 ?
+             mem_T.parameters[2] : Int64  # param 1=ordering, param 2=T
+    elem_size = UInt32(sizeof(elem_T))
+
+    n_id = resolve_operand(bc, n, ir)
+    # __jl_gc_alloc_array expects i32 — reduce from i64
+    ireduce_ptr = Libdl.dlsym(bc.lib_handle, :block_add_ireduce)
+    n32_id = ccall(ireduce_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
+                   bc.fctx_handle, n_id, TYPE_I32)
+
+    type_tag_id = emit_constant(bc, Int32(ARRAY_TYPE_TAG))
+    elem_size_id = emit_constant(bc, Int32(elem_size))
+
+    # __jl_gc_alloc_array call blocked — Cranelift ObjectModule call crashes on ARM64 macOS
+    # Workaround: pre-allocate arrays in Julia, pass to compiled functions
+    error("Array allocation not yet supported — pass pre-allocated arrays from Julia")
+end
+
+function emit_memoryref_from_mem(bc::BuilderCtx, args, ir, stmt_idx)
+    # Core.memoryrefnew(mem::Memory{T}) → create MemoryRef from raw allocation
+    # The memory pointer IS the data pointer. Track for later memoryrefget/setfield
+    mem_id = resolve_operand(bc, args[1], ir)
+    mem_T = get_operand_type(args[1], ir)
+    mem_T = mem_T isa Core.Const ? mem_T.val : mem_T
+
+    # Track with offset 0 — the pointer from alloc already points to element data
+    # Memory/MemoryRef types have same param structure (ordering, T, addrspace)
+    bc.ref_tracking[Core.SSAValue(stmt_idx)] = (mem_id, 0, mem_T)
+    return mem_id
+end
+
+function emit_core_tuple(bc::BuilderCtx, args, ir)
+    # Core.tuple(elements...) → creates a Tuple
+    # For single-element Tuple{Int64}, sizeof=8, pass through
+    if length(args) == 1
+        return resolve_operand(bc, args[1], ir)
+    end
+    error("Multi-element tuple not yet supported")
+end
+
+function emit_new(bc::BuilderCtx, T, field_args, ir, stmt_idx)
+    # %new(T, fields...) — construct a new struct
+    T = T isa Core.Const ? T.val : T
+
+    if !(T isa DataType) || !Base.ismutabletype(T)
+        error("new only supported for mutable structs, got $T")
+    end
+
+    # Resolve all field values
+    field_ids = UInt32[resolve_operand(bc, fa, ir) for fa in field_args]
+
+    # Struct construction blocked — Cranelift ObjectModule call crashes on ARM64 macOS
+    error("Struct construction (:new) not yet supported — use pre-allocated objects from Julia")
+end
+
+# === Find native-builder library ===
+
+function get_native_builder_lib()
+    base_dir = joinpath(dirname(@__DIR__), "..", "native-builder", "target")
+    lib_name = Sys.isapple() ? "libnative_builder.dylib" :
+               Sys.islinux()  ? "libnative_builder.so" :
+               error("unsupported platform")
     for profile in ("release", "debug")
-        lib_name = Sys.isapple() ? "libnative_builder.dylib" :
-                   Sys.islinux()  ? "libnative_builder.so" :
-                   error("unsupported platform")
         path = joinpath(base_dir, profile, lib_name)
         isfile(path) && return path
     end
-
     error("native-builder library not found. Build with: cd native-builder && cargo build --release")
 end
