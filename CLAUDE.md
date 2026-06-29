@@ -165,8 +165,9 @@ for direct memory access (no runtime calls needed):
 - ✅ `BuilderContext` owns `ObjectModule` from `new()` with import registry
 - ✅ Platform-appropriate calling convention (`AppleAarch64` on ARM64 macOS)
 - ✅ Runtime GC functions: `__jl_gc_alloc`, `__jl_gc_alloc_array`, array helpers
-- 🚧 Array allocation (`:memorynew`) — blocked by Cranelift call crash (see limitations)
-- 🚧 Struct construction (`:new`) — blocked by Cranelift call crash (see limitations)
+- ✅ Struct allocation (`:new`) — works for internal use within compiled functions
+- ✅ Array allocation (`:memorynew`) — works for internal use within compiled functions
+- 🚧 Returning allocated objects to Julia — Boehm-GC-allocated memory lacks Julia object headers
 - 🚧 Bitstype struct getfield with offset≠0 — NYI (need shift/extract)
 - 🚧 Multi-element tuples — NYI (single-element passes through)
 
@@ -191,25 +192,54 @@ for direct memory access (no runtime calls needed):
 - **Linking**: Julia's lld at `~/.julia/juliaup/julia-nightly/libexec/julia/lld`. Command: `lld -flavor ld.lld -shared -o out.so in.o libnative_backend.a`
 - **Import declaration**: `builder_declare_import(name, ret_type, param_types)` → declares in ObjectModule with `Linkage::Import`. `block_add_call(name, args)` → emits `call` via `module.declare_func_in_func` + `fb.ins().call`.
 - **Constant emission**: Each `resolve_operand` call for a constant emits a NEW iconst — constants are NOT cached across blocks, as that would cause Cranelift verifier cross-block dominance violations.
+- **PIC required on ARM64 macOS**: The flags builder MUST set `is_pic = true` (requires `use cranelift_codegen::settings::Configurable`). Without PIC, external function calls crash with `ReadOnlyMemoryError` because ARM64 macOS enforces position-independent executables and `dyld` rejects absolute relocations in `.text`.
 
 ### Known limitations & workarounds
 
-1. **Cranelift 0.133 ObjectModule `call` crashes on ARM64 macOS** — `declare_function(Linkage::Import)` + `declare_func_in_func` + `call` compiles successfully but crashes at runtime with `ReadOnlyMemoryError`. Disassembly analysis suggests literal pool relocation bug (addresses off by +8). Runtime functions (`__jl_gc_alloc`, `__jl_gc_alloc_array`) are callable from Julia via ccall and stores to Julia-allocated memory work correctly. This blocks:
-   - Array allocation (`:memorynew` → `__jl_gc_alloc_array`)
-   - Struct construction (`:new` → `__jl_gc_alloc`)
-   **Workaround**: Pre-allocate objects/arrays in Julia, pass to compiled functions for processing.
+1. **Cranelift ObjectModule `call` FIXED** — Added `is_pic = true` to the Cranelift
+   flags builder and `use cranelift_codegen::settings::Configurable` import. On
+   ARM64 macOS, PIC is mandatory — without it, absolute relocations (`ARM64_RELOC_UNSIGNED`)
+   are emitted in the literal pool, which dyld refuses to write to read-only `.text`
+   pages. With `is_pic = true`, Cranelift emits proper GOT-based access via
+   `adrp` + `add` + `blr`, producing `ARM64_RELOC_GOT_LOAD_PAGE21` /
+   `ARM64_RELOC_GOT_LOAD_PAGEOFF12` relocations. Also tried `Linkage::Preemptible`
+   but `Linkage::Import` works fine with PIC enabled.
 
-2. **Bitstype multi-field structs** — `cranelift_type()` returns a scalar type by sizeof, but multi-field bitstypes need field extraction (ireduce/ishift). Currently only single-field bitstypes at offset 0 work (value IS the field). Multi-field needs shift+extract pattern.
+2. **Allocated objects can't be returned to Julia** — `emit_new` and `emit_memorynew`
+   call `__jl_gc_alloc` / `__jl_gc_alloc_array` via the now-fixed call mechanism.
+   Allocation, field stores, and field loads all work correctly within compiled
+   functions. However, the returned pointer **cannot** be passed to Julia's
+   `unsafe_pointer_to_objref` — it crashes with:
+   ```
+   signal 11: Segmentation fault
+   typekeyvalue_hash → lookup_typevalue → lookup_arg_type_tuple → jl_lookup_generic_
+   ```
+   **Why**: `__jl_gc_alloc` allocates via Boehm GC (`bdwgc-alloc`) with a custom
+   `GCHeader { type_tag, flags, length }` prepended. Julia's `unsafe_pointer_to_objref`
+   expects the pointer to point to a `jl_value_t` with Julia's internal type tag
+   (a `jl_datatype_t*`). Boehm's header has no Julia type tag, so Julia's type
+   system dereferences garbage and crashes in `typekeyvalue_hash`.
+   
+   **Verified working**: raw `ccall` returns a valid non-null pointer; storing and
+   loading fields at `fieldoffset` offsets works correctly.
+   
+   **Workaround**: Pre-allocate mutable structs/arrays in Julia, pass them as
+   `Ptr{Cvoid}` arguments to compiled functions, use `getfield`/`setfield!` or
+   pointer ops to read/write. This is how all 28 existing tests work.
 
-3. **Julia nightly required** — `InferenceCache` is only in nightly.
+3. **Bitstype multi-field structs** — `cranelift_type()` returns a scalar type by
+   sizeof, but multi-field bitstypes need field extraction (ireduce/ishift).
+   Currently only single-field bitstypes at offset 0 work (value IS the field).
 
-4. **`native-backend` is `staticlib`** — produces `.a`. Do NOT change to
+4. **Julia nightly required** — `InferenceCache` is only in nightly.
+
+5. **`native-backend` is `staticlib`** — produces `.a`. Do NOT change to
    `cdylib`; the linker embeds it into the final `.so`.
 
-5. **CLIF text format is DEAD CODE**. The old `clif_emit.jl` has been removed.
+6. **CLIF text format is DEAD CODE**. The old `clif_emit.jl` has been removed.
    Do not add CLIF text generation — use the eDSL builder API instead.
 
-6. **Unknown invoke sentinel** — unsupported `:invoke` calls emit constant 0
+7. **Unknown invoke sentinel** — unsupported `:invoke` calls emit constant 0
    instead of erroring. This allows functions with dead branches
    (e.g. bounds-check error paths) to compile.
 

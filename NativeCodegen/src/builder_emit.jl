@@ -1051,9 +1051,9 @@ function emit_memorynew(bc::BuilderCtx, args, ir)
     type_tag_id = emit_constant(bc, Int32(ARRAY_TYPE_TAG))
     elem_size_id = emit_constant(bc, Int32(elem_size))
 
-    # __jl_gc_alloc_array call blocked — Cranelift ObjectModule call crashes on ARM64 macOS
-    # Workaround: pre-allocate arrays in Julia, pass to compiled functions
-    error("Array allocation not yet supported — pass pre-allocated arrays from Julia")
+    # Call __jl_gc_alloc_array(type_tag: u32, length: i32, elem_size: u32) -> *mut u8
+    return emit_call_runtime(bc, "__jl_gc_alloc_array",
+        UInt32[type_tag_id, n32_id, elem_size_id])
 end
 
 function emit_memoryref_from_mem(bc::BuilderCtx, args, ir, stmt_idx)
@@ -1078,19 +1078,45 @@ function emit_core_tuple(bc::BuilderCtx, args, ir)
     error("Multi-element tuple not yet supported")
 end
 
+const STRUCT_TYPE_TAG = UInt32(1)
+
 function emit_new(bc::BuilderCtx, T, field_args, ir, stmt_idx)
     # %new(T, fields...) — construct a new struct
-    T = T isa Core.Const ? T.val : T
+    # T can be: Core.Const, Core.GlobalRef, or direct DataType
+    if T isa Core.Const
+        T = T.val
+    elseif T isa Core.GlobalRef
+        T = getglobal(T.mod, T.name)
+    elseif T isa Core.SSAValue
+        T = ir.stmts[T.id][:type]
+        T = T isa Core.Const ? T.val : T
+    end
 
     if !(T isa DataType) || !Base.ismutabletype(T)
-        error("new only supported for mutable structs, got $T")
+        error("new only supported for mutable structs, got $T ($(typeof(T)))")
     end
 
     # Resolve all field values
     field_ids = UInt32[resolve_operand(bc, fa, ir) for fa in field_args]
 
-    # Struct construction blocked — Cranelift ObjectModule call crashes on ARM64 macOS
-    error("Struct construction (:new) not yet supported — use pre-allocated objects from Julia")
+    # Allocate: __jl_gc_alloc(type_tag: u32, data_size: u32) -> *mut u8
+    data_size = UInt32(sizeof(T))
+    type_tag_id = emit_constant(bc, Int32(STRUCT_TYPE_TAG))
+    size_id = emit_constant(bc, Int32(data_size))
+    ptr_id = emit_call_runtime(bc, "__jl_gc_alloc", UInt32[type_tag_id, size_id])
+
+    # Store each field at its offset
+    field_names = fieldnames(T)
+    store_ptr = Libdl.dlsym(bc.lib_handle, :block_add_store)
+    for (i, fid) in enumerate(field_ids)
+        offset = Int32(fieldoffset(T, i))
+        field_T = fieldtype(T, i)
+        field_type_enum = cranelift_type(field_T)
+        ccall(store_ptr, Cvoid, (Ptr{Cvoid}, UInt32, Int32, UInt32, UInt32),
+              bc.fctx_handle, ptr_id, offset, fid, field_type_enum)
+    end
+
+    return ptr_id
 end
 
 # === Find native-builder library ===

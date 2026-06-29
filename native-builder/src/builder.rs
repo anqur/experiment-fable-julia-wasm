@@ -6,6 +6,7 @@ use cranelift_codegen::ir::types;
 use cranelift_codegen::ir::condcodes::{IntCC, FloatCC};
 use cranelift_codegen::ir::{AbiParam, Type, Signature, InstBuilder, MemFlagsData, UserFuncName, BlockArg};
 use cranelift_codegen::isa::CallConv;
+use cranelift_codegen::settings::Configurable;
 use cranelift_codegen::Context;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_module::{FuncId, Linkage, Module};
@@ -283,7 +284,8 @@ pub struct BuilderContext {
 impl BuilderContext {
     pub fn new() -> Self {
         let triple = Triple::host();
-        let fb = cranelift_codegen::settings::builder();
+        let mut fb = cranelift_codegen::settings::builder();
+        fb.set("is_pic", "true").unwrap();  // Required for aarch64 macOS: GOT-based external calls
         let flags = cranelift_codegen::settings::Flags::new(fb);
         let isa = cranelift_codegen::isa::lookup(triple)
             .expect("ISA lookup").finish(flags).expect("ISA finish");
