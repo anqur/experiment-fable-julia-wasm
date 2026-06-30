@@ -17,11 +17,22 @@ Boehm GC, exception handling (setjmp/longjmp), and string/array runtime support.
 
 ## Build
 
+Use the **dev profile for local development** — it rebuilds in ~0.3s vs ~60s for
+release (release sets `lto = true` + `opt-level = 3`, which dominates compile
+time over the large Cranelift graph). Release is only needed for runtime-perf
+measurements. `[profile.dev]` disables `debug-assertions` because
+cranelift-frontend's empty-`FunctionBuilderContext` assertion doesn't fit our
+transient-builder pattern; codegen is correct either way (verified by the test
+suite).
+
 ```bash
 cd native-backend
-cargo build          # debug build → target/debug/libnative_backend.a
-cargo build --release  # release build → target/release/libnative_backend.a
+cargo build            # dev build → target/debug/libnative_backend.a  (fast; recommended)
+cargo build --release  # release build → target/release/libnative_backend.a  (~1 min)
 ```
+
+The Julia loader auto-selects the **newest** artifact by mtime across
+`target/debug` and `target/release`, so whichever you built last is what runs.
 
 ## C ABI exports
 

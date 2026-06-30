@@ -42,6 +42,8 @@ function cranelift_type(T)
     t = get(CRANELIFT_TYPE_MAP, T, nothing)
     t !== nothing && return t
     T isa DataType && Base.ismutabletype(T) && !(T <: Ptr) && return TYPE_PTR
+    # Handle tuples as pointer types (multi-element tuples need memory allocation)
+    T isa DataType && T <: Tuple && return TYPE_PTR
     r = scalar_repr(T)
     if r !== nothing
         return r.vt == WasmTools.I64 ? TYPE_I64 : r.vt == WasmTools.I32 ? TYPE_I32 :
@@ -58,7 +60,7 @@ function cranelift_type(T)
 end
 
 function is_ptr_type(T)
-    T isa DataType && (Base.ismutabletype(T) || T === String) && !(T <: Ptr)
+    T isa DataType && (Base.ismutabletype(T) || T === String || T <: Tuple) && !(T <: Ptr)
 end
 
 # === BuilderCtx: tracks a Rust FunctionCtx for one Julia function ===
@@ -183,10 +185,16 @@ function emit_function_via_builder(interp::WasmInterp, f, argtypes::Type{<:Tuple
             # Process statements
             had_terminator = false
             for si in block.stmts
+                had_terminator && break
                 e = ir.stmts[si][:stmt]
                 emit_instruction(bc, e, ir, si)
                 if e isa Core.GotoNode || e isa Core.GotoIfNot || e isa Core.ReturnNode
                     had_terminator = true
+                elseif e isa Expr && e.head == :call && length(e.args) >= 1
+                    f = e.args[1]
+                    if f isa Core.GlobalRef && f.name == :throw
+                        had_terminator = true
+                    end
                 end
             end
 
@@ -236,11 +244,15 @@ function emit_instruction(bc::BuilderCtx, e, ir, stmt_idx::Int)
         elseif f === Core.sizeof || f === sizeof
             # sizeof(s::String) == ncodeunits(s) — emit load from ptr+0
             result_id = emit_string_ncodeunits(bc, args, ir)
+        elseif f === Core.memoryrefunset!
+            # memoryrefunset!(ref, ordering, boundscheck) — store zero at ref for GC safety
+            result_id = emit_memoryrefunset(bc, args, ir)
         else
             error("Unsupported call: $(f)")
         end
         if result_id !== nothing
             bc.ssa_values[Core.SSAValue(stmt_idx)] = result_id
+            println("[DEBUG ssa] stmt=$stmt_idx (call) -> result_id=$result_id")
         end
     elseif e isa Expr && e.head == :invoke
         mi = e.args[1]  # MethodInstance or CodeInstance
@@ -346,15 +358,43 @@ function get_phi_args(ir, bc::BuilderCtx, source_bi::Int, target_bi::Int)
     for si in target_block.stmts
         e = ir.stmts[si][:stmt]
         if e isa Core.PhiNode
+            found = false
             for (j, edge_bi) in enumerate(e.edges)
                 if edge_bi == source_bi
                     push!(args, resolve_operand(bc, e.values[j], ir))
+                    found = true
                     break
                 end
+            end
+            if !found
+                # This phi is undefined along this edge (its variable is not
+                # defined on this predecessor path — common for loop-carried
+                # values on bounds-check escape paths). Pass a zero placeholder
+                # of the phi's type so the jump arg count matches the block's
+                # param count. The value is never used along this path.
+                push!(args, _undef_placeholder(bc, ir.stmts[si][:type]))
             end
         end
     end
     return args
+end
+
+# Zero placeholder for an undefined phi edge, matching the phi value's type so
+# the jump argument count lines up with the target block's parameters.
+function _undef_placeholder(bc::BuilderCtx, T)
+    T = T isa Core.PartialStruct ? T.typ : (T isa Core.Const ? typeof(T.val) : T)
+    ty_enum = try; cranelift_type(T); catch _; TYPE_I64; end
+    if ty_enum == TYPE_F64
+        fptr = Libdl.dlsym(bc.lib_handle, :block_add_f64const)
+        return ccall(fptr, UInt32, (Ptr{Cvoid}, Float64), bc.fctx_handle, 0.0)
+    elseif ty_enum == TYPE_F32
+        fptr = Libdl.dlsym(bc.lib_handle, :block_add_f32const)
+        return ccall(fptr, UInt32, (Ptr{Cvoid}, Float32), bc.fctx_handle, 0.0f0)
+    else
+        iconst_ptr = Libdl.dlsym(bc.lib_handle, :block_add_iconst)
+        return ccall(iconst_ptr, UInt32, (Ptr{Cvoid}, Int64, UInt32),
+                     bc.fctx_handle, Int64(0), ty_enum)
+    end
 end
 
 # Find which basic block contains a given statement
@@ -376,6 +416,9 @@ function resolve_operand(bc::BuilderCtx, val, ir)
     elseif val isa Core.Argument
         haskey(bc.arg_values, val) && return bc.arg_values[val]
         error("Argument $val not found in tracking")
+    elseif val isa Core.Const
+        # Extract the constant value and resolve it
+        return resolve_operand(bc, val.val, ir)
     elseif isa(val, Number)
         # Create constant each time (caching causes cross-block dominance issues)
         return emit_constant(bc, val)
@@ -387,6 +430,18 @@ function resolve_operand(bc::BuilderCtx, val, ir)
         iconst_ptr = Libdl.dlsym(bc.lib_handle, :block_add_iconst)
         return ccall(iconst_ptr, UInt32, (Ptr{Cvoid}, Int64, UInt32),
                    bc.fctx_handle, Int64(val ? 1 : 0), TYPE_I32)
+    elseif val isa Tuple
+        # Handle tuple constants by emitting tuple creation
+        args = [Core.Const(v) for v in val]
+        return emit_core_tuple(bc, args, ir)
+    elseif val isa AbstractString
+        # String literal/constant: emit its object pointer as a constant. The
+        # value is already a real Julia String; it round-trips back via
+        # unsafe_pointer_to_objref on return.
+        iconst_ptr = Libdl.dlsym(bc.lib_handle, :block_add_iconst)
+        return ccall(iconst_ptr, UInt32, (Ptr{Cvoid}, Int64, UInt32),
+                     bc.fctx_handle, Int64(reinterpret(UInt64, pointer_from_objref(val))),
+                     TYPE_PTR)
     else
         error("Unsupported operand type: $(typeof(val))")
     end
@@ -587,6 +642,36 @@ function emit_invoke(bc::BuilderCtx, invoke_target, f, args, ir, stmt_idx)
                      bc.fctx_handle, cmp_id, TYPE_I32)
     end
 
+    # String concatenation. `a * b * ...` lowers either to `invoke Base._string(...)`
+    # or (with literal/constant args) to `invoke *(::String,::String)` which inference
+    # may constant-fold. Int `*` never reaches here (it's a :call intrinsic), so an
+    # :invoke of :* / :_string with ≥2 args is string concat. Left-fold binary
+    # __jl_string_concat over the operands (each resolved to a String ptr).
+    if (fn_name == :_string || fn_name == :*) && length(args) >= 2
+        acc_id = resolve_operand(bc, args[1], ir)
+        for i in 2:length(args)
+            nxt_id = resolve_operand(bc, args[i], ir)
+            acc_id = emit_call_runtime(bc, "__jl_string_concat",
+                                       UInt32[acc_id, nxt_id])
+        end
+        return acc_id
+    end
+
+    # Array growth. `push!(a, x)` lowers to `invoke Base._growend_internal!(a, delta, oldsize)`
+    # (the trailing element store re-derives the data ptr via a fresh getfield, so no
+    # staleness). `resize!(a, n)` lowers to `invoke resize!(a, n)`. Both mutate in place;
+    # the array jl_array_t* stays valid across (re)allocation.
+    if fn_name == :_growend_internal! && length(args) >= 2
+        a_id = resolve_operand(bc, args[1], ir)
+        delta_id = resolve_operand(bc, args[2], ir)
+        return emit_call_runtime(bc, "__jl_array_grow_end", UInt32[a_id, delta_id])
+    end
+    if fn_name == :resize! && length(args) >= 2
+        a_id = resolve_operand(bc, args[1], ir)
+        n_id = resolve_operand(bc, args[2], ir)
+        return emit_call_runtime(bc, "__jl_array_resize", UInt32[a_id, n_id])
+    end
+
     # Unknown invoke — emit sentinel (e.g. bounds-error path, unreachable)
     iconst_ptr = Libdl.dlsym(bc.lib_handle, :block_add_iconst)
     return ccall(iconst_ptr, UInt32, (Ptr{Cvoid}, Int64, UInt32),
@@ -697,6 +782,25 @@ function emit_globalref(bc::BuilderCtx, f::Core.GlobalRef, args, ir, stmt_idx)
         # Core.memorynew(Memory{T}, n) → allocates raw memory for n elements
         return emit_memorynew(bc, args, ir)
     end
+    if fn == :__jl_string_new && length(args) == 1
+        # __jl_string_new(length) → create new string
+        len_id = resolve_operand(bc, args[1], ir)
+        # Allocate string with space for length + null terminator
+        total_size_id = emit_constant(bc, Int32(8))  # length + data + null
+        type_ptr = pointer_from_objref(String)
+        type_ptr_id = emit_constant(bc, Int64(reinterpret(UInt64, type_ptr)))
+
+        # Call Julia-compatible allocation
+        str_ptr_id = emit_call_runtime(bc, "__jl_gc_alloc_array_julia",
+            UInt32[type_ptr_id, len_id, total_size_id])
+
+        # Store length at offset 0 (String layout)
+        len_ptr = Libdl.dlsym(bc.lib_handle, :block_add_store)
+        ccall(len_ptr, Cvoid, (Ptr{Cvoid}, UInt32, Int32, UInt32, UInt32),
+              bc.fctx_handle, str_ptr_id, Int32(0), len_id, TYPE_I64)
+
+        return str_ptr_id
+    end
     if fn == :memoryrefnew && length(args) == 1
         # Core.memoryrefnew(mem::Memory{T}) → creates MemoryRef from raw memory
         return emit_memoryref_from_mem(bc, args, ir, stmt_idx)
@@ -716,6 +820,29 @@ function emit_globalref(bc::BuilderCtx, f::Core.GlobalRef, args, ir, stmt_idx)
     if fn == :memoryrefset! && length(args) >= 2
         return emit_memoryrefset(bc, args, ir)
     end
+    if fn == :memoryrefoffset && length(args) >= 1
+        # memoryrefoffset(ref::MemoryRef{T}) → Int64 (1-based element index)
+        # For a fresh MemoryRef from a Vector's :ref field, byte_offset==0, so result==1.
+        # General: byte_offset / elem_size + 1.
+        memref_val = args[1]
+        tracked = (memref_val isa Core.SSAValue && haskey(bc.ref_tracking, memref_val)) ?
+                  bc.ref_tracking[memref_val] : nothing
+        if tracked !== nothing
+            _, byte_off, memref_T = tracked
+            elem_T = memref_T isa DataType && length(memref_T.parameters) >= 2 ?
+                     memref_T.parameters[2] : Int64
+            elem_index = Int64(byte_off ÷ sizeof(elem_T)) + Int64(1)
+            return emit_constant(bc, elem_index)
+        end
+        # Fallback: return constant 1 (valid for all non-sliced arrays)
+        return emit_constant(bc, Int64(1))
+    end
+    if fn == :throw
+        # Base.throw(...) — always Union{}-typed (never returns). Emit trap.
+        trap_ptr = Libdl.dlsym(bc.lib_handle, :block_add_trap)
+        ccall(trap_ptr, Cvoid, (Ptr{Cvoid},), bc.fctx_handle)
+        return nothing
+    end
 
     error("Unsupported GlobalRef: $(mod).$(fn)")
 end
@@ -724,16 +851,57 @@ end
 
 function get_operand_type(val, ir)
     if val isa Core.Argument
-        return ir.argtypes[val.n]
+        T = ir.argtypes[val.n]
     elseif val isa Core.SSAValue
-        return ir.stmts[val.id][:type]
+        T = ir.stmts[val.id][:type]
+    elseif val isa Core.Const
+        # For constants, get the type of the contained value
+        return typeof(val.val)
     else
         return typeof(val)
     end
+    # Unwrap Julia inference artifacts that aren't real DataTypes, so callers
+    # that feed this into DataType-typed slots (ref_tracking, cranelift_type,
+    # fieldoffset, etc.) get a concrete type. PartialStruct.typ is the
+    # underlying DataType (e.g. PartialStruct(Memory{Int64},...) → Memory{Int64}).
+    T isa Core.PartialStruct && return T.typ
+    T isa Core.Const && return typeof(T.val)
+    return T
+end
+
+# getfield(constant_tuple, dynamic_index) → select chain over the tuple elements.
+# tuple_val is a Julia Tuple of constants; idx resolves to a 1-based index value.
+function emit_tuple_index(bc::BuilderCtx, tuple_val, idx, ir)
+    idx_id = resolve_operand(bc, idx, ir)
+    elem_ids = UInt32[emit_constant(bc, e) for e in tuple_val]
+    n = length(elem_ids)
+    n == 1 && return elem_ids[1]
+    icmp_ptr = Libdl.dlsym(bc.lib_handle, :block_add_icmp)
+    iconst_ptr = Libdl.dlsym(bc.lib_handle, :block_add_iconst)
+    select_ptr = Libdl.dlsym(bc.lib_handle, :block_add_select)
+    # Right-to-left: acc = en; for i = n-1..1: acc = select(idx==i, ei, acc)
+    acc = elem_ids[n]
+    for i in (n - 1):-1:1
+        i_id = ccall(iconst_ptr, UInt32, (Ptr{Cvoid}, Int64, UInt32),
+                     bc.fctx_handle, Int64(i), TYPE_I64)
+        cmp = ccall(icmp_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32, UInt32),
+                    bc.fctx_handle, ICMP_EQ, idx_id, i_id)
+        acc = ccall(select_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32, UInt32),
+                    bc.fctx_handle, cmp, elem_ids[i], acc)
+    end
+    return acc
 end
 
 function emit_struct_getfield(bc::BuilderCtx, args, ir, stmt_idx)
     obj = args[1]
+    # Dynamic index into a constant tuple, e.g. getfield((1,2,3,4), %i, false),
+    # which is how array literals read their initial values in a loop. Lower to a
+    # select chain over the constant elements (no select-free alternative without
+    # new blocks/phi nodes).
+    if obj isa Tuple && length(args) >= 2 &&
+       (args[2] isa Core.SSAValue || args[2] isa Core.Argument || args[2] isa Integer)
+        return emit_tuple_index(bc, obj, args[2], ir)
+    end
     field_sym = args[2] isa QuoteNode ? args[2].value :
                 args[2] isa Symbol ? args[2] :
                 args[2] isa Integer ? args[2] :
@@ -774,13 +942,47 @@ function emit_struct_getfield(bc::BuilderCtx, args, ir, stmt_idx)
     # Case 3: bitstype struct field — extract from value (not memory load)
     if T isa DataType && isbitstype(T)
         # Bitstype getfield: value is in register, extract field by offset
-        # For single-field types at offset 0, the value IS the field
         offset = fieldoffset(T, field_sym)
         if offset == 0
             return obj_id  # value is the field itself
         end
-        # Multi-field bitstype: need to extract with ireduce/ishift — NYI
-        error("Multi-field bitstype getfield not yet supported: $T")
+
+        # Multi-field bitstype: extract with shift/mask operations
+        field_T = fieldtype(T, field_sym)
+        field_size = sizeof(field_T) * 8  # field size in bits
+        struct_size = sizeof(T) * 8        # struct size in bits
+
+        # Shift right by offset bits to bring field to LSB position
+        offset_id = emit_constant(bc, Int64(offset * 8))
+        shift_ptr = Libdl.dlsym(bc.lib_handle, :block_add_ushr)
+        shifted_id = ccall(shift_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
+                          bc.fctx_handle, obj_id, offset_id)
+
+        # Create mask to extract only the field bits
+        mask = (UInt64(1) << field_size) - UInt64(1)  # mask for field bits
+
+        # Use consistent type for mask based on struct size
+        if struct_size <= 32
+            mask_id = emit_constant(bc, Int32(mask & 0xFFFFFFFF))
+        else
+            mask_id = emit_constant(bc, Int64(mask))
+        end
+
+        # Apply mask
+        and_ptr = Libdl.dlsym(bc.lib_handle, :block_add_band)
+        masked_id = ccall(and_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
+                         bc.fctx_handle, shifted_id, mask_id)
+
+        # Sign extend if field type is signed and smaller than struct size
+        if field_T <: Signed && field_size < struct_size
+            # Sign extend from field_size to struct_size
+            target_type = cranelift_type(field_T)
+            sext_ptr = Libdl.dlsym(bc.lib_handle, :block_add_sextend)
+            return ccall(sext_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
+                          bc.fctx_handle, masked_id, target_type)
+        else
+            return masked_id
+        end
     end
 
     # Case 4: regular mutable struct field — load from memory
@@ -925,6 +1127,9 @@ function emit_memoryrefnew(bc::BuilderCtx, args, ir, stmt_idx)
     memref_val = args[1]
     idx_val = args[2]
 
+    # DEBUG
+    println("[DEBUG memoryrefnew] stmt=$stmt_idx memref_val=$memref_val idx_val=$idx_val")
+
     # Get the MemoryRef's base info from ref_tracking
     tracked = (memref_val isa Core.SSAValue && haskey(bc.ref_tracking, memref_val)) ?
               bc.ref_tracking[memref_val] : nothing
@@ -935,6 +1140,8 @@ function emit_memoryrefnew(bc::BuilderCtx, args, ir, stmt_idx)
              memref_T.parameters[2] : Int64  # param 1=ordering, param 2=T
     elem_size = sizeof(elem_T)
 
+    println("[DEBUG memoryrefnew] tracked: base_id=$base_id base_off=$base_off elem_T=$elem_T elem_size=$elem_size")
+
     # Load data pointer from base + base_off (field ptr_or_offset at offset 0)
     load_ptr = Libdl.dlsym(bc.lib_handle, :block_add_load)
     data_ptr_id = ccall(load_ptr, UInt32, (Ptr{Cvoid}, UInt32, Int32, UInt32),
@@ -942,6 +1149,7 @@ function emit_memoryrefnew(bc::BuilderCtx, args, ir, stmt_idx)
 
     # Compute element offset: (idx - 1) * elem_size
     idx_id = resolve_operand(bc, idx_val, ir)
+    println("[DEBUG memoryrefnew] idx_val=$idx_val -> idx_id=$idx_id")
     one_id = emit_constant(bc, Int64(1))
     sub_ptr = Libdl.dlsym(bc.lib_handle, :block_add_isub)
     idx_0_id = ccall(sub_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
@@ -1008,6 +1216,28 @@ function emit_memoryrefset(bc::BuilderCtx, args, ir)
     return val_id
 end
 
+function emit_memoryrefunset(bc::BuilderCtx, args, ir)
+    # memoryrefunset!(memref::MemoryRef{T}, ordering, boundscheck) → Nothing
+    # Stores zero at the MemoryRef address (GC safety for reference types).
+    memref_val = args[1]
+
+    tracked = (memref_val isa Core.SSAValue && haskey(bc.ref_tracking, memref_val)) ?
+              bc.ref_tracking[memref_val] : nothing
+    tracked === nothing && error("memoryrefunset!: operand not a tracked MemoryRef")
+
+    base_id, base_off, memref_T = tracked
+    elem_T = memref_T isa DataType && length(memref_T.parameters) >= 2 ?
+             memref_T.parameters[2] : Int64
+    elem_type_enum = cranelift_type(elem_T)
+
+    zero_id = emit_constant(bc, Int64(0))
+    store_ptr = Libdl.dlsym(bc.lib_handle, :block_add_store)
+    ccall(store_ptr, Cvoid, (Ptr{Cvoid}, UInt32, Int32, UInt32, UInt32),
+          bc.fctx_handle, base_id, Int32(base_off), zero_id, elem_type_enum)
+
+    return nothing
+end
+
 # === Runtime allocation ===
 
 function _declare_imports(bc::BuilderCtx)
@@ -1020,6 +1250,34 @@ function _declare_imports(bc::BuilderCtx)
     int32_2 = UInt32[TYPE_I32, TYPE_I32]
     ccall(declare_ptr, Cint, (Ptr{Cvoid}, Ptr{UInt8}, UInt32, Ptr{UInt32}, Csize_t),
           bc.builder_handle, "__jl_gc_alloc", TYPE_PTR, int32_2, length(int32_2))
+
+    # Julia-compatible allocation functions
+    # __jl_gc_alloc_julia(type_ptr: *mut u8, data_size: u32) -> *mut u8
+    julia_alloc_args = UInt32[TYPE_PTR, TYPE_I32]
+    ccall(declare_ptr, Cint, (Ptr{Cvoid}, Ptr{UInt8}, UInt32, Ptr{UInt32}, Csize_t),
+          bc.builder_handle, "__jl_gc_alloc_julia", TYPE_PTR, julia_alloc_args, length(julia_alloc_args))
+
+    # __jl_gc_alloc_array_julia(type_ptr: *mut u8, length: i32, elem_size: u32) -> *mut u8
+    julia_array_args = UInt32[TYPE_PTR, TYPE_I32, TYPE_I32]
+    ccall(declare_ptr, Cint, (Ptr{Cvoid}, Ptr{UInt8}, UInt32, Ptr{UInt32}, Csize_t),
+          bc.builder_handle, "__jl_gc_alloc_array_julia", TYPE_PTR, julia_array_args, length(julia_array_args))
+
+    # __jl_array_new_1d(atype: *mut u8, nel: i64) -> *mut u8  (real Julia array)
+    array_new_args = UInt32[TYPE_PTR, TYPE_I64]
+    ccall(declare_ptr, Cint, (Ptr{Cvoid}, Ptr{UInt8}, UInt32, Ptr{UInt32}, Csize_t),
+          bc.builder_handle, "__jl_array_new_1d", TYPE_PTR, array_new_args, length(array_new_args))
+
+    # __jl_string_concat(a: ptr, b: ptr) -> ptr  (real Julia String via jl_alloc_string)
+    str_concat_args = UInt32[TYPE_PTR, TYPE_PTR]
+    ccall(declare_ptr, Cint, (Ptr{Cvoid}, Ptr{UInt8}, UInt32, Ptr{UInt32}, Csize_t),
+          bc.builder_handle, "__jl_string_concat", TYPE_PTR, str_concat_args, length(str_concat_args))
+
+    # Array growth/shrink (real jl_array_grow_end / jl_array_del_end / resize).
+    for fn in ("__jl_array_grow_end", "__jl_array_del_end", "__jl_array_resize")
+        grow_args = UInt32[TYPE_PTR, TYPE_I64]
+        ccall(declare_ptr, Cint, (Ptr{Cvoid}, Ptr{UInt8}, UInt32, Ptr{UInt32}, Csize_t),
+              bc.builder_handle, fn, TYPE_PTR, grow_args, length(grow_args))
+    end
 end
 
 function emit_call_runtime(bc::BuilderCtx, func_name::String, arg_ids::Vector{UInt32})
@@ -1034,7 +1292,7 @@ const ARRAY_TYPE_TAG = UInt32(2)
 const VECTOR_TYPE_TAG = UInt32(3)
 
 function emit_memorynew(bc::BuilderCtx, args, ir)
-    # Core.memorynew(Memory{T}, n) → allocate raw memory
+    # Core.memorynew(Memory{T}, n) → allocate raw memory with Julia-compatible layout
     mem_T = args[1]  # Memory{Int64} DataType
     n = args[2]      # length
 
@@ -1043,17 +1301,24 @@ function emit_memorynew(bc::BuilderCtx, args, ir)
     elem_size = UInt32(sizeof(elem_T))
 
     n_id = resolve_operand(bc, n, ir)
-    # __jl_gc_alloc_array expects i32 — reduce from i64
+    # __jl_gc_alloc_array_julia expects i32 — reduce from i64
     ireduce_ptr = Libdl.dlsym(bc.lib_handle, :block_add_ireduce)
     n32_id = ccall(ireduce_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
                    bc.fctx_handle, n_id, TYPE_I32)
 
-    type_tag_id = emit_constant(bc, Int32(ARRAY_TYPE_TAG))
-    elem_size_id = emit_constant(bc, Int32(elem_size))
+    # Get Julia type pointer for the array type (Vector{T})
+    array_T = Vector{elem_T}
+    type_ptr = pointer_from_objref(array_T)
 
-    # Call __jl_gc_alloc_array(type_tag: u32, length: i32, elem_size: u32) -> *mut u8
-    return emit_call_runtime(bc, "__jl_gc_alloc_array",
-        UInt32[type_tag_id, n32_id, elem_size_id])
+    elem_size_id = emit_constant(bc, Int32(elem_size))
+    type_ptr_id = emit_constant(bc, Int64(reinterpret(UInt64, type_ptr)))
+
+    # Call __jl_gc_alloc_array_julia using the builder's runtime call mechanism
+    # This creates Julia-compatible array layout that can be safely returned to Julia
+    ptr_id = emit_call_runtime(bc, "__jl_gc_alloc_array_julia",
+        UInt32[type_ptr_id, n32_id, elem_size_id])
+
+    return ptr_id
 end
 
 function emit_memoryref_from_mem(bc::BuilderCtx, args, ir, stmt_idx)
@@ -1075,13 +1340,56 @@ function emit_core_tuple(bc::BuilderCtx, args, ir)
     if length(args) == 1
         return resolve_operand(bc, args[1], ir)
     end
-    error("Multi-element tuple not yet supported")
+
+    # Multi-element tuple: allocate and store elements
+    # Calculate tuple layout and size
+    elem_types = [get_operand_type(a, ir) for a in args]
+    elem_types = [t isa Core.Const ? t.val : t for t in elem_types]
+
+    # Calculate offsets for each element (tuple fields are aligned)
+    offsets = Int[]
+    current_offset = 0
+    for ET in elem_types
+        # Align to natural boundary of the type
+        align = sizeof(ET)
+        current_offset = cld(current_offset, align) * align
+        push!(offsets, current_offset)
+        current_offset += sizeof(ET)
+    end
+
+    total_size = current_offset
+
+    # For tuples, we need to allocate a chunk of memory for the elements
+    # Since tuples are immutable and fixed-size, we can use a simple allocation
+    # Allocate memory for tuple elements (using struct allocation)
+
+    # Construct the actual tuple type from element types
+    tuple_type = Tuple{elem_types...}
+    type_ptr = pointer_from_objref(tuple_type)  # Use actual tuple type pointer
+    size_id = emit_constant(bc, Int32(total_size))
+    type_ptr_id = emit_constant(bc, Int64(reinterpret(UInt64, type_ptr)))
+
+    # Call __jl_gc_alloc_julia for the memory (tuples are structs, not arrays)
+    ptr_id = emit_call_runtime(bc, "__jl_gc_alloc_julia",
+        UInt32[type_ptr_id, size_id])
+
+    # Store each element at its calculated offset
+    store_ptr = Libdl.dlsym(bc.lib_handle, :block_add_store)
+    for (i, arg) in enumerate(args)
+        elem_id = resolve_operand(bc, arg, ir)
+        elem_T = elem_types[i]
+        field_type_enum = cranelift_type(elem_T)
+        ccall(store_ptr, Cvoid, (Ptr{Cvoid}, UInt32, Int32, UInt32, UInt32),
+              bc.fctx_handle, ptr_id, Int32(offsets[i]), elem_id, field_type_enum)
+    end
+
+    return ptr_id
 end
 
 const STRUCT_TYPE_TAG = UInt32(1)
 
 function emit_new(bc::BuilderCtx, T, field_args, ir, stmt_idx)
-    # %new(T, fields...) — construct a new struct
+    # %new(T, fields...) — construct a new struct with Julia-compatible allocation
     # T can be: Core.Const, Core.GlobalRef, or direct DataType
     if T isa Core.Const
         T = T.val
@@ -1092,6 +1400,23 @@ function emit_new(bc::BuilderCtx, T, field_args, ir, stmt_idx)
         T = T isa Core.Const ? T.val : T
     end
 
+    # Arrays: allocate a REAL Julia array via jl_alloc_array_1d. The fake struct
+    # layout can't represent a returnable jl_array_t, so hand off to Julia's own
+    # allocator. Subsequent getfield(%new, :ref)/memoryrefset! element stores then
+    # work exactly as they do for arrays passed in from Julia. field_args is
+    # (memref, size_tuple); only the 1-d constant size_tuple is supported here.
+    if T isa DataType && T <: AbstractArray
+        size_arg = field_args[end]
+        if !(size_arg isa Tuple) || length(size_arg) != 1
+            error("emit_new(array): only 1-d arrays with constant size supported, got size $size_arg")
+        end
+        nel = size_arg[1]
+        type_ptr = pointer_from_objref(T)
+        type_ptr_id = emit_constant(bc, Int64(reinterpret(UInt64, type_ptr)))
+        nel_id = emit_constant(bc, Int64(nel))
+        return emit_call_runtime(bc, "__jl_array_new_1d", UInt32[type_ptr_id, nel_id])
+    end
+
     if !(T isa DataType) || !Base.ismutabletype(T)
         error("new only supported for mutable structs, got $T ($(typeof(T)))")
     end
@@ -1099,11 +1424,17 @@ function emit_new(bc::BuilderCtx, T, field_args, ir, stmt_idx)
     # Resolve all field values
     field_ids = UInt32[resolve_operand(bc, fa, ir) for fa in field_args]
 
-    # Allocate: __jl_gc_alloc(type_tag: u32, data_size: u32) -> *mut u8
+    # Get Julia type pointer for Julia-compatible allocation
+    type_ptr = pointer_from_objref(T)
     data_size = UInt32(sizeof(T))
-    type_tag_id = emit_constant(bc, Int32(STRUCT_TYPE_TAG))
+
+    # Allocate using Julia-compatible runtime call
+    # __jl_gc_alloc_julia(type_ptr: *mut u8, data_size: u32) -> *mut u8
+    type_ptr_id = emit_constant(bc, Int64(reinterpret(UInt64, type_ptr)))
     size_id = emit_constant(bc, Int32(data_size))
-    ptr_id = emit_call_runtime(bc, "__jl_gc_alloc", UInt32[type_tag_id, size_id])
+
+    # Use the builder's runtime call mechanism
+    ptr_id = emit_call_runtime(bc, "__jl_gc_alloc_julia", UInt32[type_ptr_id, size_id])
 
     # Store each field at its offset
     field_names = fieldnames(T)

@@ -9,7 +9,8 @@
       "Bash(cargo check *)",
       "WebFetch(domain:docs.rs)",
       "Bash(grep -n \"function emit_globalref\\\\|end$\" /Users/anqur/workspace/experiment-fable-julia-wasm/NativeCodegen/src/builder_emit.jl)",
-      "Bash(grep -n '^end$' /Users/anqur/workspace/experiment-fable-julia-wasm/NativeCodegen/src/builder_emit.jl)"
+      "Bash(grep -n '^end$' /Users/anqur/workspace/experiment-fable-julia-wasm/NativeCodegen/src/builder_emit.jl)",
+      "Bash(nm -D native-backend/target/release/libnative_backend.a)"
     ]
   },
   "enabledPlugins": {}

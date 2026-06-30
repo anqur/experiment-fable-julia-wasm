@@ -2,6 +2,35 @@
 
 const STRING_TYPE_TAG: u32 = 1;
 
+// Julia's own string allocator — produces a real, GC-tracked `jl_string_t` whose
+// layout matches what Julia expects (length@0, inline data@8). Resolves against
+// libjulia at .so load time, same as jl_alloc_array_1d in gc.rs. The legacy
+// __jl_gc_alloc_array-based allocators cannot produce a returnable String.
+extern "C" {
+    fn jl_alloc_string(n: usize) -> *mut u8;
+}
+
+/// Concatenate two Julia Strings into a new real String.
+/// `a`/`b` are String pointers (past the type tag): length (i64) at offset 0,
+/// inline char data at offset 8. jl_alloc_string(n) returns a String of length n
+/// with n+1 bytes (null-terminated); data starts at result+8.
+#[no_mangle]
+pub unsafe extern "C" fn __jl_string_concat(a: *const u8, b: *const u8) -> *mut u8 {
+    if a.is_null() || b.is_null() {
+        return std::ptr::null_mut();
+    }
+    let la = *(a as *const i64) as usize;
+    let lb = *(b as *const i64) as usize;
+    let r = jl_alloc_string(la + lb);
+    if r.is_null() {
+        return std::ptr::null_mut();
+    }
+    // jl_alloc_string sets the length; copy both operands' inline data into r+8.
+    std::ptr::copy_nonoverlapping(a.add(8), r.add(8), la);
+    std::ptr::copy_nonoverlapping(b.add(8), r.add(8 + la), lb);
+    r
+}
+
 /// Create a GC-managed string from UTF-8 bytes.
 #[no_mangle]
 pub unsafe extern "C" fn __jl_string_new(data: *const u8, len: i32) -> *mut u8 {

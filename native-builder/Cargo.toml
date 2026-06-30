@@ -16,7 +16,3 @@ cranelift-native = "0.133"   # For native ISA
 target-lexicon = "0.13"      # Updated to match cranelift 0.133
 libc = "0.2"
 bdwgc-alloc = "0.6.13"       # Keep existing GC
-
-[profile.release]
-lto = true
-opt-level = 3

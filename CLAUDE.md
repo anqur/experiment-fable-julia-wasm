@@ -32,17 +32,31 @@ instead of serializing/parsing CLIF text.
   wasm-specific work). Use descriptive names (e.g. `debug_struct_ir.jl`,
   `test_new_feature.jl`). Tests that are part of the permanent suite go in
   `test_edsl_approach.jl` or a new `test_*.jl` file.
-- **Rust `cargo test` is not wired yet.** Verify Rust changes via
-  `cargo build --release` then run Julia-side tests.
+- **Rust `cargo test` is not wired yet.** Verify Rust changes via `cargo build`
+  then run Julia-side tests.
 
 ## Build & test (native target)
 
-```bash
-# Build Rust components (two crates)
-cd native-backend && cargo build --release && cd ..    # runtime static lib (.a)
-cd native-builder && cargo build --release && cd ..    # eDSL builder (.so/dylib)
+**Use the dev profile (`cargo build`) for local development** — it's ~250×
+faster to rebuild incrementally (~0.3s vs ~60s). Release (`cargo build --release`)
+is only needed for runtime-performance measurements. Both crates set
+`lto = true` + `opt-level = 3` in `[profile.release]`, which is what makes
+release slow; `[profile.dev]` disables `debug-assertions` (needed because
+cranelift-frontend asserts the FunctionBuilderContext is empty on each
+`FunctionBuilder::new`, which our transient-builder-per-FFI-call pattern trips
+— the codegen itself is correct, as the test suite confirms).
 
-# Run eDSL pipeline test (28 tests)
+The Julia loader auto-selects the **newest** built artifact by mtime across
+`target/release` and `target/debug` (see `_newest_artifact` in
+`NativeCodegen.jl`), so whichever profile you built most recently is what runs.
+
+```bash
+# Build Rust components (two crates) — DEV profile, fast local iteration
+cd native-backend && cargo build && cd ..    # runtime static lib (.a)
+cd native-builder && cargo build && cd ..    # eDSL builder (.so/dylib)
+# (For optimized runtime perf only: add --release — expect ~1 min/crate.)
+
+# Run eDSL pipeline test (41 tests)
 julia +nightly --project=. NativeCodegen/test/test_edsl_approach.jl
 
 # Explore IR patterns (read-only inspection)
@@ -114,7 +128,8 @@ etc. with loop-based equivalents.
 | `native-builder/src/linker.rs` | Invokes Julia's lld: `lld -flavor ld.lld -shared -o out.so in.o libnative_backend.a` |
 | `native-builder/src/lib.rs` | FFI entry points: `create_builder`, `builder_add_function`, `builder_declare_import`, all `block_add_*` instruction emitters, `builder_finalize`, `link_object_to_so`. |
 | `native-builder/src/runtime.rs` | Runtime stubs (linked via native-backend.a) |
-| `native-backend/src/runtime/gc.rs` | Boehm GC (`bdwgc-alloc`), `GCHeader`, `__jl_gc_alloc`, `__jl_gc_alloc_array`, `__jl_gc_array_len`, `__jl_gc_type_tag`, `__jl_array_elem_ptr/get/set` |
+| `native-backend/src/runtime/gc.rs` | Boehm GC (`bdwgc-alloc`), `GCHeader`, `__jl_gc_alloc`, `__jl_gc_alloc_array`, `__jl_gc_array_len`, `__jl_gc_type_tag`, `__jl_array_elem_ptr/get/set`, **`__jl_gc_alloc_julia`** (Julia-compatible struct/tuple alloc), **`__jl_array_new_1d`** (real `jl_alloc_array_1d` wrapper), **`__jl_array_grow_end`/`__jl_array_del_end`/`__jl_array_resize`** (real `jl_array_grow_end`/`del_end` wrappers for resize!) |
+| `native-backend/src/runtime/strings.rs` | **`__jl_string_concat`** (real `jl_alloc_string` wrapper for `a*b`); legacy `__jl_string_new`/`_len`/`_get`/`_set` (old header — deprecated, not used for returnable strings) |
 
 ### Key Julia object layouts (known from empirical exploration)
 
@@ -155,7 +170,10 @@ for direct memory access (no runtime calls needed):
 - ✅ Loops (while, gcd with swapping)
 - ✅ SSA value tracking — `BuilderCtx` with `ssa_values`, `arg_values`
 - ✅ `native_callable_from_so` — load compiled .so and call entry function
-- ✅ String operations — ncodeunits, codeunit, sizeof, isempty (via direct load from String layout)
+- ✅ String operations — read ops (ncodeunits, codeunit, sizeof, isempty) via direct
+  load from String layout; **concatenation** (`a*b`, `a*b*c`, …) via `invoke Base._string`
+  / `invoke *` → left-fold of `__jl_string_concat` (real `jl_alloc_string` String);
+  **string-literal return** (`return "hi"`) via `pointer_from_objref` constant
 - ✅ Mutable struct getfield/setfield! — load/store at `fieldoffset` (nested access works)
 - ✅ Array length — `length(a)` via bitstype getfield from Vector layout
 - ✅ Array element read/write — pointerref/pointerset (unsafe_load/store)
@@ -167,9 +185,29 @@ for direct memory access (no runtime calls needed):
 - ✅ Runtime GC functions: `__jl_gc_alloc`, `__jl_gc_alloc_array`, array helpers
 - ✅ Struct allocation (`:new`) — works for internal use within compiled functions
 - ✅ Array allocation (`:memorynew`) — works for internal use within compiled functions
-- 🚧 Returning allocated objects to Julia — Boehm-GC-allocated memory lacks Julia object headers
-- 🚧 Bitstype struct getfield with offset≠0 — NYI (need shift/extract)
-- 🚧 Multi-element tuples — NYI (single-element passes through)
+- ✅ **Returning allocated objects to Julia** — mutable structs, tuples, AND fresh
+  arrays (`Vector{T}`) round-trip through `unsafe_pointer_to_objref`. Structs/tuples
+  use `__jl_gc_alloc_julia` (Julia-compatible `jl_value_t` header = type ptr + fields);
+  arrays use Julia's own `jl_alloc_array_1d` (a *real* `jl_array_t`).
+- ✅ Multi-field bitstype getfield with offset≠0 — shift/mask extraction
+- ✅ Multi-element tuples — allocated via `__jl_gc_alloc_julia` with the real tuple
+  type pointer; constant tuples in returns lower to `emit_core_tuple`
+- ✅ Dynamic indexing of constant tuples (`getfield((1,2,3,4), i)`) — select chain
+  (`block_add_select`); enables array literals `T[a,b,c,d]`
+- ✅ Phi nodes with undef edges (loop-carried values on bounds-check escape paths)
+  — zero-placeholder args keep jump arg counts aligned with block params
+- ✅ `arraysize`/`size(arr, dim)` — via `getfield(getfield(arr, :size), dim)`
+- ✅ **Array growth/shrink** — `resize!(a, n)` (grow + shrink) via
+  `__jl_array_resize` → `jl_array_grow_end`/`jl_array_del_end`; **`push!(a, x)`**
+  via `invoke Base._growend_internal!(a, 1, oldsize)` → `__jl_array_grow_end`;
+  `memoryrefoffset` emitted as constant from `ref_tracking.byte_offset / elem_size + 1`.
+- 🔄 **`pop!(a)` in progress** — `Core.memoryrefunset!` handler added (stores zero
+  for GC safety); `Base.throw` emits trap; terminator-after-trap skipping added.
+  Debug prints active in `emit_memoryrefnew`. Issue: returns `a[end-1]` instead of
+  `a[end]` when combined with `resize!` — root cause under investigation (suspect
+  cross-block SSA value resolution or block ordering).
+- ⏸️ `append!` deferred (needs `invoke unsafe_copyto!` bulk copy between MemoryRefs).
+- ✅ `compile_and_call` supports 0–2 args (was 0–1)
 
 ### Bridge type dispatch
 
@@ -177,9 +215,16 @@ for direct memory access (no runtime calls needed):
 - `_is_i64(T)`: `scalar_repr(T).bits == 64 && !isfloat`
 - `_is_f64(T)`: `scalar_repr(T).isfloat && bits == 64`
 - `_is_f32(T)`: `scalar_repr(T).isfloat && bits == 32`
-- `_is_ptr_type(T)`: mutable struct → passed as `Ptr{Cvoid}` via `pointer_from_objref`
-- Return types: `_ret()` handles `Float64` (reinterpret), `Float32` (reinterpret),
-  `Bool` (from_wire), `Ptr{Cvoid}`, and default `from_wire`
+- `_is_ptr_type(T)`: mutable struct, `String`, or `T <: Tuple` → passed/returned as
+  `Ptr{Cvoid}` via `pointer_from_objref` (then `unsafe_pointer_to_objref` on return)
+- Return types: `_call0()`/`_ret()` handle pointer (`unsafe_pointer_to_objref`),
+  `Float64`/`Float32` (reinterpret), `Bool` (from_wire), and default `from_wire`
+- `_norm_nargs(argtypes)`: treats a single `Tuple{}` argtype as "no arguments", so
+  callers can pass `argtypes = Tuple{}` uniformly (matches `compile_and_call`)
+- `compile_and_call(f, rettype, argtypes::Type{<:Tuple}, args...)`: one-shot helper
+  supporting 0–2 args with automatic pointer↔object conversion (note: index arg
+  types via `argtypes.parameters[i]`, NOT `argtypes[i]` — the latter is Julia's
+  type-array literal syntax)
 - Also `native_callable_from_so` for loading pre-linked .so files (bypasses Rust ccalls)
 
 ### Key eDSL conventions (builder_emit.jl ↔ native-builder)
@@ -196,52 +241,57 @@ for direct memory access (no runtime calls needed):
 
 ### Known limitations & workarounds
 
-1. **Cranelift ObjectModule `call` FIXED** — Added `is_pic = true` to the Cranelift
+1. **✅ RESOLVED: Allocated objects can be returned to Julia.** Mutable structs and
+   tuples are allocated via `__jl_gc_alloc_julia(type_ptr, sizeof(T))` — a
+   Julia-compatible `jl_value_t` (header = the datatype pointer, then fields at
+   `fieldoffset`). Arrays are allocated via `__jl_array_new_1d(type_ptr, nel)`,
+   which wraps Julia's own `jl_alloc_array_1d` so the result is a *real* GC-tracked
+   `jl_array_t` (the fake `[type_ptr][len][data]` layout from `__jl_gc_alloc_array_julia`
+   cannot match `jl_array_t` and would mis-index). `jl_alloc_array_1d` resolves
+   against libjulia at `.so` load time. The `:new(Vector{T}, memref, (n,))` IR
+   pattern is intercepted in `emit_new` (the memref arg is ignored; the real
+   allocator determines layout). Element writes then flow through the existing
+   `getfield(arr, :ref)`/`memoryrefset!` pipeline, exactly as for passed-in arrays.
+   Note: `__jl_gc_alloc` / `__jl_gc_alloc_array` (legacy Boehm-header allocators)
+   still exist but are NOT used for returnable objects.
+
+2. **Cranelift ObjectModule `call` FIXED** — Added `is_pic = true` to the Cranelift
    flags builder and `use cranelift_codegen::settings::Configurable` import. On
    ARM64 macOS, PIC is mandatory — without it, absolute relocations (`ARM64_RELOC_UNSIGNED`)
    are emitted in the literal pool, which dyld refuses to write to read-only `.text`
    pages. With `is_pic = true`, Cranelift emits proper GOT-based access via
    `adrp` + `add` + `blr`, producing `ARM64_RELOC_GOT_LOAD_PAGE21` /
-   `ARM64_RELOC_GOT_LOAD_PAGEOFF12` relocations. Also tried `Linkage::Preemptible`
-   but `Linkage::Import` works fine with PIC enabled.
+   `ARM64_RELOC_GOT_LOAD_PAGEOFF12` relocations.
 
-2. **Allocated objects can't be returned to Julia** — `emit_new` and `emit_memorynew`
-   call `__jl_gc_alloc` / `__jl_gc_alloc_array` via the now-fixed call mechanism.
-   Allocation, field stores, and field loads all work correctly within compiled
-   functions. However, the returned pointer **cannot** be passed to Julia's
-   `unsafe_pointer_to_objref` — it crashes with:
-   ```
-   signal 11: Segmentation fault
-   typekeyvalue_hash → lookup_typevalue → lookup_arg_type_tuple → jl_lookup_generic_
-   ```
-   **Why**: `__jl_gc_alloc` allocates via Boehm GC (`bdwgc-alloc`) with a custom
-   `GCHeader { type_tag, flags, length }` prepended. Julia's `unsafe_pointer_to_objref`
-   expects the pointer to point to a `jl_value_t` with Julia's internal type tag
-   (a `jl_datatype_t*`). Boehm's header has no Julia type tag, so Julia's type
-   system dereferences garbage and crashes in `typekeyvalue_hash`.
-   
-   **Verified working**: raw `ccall` returns a valid non-null pointer; storing and
-   loading fields at `fieldoffset` offsets works correctly.
-   
-   **Workaround**: Pre-allocate mutable structs/arrays in Julia, pass them as
-   `Ptr{Cvoid}` arguments to compiled functions, use `getfield`/`setfield!` or
-   pointer ops to read/write. This is how all 28 existing tests work.
+3. **✅ RESOLVED: Bitstype multi-field structs** — `cranelift_type()` returns a
+   scalar type by sizeof, but multi-field bitstypes now extract fields via
+   shift/mask (`block_add_ushr` + `block_add_band`, sign-extend if signed).
 
-3. **Bitstype multi-field structs** — `cranelift_type()` returns a scalar type by
-   sizeof, but multi-field bitstypes need field extraction (ireduce/ishift).
-   Currently only single-field bitstypes at offset 0 work (value IS the field).
+4. **✅ RESOLVED: Multi-element tuples** — allocated via `__jl_gc_alloc_julia`
+   with `pointer_from_objref(Tuple{types...})`; constant tuples in returns lower
+   to `emit_core_tuple`. Tuples are treated as pointer types (`cranelift_type`,
+   `_is_ptr_type`, `is_ptr_type` all special-case `T <: Tuple`).
 
-4. **Julia nightly required** — `InferenceCache` is only in nightly.
+5. **Julia nightly required** — `InferenceCache` is only in nightly.
 
-5. **`native-backend` is `staticlib`** — produces `.a`. Do NOT change to
+6. **`native-backend` is `staticlib`** — produces `.a`. Do NOT change to
    `cdylib`; the linker embeds it into the final `.so`.
 
-6. **CLIF text format is DEAD CODE**. The old `clif_emit.jl` has been removed.
+7. **CLIF text format is DEAD CODE**. The old `clif_emit.jl` has been removed.
    Do not add CLIF text generation — use the eDSL builder API instead.
 
-7. **Unknown invoke sentinel** — unsupported `:invoke` calls emit constant 0
+8. **Unknown invoke sentinel** — unsupported `:invoke` calls emit constant 0
    instead of erroring. This allows functions with dead branches
-   (e.g. bounds-check error paths) to compile.
+   (e.g. bounds-check error paths) to compile. (Handled invokes: `ncodeunits`,
+   `codeunit`, `sizeof`, `isempty`, and string concat `:*`/`Base._string`.)
+
+9. **String ops — what's deferred** — String **read** ops + **concatenation** +
+   **literal return** work. NOT yet supported: mixed-type `string(n)` (lowers to
+   `invoke Base.print_to_string` / generated `Base.var"#string#N"` — needs
+   integer-to-decimal formatting), `String(bytes::Vector{UInt8})` (lowers to
+   `invoke WasmCodegen._memory_to_string` — needs Memory-pipeline data-ptr
+   extraction), and string mutation / UTF-8 character indexing (byte/codeunit
+   access works).
 
 ### Invoke vs Call dispatch
 

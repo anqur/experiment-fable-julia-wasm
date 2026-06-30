@@ -24,6 +24,26 @@ function run(name, f, argtypes, args, expected)
     end
 end
 
+# Like `run`, but via the one-shot compile_and_call — needed for tests that
+# return GC objects (Strings, structs, arrays) with 1+ args, since
+# native_callable_from_so's multi-arg return path still yields a raw Ptr.
+function run_cc(name, f, argtypes, args, expected)
+    print("  $name ... ")
+    try
+        r = compile_and_call(f, expected isa Nothing ? Nothing : typeof(expected), argtypes, args...)
+        if r == expected
+            println("✅ $r")
+            return true
+        else
+            println("❌ got $r, expected $expected")
+            return false
+        end
+    catch e
+        println("❌ $e")
+        return false
+    end
+end
+
 println("=== Arithmetic ===")
 a64_add(a::Int64,b::Int64)=a+b ; run("add64",a64_add,Tuple{Int64,Int64},(Int64(5),Int64(3)),8)
 a64_sub(a::Int64,b::Int64)=a-b ; run("sub64",a64_sub,Tuple{Int64,Int64},(Int64(10),Int64(3)),7)
@@ -73,4 +93,80 @@ ar_len(a::Vector{Int64})=length(a) ; run("alen4",ar_len,Tuple{Vector{Int64}},(In
 ar_get(a::Vector{Int64},i::Int64)=(p=pointer(a); unsafe_load(p,i)) ; run("aget",ar_get,Tuple{Vector{Int64},Int64},(Int64[10,20,30,40],Int64(3)),30)
 ar_set(a::Vector{Int64},v::Int64)=(p=pointer(a); unsafe_store!(p,v,Int64(1)); unsafe_load(p,Int64(1))) ; run("aset",ar_set,Tuple{Vector{Int64},Int64},(Int64[0,0,0,0],Int64(99)),99)
 ar_inb_get(a::Vector{Int64},i::Int64)=(@inbounds r=a[i]; r) ; run("inb2",ar_inb_get,Tuple{Vector{Int64},Int64},(Int64[10,20,30,40],Int64(2)),20)
+
+println("\n=== Object Return ===")
+# Mutable struct allocation + return to Julia (mutable structs compare by
+# identity, so check fields explicitly rather than via the generic `run`).
+mkpoint()::Point = Point(42, 99)
+print("  mkpoint ... ")
+try
+    comp = compile_native(mkpoint, Tuple{}; name="mkpoint")
+    r = native_callable_from_so(comp, Point)()
+    ok = r isa Point && r.x == 42 && r.y == 99
+    println("$(ok ? "✅" : "❌") Point($(r.x), $(r.y))")
+    rm(comp.so_path)
+catch e
+    println("❌ $e")
+end
+# Multi-element tuple return (value equality, so `run` works).
+mktuple() = (7, 8) ; run("mktuple", mktuple, Tuple{}, (), (7, 8))
+
+println("\n=== Array Return ===")
+# Fresh array allocation + return — a *real* Julia array via jl_alloc_array_1d.
+mkarray()::Vector{Int64} = Int64[1, 2, 3, 4] ; run("mkarr", mkarray, Tuple{}, (), [1, 2, 3, 4])
+# Computed fill (loop writing i*i) + return — exercises the loop CFG + allocator.
+function mksquares()::Vector{Int64}
+    a = Vector{Int64}(undef, 5)
+    for i in 1:5; a[i] = i * i; end
+    a
+end
+run("squares", mksquares, Tuple{}, (), [1, 4, 9, 16, 25])
+# arraysize intrinsic on a passed-in array.
+ar_size(a::Vector{Int64}) = size(a, 1) ; run("arsz3", ar_size, Tuple{Vector{Int64}}, (Int64[10,20,30],), 3)
+
+println("\n=== Strings (concat/return) ===")
+# String concatenation (a*b → invoke Base._string; literal-literal → invoke *).
+sc_cat2(a::String,b::String) = a * b ; run_cc("scat2", sc_cat2, Tuple{String,String}, ("foo","bar"), "foobar")
+# 3-way concat via left-fold (2 args + literal).
+sc_cat3(a::String,b::String) = a * b * "!" ; run_cc("scat3", sc_cat3, Tuple{String,String}, ("ab","cd"), "abcd!")
+# String literal return.
+sc_mkstr() = "hello" ; run_cc("smkstr", sc_mkstr, Tuple{}, (), "hello")
+# Literal-literal concat (inference may constant-fold; both paths handled).
+sc_greet() = "Hello, " * "World!" ; run_cc("sgreet", sc_greet, Tuple{}, (), "Hello, World!")
+
+println("\n=== Array Growth (resize!) ===")
+# resize! shrink: [1,2,3,4] -> [1,2].
+ag_shrink(a::Vector{Int64}) = (resize!(a, 2); a) ; run_cc("ashrk", ag_shrink, Tuple{Vector{Int64}}, (Int64[1,2,3,4],), [1,2])
+# Build an array dynamically by growing + filling (the headline growth case).
+function ag_build(n::Int64)::Vector{Int64}
+    a = Vector{Int64}(undef, 0)
+    for i in 1:n; resize!(a, i); a[i] = i*i; end
+    a
+end
+run_cc("abuild", ag_build, Tuple{Int64}, (5,), [1,4,9,16,25])
+# resize! grow: length grows, original elements preserved (new slots are undef,
+# so check length + first elements explicitly rather than full-array equality).
+ag_grow(a::Vector{Int64}, n::Int64) = (resize!(a, n); a)
+print("  agrow ... ")
+try
+    global ag_grow
+    r = compile_and_call(ag_grow, Vector{Int64}, Tuple{Vector{Int64},Int64}, Int64[1,2], 4)
+    ok = length(r) == 4 && r[1] == 1 && r[2] == 2
+    println("$(ok ? "✅" : "❌") length=$(length(r)) first_two=[$(r[1]),$(r[2])]")
+catch e
+    println("❌ $e")
+end
+
+println("\n=== push! ===")
+# push! mutates in place: [1,2] + push!(9) → length 3, last element 9.
+pushone(a::Vector{Int64}, x::Int64) = (push!(a, x); a)
+run_cc("pushone", pushone, Tuple{Vector{Int64},Int64}, (Int64[1,2], Int64(9)), [1,2,9])
+# Build by pushing in a loop: empty alloc + grow loop + return.
+function buildpush(n::Int64)::Vector{Int64}
+    a = Int64[]
+    for i in 1:n; push!(a, i*i); end
+    a
+end
+run_cc("bldpush", buildpush, Tuple{Int64}, (5,), [1,4,9,16,25])
+
 println("\n=== Done ===")

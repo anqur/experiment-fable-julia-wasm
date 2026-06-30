@@ -151,6 +151,8 @@ impl FunctionCtx {
     // --- Comparisons ---
     pub fn emit_icmp(&mut self, cond: IntCC, l: u32, r: u32) -> u32 { let (lv, rv) = (self.ssa(l), self.ssa(r)); self.emit(|fb| fb.ins().icmp(cond, lv, rv)) }
     pub fn emit_fcmp(&mut self, cond: FloatCC, l: u32, r: u32) -> u32 { let (lv, rv) = (self.ssa(l), self.ssa(r)); self.emit(|fb| fb.ins().fcmp(cond, lv, rv)) }
+    // select(cond, then, else): returns `then` when cond (a b1 from icmp) is true.
+    pub fn emit_select(&mut self, cond: u32, t: u32, e: u32) -> u32 { let (cv, tv, ev) = (self.ssa(cond), self.ssa(t), self.ssa(e)); self.emit(|fb| fb.ins().select(cv, tv, ev)) }
 
     // --- Bitwise ---
     pub fn emit_band(&mut self, l: u32, r: u32) -> u32 { let (lv, rv) = (self.ssa(l), self.ssa(r)); self.emit(|fb| fb.ins().band(lv, rv)) }

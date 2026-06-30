@@ -16,8 +16,10 @@ compiles to native machine code via the `native-backend` Rust crate.
 # From the monorepo root
 cd experiment-fable-julia-wasm
 
-# Build the Rust backend first
+# Build the two Rust crates (dev profile — fast ~0.3s incremental rebuilds;
+# release adds --release but is ~1 min/crate). The loader auto-picks the newest.
 cd native-backend && cargo build && cd ..
+cd native-builder && cargo build && cd ..
 
 # Julia uses the top-level Project.toml which has [sources] for all local packages
 julia +nightly --project=.

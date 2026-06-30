@@ -147,6 +147,7 @@ ffi_convert!(block_add_ireduce, emit_ireduce);
 
 #[no_mangle] pub extern "C" fn block_add_icmp(fctx: *mut FunctionCtx, c: u32, l: u32, r: u32) -> u32 { if fctx.is_null() { 0 } else { let cc = map_icmp_cond(c); unsafe { (*fctx).emit_icmp(cc, l, r) } } }
 #[no_mangle] pub extern "C" fn block_add_fcmp(fctx: *mut FunctionCtx, c: u32, l: u32, r: u32) -> u32 { if fctx.is_null() { 0 } else { let cc = map_fcmp_cond(c); unsafe { (*fctx).emit_fcmp(cc, l, r) } } }
+#[no_mangle] pub extern "C" fn block_add_select(fctx: *mut FunctionCtx, cond: u32, t: u32, e: u32) -> u32 { if fctx.is_null() { 0 } else { unsafe { (*fctx).emit_select(cond, t, e) } } }
 
 #[no_mangle] pub extern "C" fn block_add_load(fctx: *mut FunctionCtx, ptr: u32, off: i32, ty: u32) -> u32 { if fctx.is_null() { 0 } else { unsafe { (*fctx).emit_load(ptr, off, ty) } } }
 #[no_mangle] pub extern "C" fn block_add_store(fctx: *mut FunctionCtx, ptr: u32, off: i32, val: u32, ty: u32) { if !fctx.is_null() { unsafe { (*fctx).emit_store(ptr, off, val, ty) } } }
