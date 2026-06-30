@@ -79,6 +79,11 @@ mutable struct BuilderCtx
     # Used when getfield loads a non-loadable type like MemoryRef — subsequent
     # getfield on that SSA value recomposes the full offset from the base pointer.
     ref_tracking::Dict{Core.SSAValue, Tuple{UInt32, Int, DataType}}
+    # checked-arithmetic pairs: stmt_idx → (value_id, flag_id). A single
+    # checked_{s,u}{add,sub,mul}_int IR stmt materializes TWO value ids (the
+    # unchecked result + the overflow flag); getfield(pair, 1/2) reads them.
+    # Mirrors WasmCodegen's `ssapair` mechanism (compiler.jl).
+    ssa_pairs::Dict{Int, Tuple{UInt32, UInt32}}
 end
 
 function BuilderCtx(lib_path::String)
@@ -90,7 +95,8 @@ function BuilderCtx(lib_path::String)
                Dict{Core.Argument, UInt32}(),
                Dict{Any, UInt32}(),
                Dict{Int, String}(), nothing,
-               Dict{Core.SSAValue, Tuple{UInt32, Int, DataType}}())
+               Dict{Core.SSAValue, Tuple{UInt32, Int, DataType}}(),
+               Dict{Int, Tuple{UInt32, UInt32}}())
 end
 
 function free_builder(bc::BuilderCtx)
@@ -466,6 +472,18 @@ end
 # === Intrinsic emission ===
 
 function emit_intrinsic(bc::BuilderCtx, f::Core.IntrinsicFunction, args, ir, stmt_idx)
+    # checked {add,sub,mul}: return (value, overflowed::Bool) — materialized as a
+    # pair of value ids (see emit_checked_pair); returns nothing so the call's
+    # SSA slot is NOT recorded in ssa_values (consumed via getfield(pair, k)).
+    # Identified by identity (===) because jl_intrinsic_name returns "invalid"
+    # for these newer intrinsics — they're missing from that C table.
+    f === Core.Intrinsics.checked_sadd_int && return emit_checked_pair(bc, :add, true,  args, ir, stmt_idx)
+    f === Core.Intrinsics.checked_uadd_int && return emit_checked_pair(bc, :add, false, args, ir, stmt_idx)
+    f === Core.Intrinsics.checked_ssub_int && return emit_checked_pair(bc, :sub, true,  args, ir, stmt_idx)
+    f === Core.Intrinsics.checked_usub_int && return emit_checked_pair(bc, :sub, false, args, ir, stmt_idx)
+    f === Core.Intrinsics.checked_smul_int && return emit_checked_pair(bc, :mul, true,  args, ir, stmt_idx)
+    f === Core.Intrinsics.checked_umul_int && return emit_checked_pair(bc, :mul, false, args, ir, stmt_idx)
+
     # Map intrinsic to Rust FFI call
     fn_name = ccall(:jl_intrinsic_name, Ptr{UInt8}, (Any,), f)
     fn_sym = unsafe_string(fn_name) |> Symbol
@@ -665,6 +683,107 @@ function emit_flipsign_int(bc::BuilderCtx, args, ir)
                  bc.fctx_handle, xors_id, s_id)
 end
 
+# --- checked-arithmetic overflow pairs (Item 5) ------------------------------
+# checked_{s,u}{add,sub,mul}_int return (value, overflowed::Bool): a single IR
+# stmt materialized into TWO value ids (value + flag), later read by
+# getfield(pair, 1/2). We store both in bc.ssa_pairs[stmt_idx] and return
+# nothing so emit_instruction does NOT record the call's SSA slot in ssa_values.
+# Mirrors WasmCodegen's `ssapair` mechanism (compiler.jl). Cranelift 0.133 has
+# no native overflow opcode, so overflow is detected branch-free and trap-free
+# via the comparison formulation (Lifted from WasmCodegen intrinsics.jl; the
+# signed-mul trap case is sidestepped with a "safe divisor" + select instead of
+# if/else, since SSA select evaluates both arms — the guarded sdiv never traps).
+# Only full-word widths (sizeof ∈ {4,8}) are supported; sub-word needs
+# width-aware renormalization and throws CompileError (loud failure).
+
+# value-id binop / icmp / select helpers (operands already resolved to ids)
+_binop_id(bc, sym, l_id, r_id) =
+    ccall(Libdl.dlsym(bc.lib_handle, sym), UInt32,
+          (Ptr{Cvoid}, UInt32, UInt32), bc.fctx_handle, l_id, r_id)
+
+function _icmp_id(bc, cond, l_id, r_id)
+    r = ccall(Libdl.dlsym(bc.lib_handle, :block_add_icmp), UInt32,
+              (Ptr{Cvoid}, UInt32, UInt32, UInt32), bc.fctx_handle, cond, l_id, r_id)
+    # icmp yields i8; widen to i32 for Bool-domain use (matches emit_icmp).
+    ccall(Libdl.dlsym(bc.lib_handle, :block_add_uextend), UInt32,
+          (Ptr{Cvoid}, UInt32, UInt32), bc.fctx_handle, r, TYPE_I32)
+end
+
+_select_id(bc, cond_id, t_id, e_id) =
+    ccall(Libdl.dlsym(bc.lib_handle, :block_add_select), UInt32,
+          (Ptr{Cvoid}, UInt32, UInt32, UInt32), bc.fctx_handle, cond_id, t_id, e_id)
+
+# Value element type of a checked pair: Tuple{Tvalue, Bool} from the stmt type,
+# falling back to the operand's inferred type.
+function _checked_value_type(ir, stmt_idx, arg1)
+    TT = ir.stmts[stmt_idx][:type]
+    if TT isa DataType && TT <: Tuple && length(TT.parameters) == 2
+        return TT.parameters[1]
+    end
+    T = get_operand_type(arg1, ir)
+    return T isa Core.Const ? T.val : T
+end
+
+function emit_checked_pair(bc::BuilderCtx, kind::Symbol, signed::Bool, args, ir, stmt_idx)
+    a = resolve_operand(bc, args[1], ir)
+    b = resolve_operand(bc, args[2], ir)
+    val_T = _checked_value_type(ir, stmt_idx, args[1])
+    sz = sizeof(val_T)
+    (sz == 4 || sz == 8) ||
+        throw(CompileError("checked arithmetic on $val_T (sub-word) not yet supported"))
+
+    if kind === :add
+        value = _binop_id(bc, :block_add_iadd, a, b)
+        if signed   # overflow ⟺ ((r ⊻ a) & (r ⊻ b)) < 0  (sign of result differs from both)
+            t1 = _binop_id(bc, :block_add_bxor, value, a)
+            t2 = _binop_id(bc, :block_add_bxor, value, b)
+            t3 = _binop_id(bc, :block_add_band, t1, t2)
+            flag = _icmp_id(bc, ICMP_SLT, t3, emit_constant(bc, val_T(0)))
+        else        # overflow ⟺ r <u a
+            flag = _icmp_id(bc, ICMP_ULT, value, a)
+        end
+    elseif kind === :sub
+        value = _binop_id(bc, :block_add_isub, a, b)
+        if signed   # overflow ⟺ ((a ⊻ b) & (a ⊻ r)) < 0  (sign of r differs from a)
+            t1 = _binop_id(bc, :block_add_bxor, a, b)
+            t2 = _binop_id(bc, :block_add_bxor, a, value)
+            t3 = _binop_id(bc, :block_add_band, t1, t2)
+            flag = _icmp_id(bc, ICMP_SLT, t3, emit_constant(bc, val_T(0)))
+        else        # overflow ⟺ a <u b  (borrow)
+            flag = _icmp_id(bc, ICMP_ULT, a, b)
+        end
+    else  # kind === :mul — trap-free division check via a "safe" divisor
+        value  = _binop_id(bc, :block_add_imul, a, b)
+        i32z   = emit_constant(bc, Int32(0))     # Bool-domain false
+        one    = emit_constant(bc, val_T(1))
+        is_zero = _icmp_id(bc, ICMP_EQ, a, emit_constant(bc, val_T(0)))
+        if signed
+            # a==0  → no overflow; a==-1 → overflow iff b==typemin (the /-1 trap
+            # case); else overflow iff (sdiv(r, a) != b). The divisor is made
+            # safe (1 when a∈{0,-1}, else a) so sdiv never traps at runtime.
+            neg1   = emit_constant(bc, val_T(-1))
+            tmin   = emit_constant(bc, typemin(val_T))
+            is_m1  = _icmp_id(bc, ICMP_EQ, a, neg1)
+            disj   = _binop_id(bc, :block_add_bor, is_zero, is_m1)
+            safe_a = _select_id(bc, disj, one, a)
+            quot   = _binop_id(bc, :block_add_sdiv, value, safe_a)
+            fdiv   = _icmp_id(bc, ICMP_NE, quot, b)
+            fm1    = _icmp_id(bc, ICMP_EQ, b, tmin)
+            inner  = _select_id(bc, is_m1, fm1, fdiv)
+            flag   = _select_id(bc, is_zero, i32z, inner)
+        else
+            # a==0 → no overflow; else overflow iff (udiv(r, a) != b).
+            safe_a = _select_id(bc, is_zero, one, a)
+            quot   = _binop_id(bc, :block_add_udiv, value, safe_a)
+            fdiv   = _icmp_id(bc, ICMP_NE, quot, b)
+            flag   = _select_id(bc, is_zero, i32z, fdiv)
+        end
+    end
+
+    bc.ssa_pairs[stmt_idx] = (value, flag)
+    return nothing   # signal emit_instruction to skip the ssa_values recording
+end
+
 # === Invoke handling (overlay method calls) ===
 
 function emit_invoke(bc::BuilderCtx, invoke_target, f, args, ir, stmt_idx)
@@ -777,6 +896,14 @@ function emit_globalref(bc::BuilderCtx, f::Core.GlobalRef, args, ir, stmt_idx)
     if fn == :srem_int || fn == :checked_srem_int ; return emit_binop(bc, :block_add_srem, args, ir) end
     if fn == :urem_int ; return emit_binop(bc, :block_add_urem, args, ir) end
     if fn == :checked_sdiv_int ; return emit_binop(bc, :block_add_sdiv, args, ir) end
+    # checked {add,sub,mul} as GlobalRef (dual dispatch with emit_intrinsic):
+    # return (value, overflowed::Bool) — materialized as a value-id pair.
+    if fn == :checked_sadd_int ; return emit_checked_pair(bc, :add, true,  args, ir, stmt_idx) end
+    if fn == :checked_uadd_int ; return emit_checked_pair(bc, :add, false, args, ir, stmt_idx) end
+    if fn == :checked_ssub_int ; return emit_checked_pair(bc, :sub, true,  args, ir, stmt_idx) end
+    if fn == :checked_usub_int ; return emit_checked_pair(bc, :sub, false, args, ir, stmt_idx) end
+    if fn == :checked_smul_int ; return emit_checked_pair(bc, :mul, true,  args, ir, stmt_idx) end
+    if fn == :checked_umul_int ; return emit_checked_pair(bc, :mul, false, args, ir, stmt_idx) end
 
     # === Integer comparisons ===
     if fn == :eq_int || fn === Symbol("===") ; return emit_icmp(bc, ICMP_EQ, args, ir) end
@@ -973,6 +1100,15 @@ end
 
 function emit_struct_getfield(bc::BuilderCtx, args, ir, stmt_idx)
     obj = args[1]
+    # checked-arithmetic pair: getfield(pair, 1)=value, getfield(pair, 2)=flag.
+    # The pair stmt stored two value ids in bc.ssa_pairs (no tuple allocation).
+    if obj isa Core.SSAValue && haskey(bc.ssa_pairs, obj.id)
+        k = args[2]
+        k isa QuoteNode && (k = k.value)
+        k isa Integer || throw(CompileError("non-constant index into checked pair"))
+        pair = bc.ssa_pairs[obj.id]
+        return k == 1 ? pair[1] : pair[2]
+    end
     # Dynamic index into a constant tuple, e.g. getfield((1,2,3,4), %i, false),
     # which is how array literals read their initial values in a loop. Lower to a
     # select chain over the constant elements (no select-free alternative without

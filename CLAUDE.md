@@ -223,6 +223,18 @@ for direct memory access (no runtime calls needed):
   cross-block SSA value resolution or block ordering).
 - ⏸️ `append!` deferred (needs `invoke unsafe_copyto!` bulk copy between MemoryRefs).
 - ✅ `compile_and_call` supports 0–2 args (was 0–1)
+- ✅ **Checked-arithmetic overflow pairs** — `checked_{s,u}{add,sub,mul}_int` return
+  `(value, overflowed::Bool)` from a *single* IR stmt. Materialized as TWO value
+  ids in `bc.ssa_pairs[stmt_idx] = (value_id, flag_id)` (no tuple allocation),
+  read back by `getfield(pair, 1/2)` (intercepted at the top of
+  `emit_struct_getfield`). Mirrors WasmCodegen's `ssapair` mechanism. Overflow is
+  detected branch-free and trap-free (Cranelift 0.133 has no native overflow
+  opcode): add/sub via the sign-bit comparison `((r⊕a)&(r⊕b))<0` / borrow `r<u a`;
+  mul via a division check using a **"safe divisor"** (`select` to 1 when `a∈{0,-1}`,
+  else `a`) so the guarding `sdiv`/`udiv` never traps — sidestepping the
+  `typemin/-1` trap case without control flow (SSA `select` evaluates both arms).
+  Only full-word widths (`sizeof∈{4,8}`: Int32/UInt32/Int64/UInt64) supported;
+  sub-word throws `CompileError` (loud failure — needs width renormalization).
 
 ### Bridge type dispatch
 
@@ -255,6 +267,11 @@ for direct memory access (no runtime calls needed):
 - **PIC required on ARM64 macOS**: The flags builder MUST set `is_pic = true` (requires `use cranelift_codegen::settings::Configurable`). Without PIC, external function calls crash with `ReadOnlyMemoryError` because ARM64 macOS enforces position-independent executables and `dyld` rejects absolute relocations in `.text`.
 - **Conversion intrinsic arg order**: all conversions (`sext_int`/`zext_int`/`trunc_int`/`sitofp`/`uitofp`/`fptosi`/`fptoui`/`fpext`/`fptrunc`) are `(Type, value)` — args[1] is the *result* type, args[2] the value. The type arg can arrive as a bare `DataType`, a `Core.Const`/`QuoteNode`, OR a `GlobalRef` to the type (e.g. `GlobalRef(Base, Float64)`); `_unwrap_type` (`builder_emit.jl`) handles all three. Cranelift op mapping: int↔float via `fcvt_from_sint`/`fcvt_from_uint`/`fcvt_to_sint_sat`/`fcvt_to_uint_sat`; f32↔f64 via `fpromote`/`fdemote` (both take the result `Type`).
 - **Intrinsic dispatch is dual**: intrinsics may arrive as `Core.IntrinsicFunction` (→ `emit_intrinsic`) OR as `GlobalRef` (`Base.sitofp`, `Base.bswap_int`, `Base.ceil_llvm`, … → `emit_globalref`). Each intrinsic must be handled in **both** places. Name via `ccall(:jl_intrinsic_name, …)` for the IntrinsicFunction form.
+- **`jl_intrinsic_name` returns `"invalid"` for newer intrinsics** (e.g.
+  `checked_{s,u}{add,sub,mul}_int` are missing from that C table). Identify those
+  by **identity** at the top of `emit_intrinsic`: `f === Core.Intrinsics.checked_sadd_int && return …`
+  (IntrinsicFunctions are singletons; `f === Core.Intrinsics.X` is reliable). The
+  `GlobalRef` form is unaffected (`f.name` gives the right `Symbol`).
 - **Bridge ABI gaps (FIXED)**: `native_callable[_from_so]` must ccall with the return type matching the function's actual return, and pass Float32 args via the Float32 ABI. `_call1_i64`/`_call1_i32` handle `Float64`/`Float32` returns (int-arg/float-return, e.g. `sitofp`); `_call1_f32` passes Float32 args (fpext). Float32 args are NOT lumped with Float64 (AArch64 `s0` ≠ `d0` — passing Float64 makes the callee read wrong bits).
 
 ### Known limitations & workarounds

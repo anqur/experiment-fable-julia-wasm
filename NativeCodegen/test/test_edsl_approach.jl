@@ -196,4 +196,81 @@ bo_bswap(x::UInt64)::UInt64 = bswap(x) ; run("bswap", bo_bswap, Tuple{UInt64}, (
 bo_flipsign(x::Int64, y::Int64)::Int64 = flipsign(x, y) ; run("flipsign", bo_flipsign, Tuple{Int64,Int64}, (Int64(3), Int64(-1)), -3)
 bo_abs(x::Int64)::Int64 = abs(x) ; run("absi", bo_abs, Tuple{Int64}, (Int64(-5),), 5)
 
+println("\n=== Checked arithmetic (overflow pairs) ===")
+# checked_{s,u}{add,sub,mul}_int return (value, overflowed::Bool) — a single IR
+# stmt materialized into two value ids, read via getfield(pair, 1/2). Tested
+# differentially against the native Julia intrinsic itself (the ground truth),
+# across overflow boundaries, the signed-mul typemin*-1 trap-guard case, and the
+# mul a==0 branch. NB: the compiled functions call the RAW intrinsic directly —
+# Base.Checked.* does not inline under our overlay interpreter, so only the raw
+# form reaches the eDSL (the form real post-inlining code uses).
+TM, TX = typemin(Int64), typemax(Int64)
+UX = typemax(UInt64)
+
+# Compile-once, multi-case runner; expected comes from the native oracle.
+function run_checked(name, f, argtypes, inputs, oracle)
+    print("  $name ... ")
+    try
+        retT = typeof(oracle(inputs[1]...))
+        comp = compile_native(f, argtypes; name=name)
+        nf = native_callable_from_so(comp, retT, argtypes.parameters...)
+        ok = true
+        for args in inputs
+            got, exp = nf(args...), oracle(args...)
+            got != exp && (println("\n    ❌ args=$args got $got, expected $exp"); ok = false)
+        end
+        println(ok ? "✅ ($(length(inputs)) cases)" : "  ❌")
+        rm(comp.so_path)
+        return ok
+    catch e
+        println("❌ $e")
+        return false
+    end
+end
+
+function csadd_v(a::Int64, b::Int64); r,_ = Core.Intrinsics.checked_sadd_int(a,b); r; end
+function csadd_f(a::Int64, b::Int64); r,f = Core.Intrinsics.checked_sadd_int(a,b); f; end
+run_checked("csadd_v", csadd_v, Tuple{Int64,Int64},
+    [(Int64(5),Int64(3)), (TX,Int64(1)), (TM,Int64(-1)), (TX,TX), (Int64(-5),Int64(-3))],
+    (a,b)->first(Core.Intrinsics.checked_sadd_int(a,b)))
+run_checked("csadd_f", csadd_f, Tuple{Int64,Int64},
+    [(Int64(5),Int64(3)), (TX,Int64(1)), (TM,Int64(-1)), (TX,TX), (Int64(10),Int64(-10))],
+    (a,b)->last(Core.Intrinsics.checked_sadd_int(a,b)))
+
+function cssub_v(a::Int64, b::Int64); r,_ = Core.Intrinsics.checked_ssub_int(a,b); r; end
+function cssub_f(a::Int64, b::Int64); r,f = Core.Intrinsics.checked_ssub_int(a,b); f; end
+run_checked("cssub_v", cssub_v, Tuple{Int64,Int64},
+    [(Int64(10),Int64(3)), (TM,Int64(1)), (TX,Int64(-1))],
+    (a,b)->first(Core.Intrinsics.checked_ssub_int(a,b)))
+run_checked("cssub_f", cssub_f, Tuple{Int64,Int64},
+    [(Int64(10),Int64(3)), (TM,Int64(1)), (TX,Int64(-1)), (Int64(0),Int64(-1))],
+    (a,b)->last(Core.Intrinsics.checked_ssub_int(a,b)))
+
+function csmul_v(a::Int64, b::Int64); r,_ = Core.Intrinsics.checked_smul_int(a,b); r; end
+function csmul_f(a::Int64, b::Int64); r,f = Core.Intrinsics.checked_smul_int(a,b); f; end
+run_checked("csmul_v", csmul_v, Tuple{Int64,Int64},
+    [(Int64(6),Int64(7)), (TM,Int64(-1)), (TX,Int64(2)), (TM,Int64(1)), (Int64(-3),Int64(4))],
+    (a,b)->first(Core.Intrinsics.checked_smul_int(a,b)))
+run_checked("csmul_f", csmul_f, Tuple{Int64,Int64},
+    [(Int64(6),Int64(7)), (TM,Int64(-1)), (TX,Int64(2)), (TM,Int64(1)),
+     (Int64(0),Int64(12345)), (Int64(-1),Int64(5)), (Int64(-1),TM)],
+    (a,b)->last(Core.Intrinsics.checked_smul_int(a,b)))
+
+function cuadd_f(a::UInt64, b::UInt64); r,f = Core.Intrinsics.checked_uadd_int(a,b); f; end
+function cusub_f(a::UInt64, b::UInt64); r,f = Core.Intrinsics.checked_usub_int(a,b); f; end
+function cumul_v(a::UInt64, b::UInt64); r,_ = Core.Intrinsics.checked_umul_int(a,b); r; end
+function cumul_f(a::UInt64, b::UInt64); r,f = Core.Intrinsics.checked_umul_int(a,b); f; end
+run_checked("cuadd_f", cuadd_f, Tuple{UInt64,UInt64},
+    [(UInt64(1),UInt64(2)), (UX,UInt64(1)), (UX,UX), (UInt64(0),UInt64(0))],
+    (a,b)->last(Core.Intrinsics.checked_uadd_int(a,b)))
+run_checked("cusub_f", cusub_f, Tuple{UInt64,UInt64},
+    [(UInt64(5),UInt64(3)), (UInt64(0),UInt64(1)), (UInt64(3),UInt64(5))],
+    (a,b)->last(Core.Intrinsics.checked_usub_int(a,b)))
+run_checked("cumul_v", cumul_v, Tuple{UInt64,UInt64},
+    [(UInt64(3),UInt64(4)), (UX,UInt64(2)), (UInt64(0),UInt64(7)), (UX,UX)],
+    (a,b)->first(Core.Intrinsics.checked_umul_int(a,b)))
+run_checked("cumul_f", cumul_f, Tuple{UInt64,UInt64},
+    [(UInt64(3),UInt64(4)), (UX,UInt64(2)), (UInt64(0),UInt64(7)), (UX,UX)],
+    (a,b)->last(Core.Intrinsics.checked_umul_int(a,b)))
+
 println("\n=== Done ===")
