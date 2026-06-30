@@ -45,7 +45,7 @@ function _init_builder_lib()
                Sys.islinux()  ? "libnative_builder.so" :
                error("unsupported platform")
     dir = joinpath(dirname(@__DIR__), "..", "native-builder", "target")
-    path = _newest_artifact(dir, lib_name)
+    path = _debug_artifact(dir, lib_name)
     path === nothing && error("native-builder library not found. Build with: cd native-builder && cargo build")
     _BUILDER_LIB_PATH[] = path
     return path
@@ -57,26 +57,21 @@ function _init_runtime_lib()
                Sys.islinux()  ? "libnative_backend.a" :
                error("unsupported platform")
     dir = joinpath(dirname(@__DIR__), "..", "native-backend", "target")
-    path = _newest_artifact(dir, lib_name)
+    path = _debug_artifact(dir, lib_name)
     path === nothing && error("native-backend runtime library not found. Build with: cd native-backend && cargo build")
     _RUNTIME_LIB_PATH[] = path
     return path
 end
 
-# Pick the newest built artifact across debug/release profiles by mtime, so the
-# profile you built most recently is the one that runs (fast `cargo build` dev
-# iteration wins over a stale release, and vice-versa). Returns nothing if none.
-function _newest_artifact(target_dir, lib_name)
-    best, best_mtime = nothing, 0.0
-    for profile in ("release", "debug")
-        path = joinpath(target_dir, profile, lib_name)
-        isfile(path) || continue
-        m = mtime(path)
-        if m > best_mtime
-            best, best_mtime = path, m
-        end
-    end
-    return best
+# Resolve the dev-profile (debug) artifact ONLY. Release artifacts are never
+# loaded during local development — they carry no debug-assertions and a stale
+# release build has historically shadowed a fresh debug one, masking real
+# IR-construction bugs. Perf measurement with `--release` should be done
+# out-of-band; this loader refuses to touch `target/release`. Returns nothing
+# if no debug artifact exists (callers raise a "build with: cargo build" error).
+function _debug_artifact(target_dir, lib_name)
+    path = joinpath(target_dir, "debug", lib_name)
+    isfile(path) ? path : nothing
 end
 
 function compile_native(f, argtypes::Type{<:Tuple}; name::String="entry")
@@ -125,6 +120,9 @@ end
 function _call1_i64(ptr::Ptr{Cvoid}, rettype, T1, a1)
     w1 = Int64(to_wire(T1, a1))
     rettype === Nothing && return (ccall(ptr, Cvoid, (Int64,), w1); nothing)
+    # Int arg but float return (e.g. sitofp): ccall must read the float register.
+    rettype === Float64 && return ccall(ptr, Float64, (Int64,), w1)
+    rettype === Float32 && return ccall(ptr, Float32, (Int64,), w1)
     raw = ccall(ptr, Int64, (Int64,), w1)
     return _ret(ptr, raw, rettype)
 end
@@ -134,6 +132,16 @@ function _call1_f64(ptr::Ptr{Cvoid}, rettype, a1)
     rettype === Float64 && return ccall(ptr, Float64, (Float64,), a1)
     rettype === Bool && return ccall(ptr, Int32, (Float64,), a1) != 0
     return from_wire(rettype, ccall(ptr, Int64, (Float64,), a1))
+end
+
+# Float32 arg: must pass via the Float32 ABI (AArch64 s0 != d0 — passing Float64
+# makes the callee read the wrong bits). Handles Float64/Float32/Bool returns.
+function _call1_f32(ptr::Ptr{Cvoid}, rettype, a1)
+    rettype === Nothing && return (ccall(ptr, Cvoid, (Float32,), a1); nothing)
+    rettype === Float32 && return ccall(ptr, Float32, (Float32,), a1)
+    rettype === Float64 && return ccall(ptr, Float64, (Float32,), a1)
+    rettype === Bool && return ccall(ptr, Int32, (Float32,), a1) != 0
+    return from_wire(rettype, ccall(ptr, Int64, (Float32,), a1))
 end
 
 function _call2_ff(ptr::Ptr{Cvoid}, rettype, a1, a2)
@@ -153,6 +161,9 @@ end
 function _call1_i32(ptr::Ptr{Cvoid}, rettype, T1, a1)
     w1 = Int32(to_wire(T1, a1))
     rettype === Nothing && return (ccall(ptr, Cvoid, (Int32,), w1); nothing)
+    # Int arg but float return (e.g. sitofp on sub-word): ccall must read the float register.
+    rettype === Float64 && return ccall(ptr, Float64, (Int32,), w1)
+    rettype === Float32 && return ccall(ptr, Float32, (Int32,), w1)
     raw = ccall(ptr, Int64, (Int32,), w1)
     return _ret(ptr, raw, rettype)
 end
@@ -213,8 +224,11 @@ function native_callable(comp::NativeCompilation, rettype, argtypes::Type...)
         if _is_ptr_type(T1)
             return (a1 -> _ret(ptr, ccall(ptr, Int64, (Ptr{Cvoid},), pointer_from_objref(a1)), rettype))
         end
-        if _is_f64(T1) || _is_f32(T1)
+        if _is_f64(T1)
             return (a1 -> _call1_f64(ptr, rt, Float64(a1)))
+        end
+        if _is_f32(T1)
+            return (a1 -> _call1_f32(ptr, rt, Float32(a1)))
         end
         if _is_i64(T1)
             return (a1 -> _call1_i64(ptr, rt, T1, a1))
@@ -273,8 +287,11 @@ function native_callable_from_so(comp::NativeCompilation, rettype::Type, argtype
         if _is_ptr_type(T1)
             return (a1 -> _ret(func_ptr, ccall(func_ptr, Int64, (Ptr{Cvoid},), pointer_from_objref(a1)), rettype))
         end
-        if _is_f64(T1) || _is_f32(T1)
+        if _is_f64(T1)
             return (a1 -> _call1_f64(func_ptr, rt, Float64(a1)))
+        end
+        if _is_f32(T1)
+            return (a1 -> _call1_f32(func_ptr, rt, Float32(a1)))
         end
         if _is_i64(T1)
             return (a1 -> _call1_i64(func_ptr, rt, T1, a1))

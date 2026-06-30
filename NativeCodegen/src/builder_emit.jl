@@ -252,7 +252,6 @@ function emit_instruction(bc::BuilderCtx, e, ir, stmt_idx::Int)
         end
         if result_id !== nothing
             bc.ssa_values[Core.SSAValue(stmt_idx)] = result_id
-            println("[DEBUG ssa] stmt=$stmt_idx (call) -> result_id=$result_id")
         end
     elseif e isa Expr && e.head == :invoke
         mi = e.args[1]  # MethodInstance or CodeInstance
@@ -496,10 +495,17 @@ function emit_intrinsic(bc::BuilderCtx, f::Core.IntrinsicFunction, args, ir, stm
     fn_sym == :lshr_int && return emit_binop(bc, :block_add_ushr, args, ir)
     fn_sym == :ashr_int && return emit_binop(bc, :block_add_sshr, args, ir)
 
-    # Conversions
+    # Conversions (int widening/narrowing)
     fn_sym == :zext_int && return emit_convert(bc, :block_add_uextend, args, ir)
     fn_sym == :sext_int && return emit_convert(bc, :block_add_sextend, args, ir)
     fn_sym == :trunc_int && return emit_trunc(bc, args, ir)
+    # Conversions (int <-> float): (Type, value) — Type is the *result* type.
+    fn_sym == :sitofp && return emit_convert(bc, :block_add_fcvt_from_sint, args, ir)
+    fn_sym == :uitofp && return emit_convert(bc, :block_add_fcvt_from_uint, args, ir)
+    fn_sym == :fptosi && return emit_convert(bc, :block_add_fcvt_to_sint_sat, args, ir)
+    fn_sym == :fptoui && return emit_convert(bc, :block_add_fcvt_to_uint_sat, args, ir)
+    fn_sym == :fpext   && return emit_convert(bc, :block_add_fpromote, args, ir)
+    fn_sym == :fptrunc && return emit_convert(bc, :block_add_fdemote, args, ir)
 
     # Float arithmetic
     fn_sym == :add_float && return emit_binop(bc, :block_add_fadd, args, ir)
@@ -507,6 +513,14 @@ function emit_intrinsic(bc::BuilderCtx, f::Core.IntrinsicFunction, args, ir, stm
     fn_sym == :mul_float && return emit_binop(bc, :block_add_fmul, args, ir)
     fn_sym == :div_float && return emit_binop(bc, :block_add_fdiv, args, ir)
     fn_sym == :neg_float && return emit_unop(bc, :block_add_fneg, args, ir)
+    # Float math (unops — Cranelift infers width from operand; binop for copysign)
+    fn_sym == :sqrt_llvm && return emit_unop(bc, :block_add_sqrt, args, ir)
+    fn_sym == :ceil_llvm && return emit_unop(bc, :block_add_ceil, args, ir)
+    fn_sym == :floor_llvm && return emit_unop(bc, :block_add_floor, args, ir)
+    fn_sym == :trunc_llvm && return emit_unop(bc, :block_add_trunc, args, ir)
+    fn_sym == :rint_llvm && return emit_unop(bc, :block_add_nearest, args, ir)
+    fn_sym == :abs_float && return emit_unop(bc, :block_add_fabs, args, ir)
+    fn_sym == :copysign_float && return emit_binop(bc, :block_add_fcopysign, args, ir)
 
     # Float comparisons
     fn_sym == :eq_float && return emit_fcmp(bc, FCMP_EQ, args, ir)
@@ -518,6 +532,15 @@ function emit_intrinsic(bc::BuilderCtx, f::Core.IntrinsicFunction, args, ir, stm
     fn_sym == :neg_int && return emit_neg_int(bc, args, ir)
     # not_int = x ⊻ -1
     fn_sym == :not_int && return emit_not_int(bc, args, ir)
+
+    # Bit-count / byte-swap unops (same width in/out; Cranelift infers width)
+    fn_sym == :ctlz_int && return emit_unop(bc, :block_add_clz, args, ir)
+    fn_sym == :cttz_int && return emit_unop(bc, :block_add_ctz, args, ir)
+    fn_sym == :ctpop_int && return emit_unop(bc, :block_add_popcnt, args, ir)
+    fn_sym == :bswap_int && return emit_unop(bc, :block_add_bswap, args, ir)
+    # flipsign_int(x, y) = (x ⊻ s) - s with s = y >>> (bits-1). Also covers abs
+    # (the IR lowers abs(x) to flipsign_int(x, x)).
+    fn_sym == :flipsign_int && return emit_flipsign_int(bc, args, ir)
 
     error("Unsupported intrinsic: $fn_sym")
 end
@@ -566,10 +589,18 @@ function emit_fcmp(bc::BuilderCtx, cond::UInt32, args, ir)
                  bc.fctx_handle, result, TYPE_I32)
 end
 
+# Unwrap a type argument that may arrive as a bare DataType, Core.Const,
+# QuoteNode, or GlobalRef to the type (e.g. GlobalRef(Base, Float64)).
+_unwrap_type(T) = T isa Core.Const ? T.val :
+                  T isa QuoteNode ? T.value :
+                  T isa Core.GlobalRef ? getglobal(T.mod, T.name) : T
+
 function emit_convert(bc::BuilderCtx, ffi_sym::Symbol, args, ir)
     length(args) < 2 && error("Convert needs 2 args")
-    val = resolve_operand(bc, args[1], ir)
-    to_T = args[2]
+    # Julia conversion intrinsics are (Type, value): e.g. sext_int(Int64, x),
+    # sitofp(Float64, x), fptosi(Int64, x). args[1] is the target type.
+    to_T = _unwrap_type(args[1])
+    val = resolve_operand(bc, args[2], ir)
     to_type_enum = cranelift_type(to_T)
     fn_ptr = Libdl.dlsym(bc.lib_handle, ffi_sym)
     return ccall(fn_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
@@ -578,8 +609,9 @@ end
 
 function emit_trunc(bc::BuilderCtx, args, ir)
     length(args) < 2 && error("trunc needs 2 args")
-    val = resolve_operand(bc, args[1], ir)
-    to_T = args[2]
+    # trunc_int(Int8, x) — args[1] is the (narrower) target type.
+    to_T = _unwrap_type(args[1])
+    val = resolve_operand(bc, args[2], ir)
     to_type_enum = cranelift_type(to_T)
     fn_ptr = Libdl.dlsym(bc.lib_handle, :block_add_ireduce)
     return ccall(fn_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
@@ -605,6 +637,32 @@ function emit_not_int(bc::BuilderCtx, args, ir)
     # Return raw i8 (no uextend) — brif handles the reduce itself
     return ccall(fn_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32, UInt32),
                  bc.fctx_handle, ICMP_EQ, val, zero)
+end
+
+# flipsign_int(x, y) = y >= 0 ? x : -x, lowered as (x ⊻ s) - s with
+# s = sshr(y, storage_bits-1). s is 0 when y>=0 and -1 (all ones) when y<0, so
+# (x ⊻ s) - s yields x or -x respectively. The shift uses the STORAGE width
+# (63 for i64, 31 for i32) — sub-word signed values are sign-extended into i32
+# storage, so the sign lives at bit 31. (Lifted from WasmCodegen intrinsics.jl.)
+function emit_flipsign_int(bc::BuilderCtx, args, ir)
+    x = resolve_operand(bc, args[1], ir)
+    y = resolve_operand(bc, args[2], ir)
+    T = get_operand_type(args[1], ir)
+    T = T isa Core.Const ? T.val : T
+    shift = cranelift_type(T) == TYPE_I64 ? 63 : 31
+    shift_id = emit_constant(bc, Int64(shift))
+    # s = arithmetic-shift y by (storage_bits-1)
+    sshr_ptr = Libdl.dlsym(bc.lib_handle, :block_add_sshr)
+    s_id = ccall(sshr_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
+                 bc.fctx_handle, y, shift_id)
+    # x ⊻ s
+    xor_ptr = Libdl.dlsym(bc.lib_handle, :block_add_bxor)
+    xors_id = ccall(xor_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
+                    bc.fctx_handle, x, s_id)
+    # (x ⊻ s) - s
+    sub_ptr = Libdl.dlsym(bc.lib_handle, :block_add_isub)
+    return ccall(sub_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
+                 bc.fctx_handle, xors_id, s_id)
 end
 
 # === Invoke handling (overlay method calls) ===
@@ -736,6 +794,12 @@ function emit_globalref(bc::BuilderCtx, f::Core.GlobalRef, args, ir, stmt_idx)
     if fn == :shl_int ; return emit_binop(bc, :block_add_ishl, args, ir) end
     if fn == :lshr_int ; return emit_binop(bc, :block_add_ushr, args, ir) end
     if fn == :ashr_int ; return emit_binop(bc, :block_add_sshr, args, ir) end
+    # Bit-count / byte-swap (full-width correct; sub-word needs renormalization)
+    if fn == :ctlz_int ; return emit_unop(bc, :block_add_clz, args, ir) end
+    if fn == :cttz_int ; return emit_unop(bc, :block_add_ctz, args, ir) end
+    if fn == :ctpop_int ; return emit_unop(bc, :block_add_popcnt, args, ir) end
+    if fn == :bswap_int ; return emit_unop(bc, :block_add_bswap, args, ir) end
+    if fn == :flipsign_int ; return emit_flipsign_int(bc, args, ir) end
 
     # === Float arithmetic ===
     if fn == :add_float ; return emit_binop(bc, :block_add_fadd, args, ir) end
@@ -743,6 +807,14 @@ function emit_globalref(bc::BuilderCtx, f::Core.GlobalRef, args, ir, stmt_idx)
     if fn == :mul_float ; return emit_binop(bc, :block_add_fmul, args, ir) end
     if fn == :div_float ; return emit_binop(bc, :block_add_fdiv, args, ir) end
     if fn == :neg_float ; return emit_unop(bc, :block_add_fneg, args, ir) end
+    # Float math (unops; binop for copysign). Cranelift infers width from operand.
+    if fn == :sqrt_llvm ; return emit_unop(bc, :block_add_sqrt, args, ir) end
+    if fn == :ceil_llvm ; return emit_unop(bc, :block_add_ceil, args, ir) end
+    if fn == :floor_llvm ; return emit_unop(bc, :block_add_floor, args, ir) end
+    if fn == :trunc_llvm ; return emit_unop(bc, :block_add_trunc, args, ir) end
+    if fn == :rint_llvm ; return emit_unop(bc, :block_add_nearest, args, ir) end
+    if fn == :abs_float ; return emit_unop(bc, :block_add_fabs, args, ir) end
+    if fn == :copysign_float ; return emit_binop(bc, :block_add_fcopysign, args, ir) end
 
     # === Float comparisons ===
     if fn == :eq_float ; return emit_fcmp(bc, FCMP_EQ, args, ir) end
@@ -754,6 +826,13 @@ function emit_globalref(bc::BuilderCtx, f::Core.GlobalRef, args, ir, stmt_idx)
     if fn == :zext_int ; return emit_convert(bc, :block_add_uextend, args, ir) end
     if fn == :sext_int ; return emit_convert(bc, :block_add_sextend, args, ir) end
     if fn == :trunc_int ; return emit_trunc(bc, args, ir) end
+    # int <-> float (Type is the *result* type, in args[1])
+    if fn == :sitofp ; return emit_convert(bc, :block_add_fcvt_from_sint, args, ir) end
+    if fn == :uitofp ; return emit_convert(bc, :block_add_fcvt_from_uint, args, ir) end
+    if fn == :fptosi ; return emit_convert(bc, :block_add_fcvt_to_sint_sat, args, ir) end
+    if fn == :fptoui ; return emit_convert(bc, :block_add_fcvt_to_uint_sat, args, ir) end
+    if fn == :fpext  ; return emit_convert(bc, :block_add_fpromote, args, ir) end
+    if fn == :fptrunc ; return emit_convert(bc, :block_add_fdemote, args, ir) end
 
     # === Struct field access ===
     if fn == :getfield && length(args) >= 2
@@ -1127,9 +1206,6 @@ function emit_memoryrefnew(bc::BuilderCtx, args, ir, stmt_idx)
     memref_val = args[1]
     idx_val = args[2]
 
-    # DEBUG
-    println("[DEBUG memoryrefnew] stmt=$stmt_idx memref_val=$memref_val idx_val=$idx_val")
-
     # Get the MemoryRef's base info from ref_tracking
     tracked = (memref_val isa Core.SSAValue && haskey(bc.ref_tracking, memref_val)) ?
               bc.ref_tracking[memref_val] : nothing
@@ -1140,8 +1216,6 @@ function emit_memoryrefnew(bc::BuilderCtx, args, ir, stmt_idx)
              memref_T.parameters[2] : Int64  # param 1=ordering, param 2=T
     elem_size = sizeof(elem_T)
 
-    println("[DEBUG memoryrefnew] tracked: base_id=$base_id base_off=$base_off elem_T=$elem_T elem_size=$elem_size")
-
     # Load data pointer from base + base_off (field ptr_or_offset at offset 0)
     load_ptr = Libdl.dlsym(bc.lib_handle, :block_add_load)
     data_ptr_id = ccall(load_ptr, UInt32, (Ptr{Cvoid}, UInt32, Int32, UInt32),
@@ -1149,7 +1223,6 @@ function emit_memoryrefnew(bc::BuilderCtx, args, ir, stmt_idx)
 
     # Compute element offset: (idx - 1) * elem_size
     idx_id = resolve_operand(bc, idx_val, ir)
-    println("[DEBUG memoryrefnew] idx_val=$idx_val -> idx_id=$idx_id")
     one_id = emit_constant(bc, Int64(1))
     sub_ptr = Libdl.dlsym(bc.lib_handle, :block_add_isub)
     idx_0_id = ccall(sub_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
@@ -1452,14 +1525,12 @@ end
 
 # === Find native-builder library ===
 
+# Delegate to NativeCodegen._init_builder_lib (defined in NativeCodegen.jl) so the
+# builder .dylib is resolved the same way as the runtime .a: dev-profile (debug)
+# ONLY, via _debug_artifact. Release artifacts are never loaded in local
+# development — they carry no debug-assertions and a stale release .dylib has
+# silently shadowed a fresh debug one, masking real bugs. _init_builder_lib
+# memoizes the resolved path in _BUILDER_LIB_PATH.
 function get_native_builder_lib()
-    base_dir = joinpath(dirname(@__DIR__), "..", "native-builder", "target")
-    lib_name = Sys.isapple() ? "libnative_builder.dylib" :
-               Sys.islinux()  ? "libnative_builder.so" :
-               error("unsupported platform")
-    for profile in ("release", "debug")
-        path = joinpath(base_dir, profile, lib_name)
-        isfile(path) && return path
-    end
-    error("native-builder library not found. Build with: cd native-builder && cargo build --release")
+    _init_builder_lib()
 end

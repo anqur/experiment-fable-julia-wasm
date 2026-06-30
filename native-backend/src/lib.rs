@@ -1,13 +1,8 @@
-// native-backend: C ABI shared library for native Julia code generation.
-//
-// Provides:
-//   native_compile(source: *const c_char, len: usize) -> *mut CompiledModule
-//   native_lookup(module: *const CompiledModule, name: *const c_char) -> *const u8
-//   native_free(module: *mut CompiledModule)
-//
-// Plus runtime exports (gc, exceptions, strings, offloads).
+// native-backend: Rust runtime static library linked into the compiled `.so`
+// by Julia's lld. Provides runtime exports (gc, exceptions, strings, offloads).
+// The old CLIF-text JIT path (compile.rs) has been removed — the pipeline now
+// uses native-builder's Cranelift ObjectModule eDSL.
 
-pub mod compile;
 pub mod runtime;
 pub mod types;
 

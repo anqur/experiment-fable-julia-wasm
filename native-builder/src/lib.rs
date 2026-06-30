@@ -140,6 +140,27 @@ ffi_unop!(block_add_fneg, emit_fneg);
 ffi_convert!(block_add_uextend, emit_uextend);
 ffi_convert!(block_add_sextend, emit_sextend);
 ffi_convert!(block_add_ireduce, emit_ireduce);
+// int <-> float conversions (typed — result type tt)
+ffi_convert!(block_add_fcvt_from_sint, emit_fcvt_from_sint);
+ffi_convert!(block_add_fcvt_from_uint, emit_fcvt_from_uint);
+ffi_convert!(block_add_fcvt_to_sint_sat, emit_fcvt_to_sint_sat);
+ffi_convert!(block_add_fcvt_to_uint_sat, emit_fcvt_to_uint_sat);
+// float width changes (typed — result type tt: F32 for fdemote, F64 for fpromote)
+ffi_convert!(block_add_fdemote, emit_fdemote);
+ffi_convert!(block_add_fpromote, emit_fpromote);
+// float math
+ffi_unop!(block_add_sqrt, emit_sqrt);
+ffi_unop!(block_add_ceil, emit_fceil);
+ffi_unop!(block_add_floor, emit_ffloor);
+ffi_unop!(block_add_trunc, emit_ftrunc);
+ffi_unop!(block_add_nearest, emit_fnearest);
+ffi_unop!(block_add_fabs, emit_fabs);
+ffi_binop!(block_add_fcopysign, emit_fcopysign);
+// bit ops
+ffi_unop!(block_add_clz, emit_clz);
+ffi_unop!(block_add_ctz, emit_ctz);
+ffi_unop!(block_add_popcnt, emit_popcnt);
+ffi_unop!(block_add_bswap, emit_bswap);
 
 #[no_mangle] pub extern "C" fn block_add_iconst(fctx: *mut FunctionCtx, val: i64, ty: u32) -> u32 { if fctx.is_null() { 0 } else { unsafe { (*fctx).emit_iconst(val, ty) } } }
 #[no_mangle] pub extern "C" fn block_add_f64const(fctx: *mut FunctionCtx, val: f64) -> u32 { if fctx.is_null() { 0 } else { unsafe { (*fctx).emit_f64const(val) } } }

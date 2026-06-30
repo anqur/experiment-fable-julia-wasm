@@ -169,4 +169,31 @@ function buildpush(n::Int64)::Vector{Int64}
 end
 run_cc("bldpush", buildpush, Tuple{Int64}, (5,), [1,4,9,16,25])
 
+println("\n=== Conversions (int <-> float) ===")
+cv_sitofp(x::Int64)::Float64 = Float64(x) ; run("sitofp", cv_sitofp, Tuple{Int64}, (Int64(5),), 5.0)
+cv_uitofp(x::UInt64)::Float64 = Float64(x) ; run("uitofp", cv_uitofp, Tuple{UInt64}, (UInt64(7),), 7.0)
+cv_fptosi(x::Float64)::Int64 = unsafe_trunc(Int64, x) ; run("fptosi", cv_fptosi, Tuple{Float64}, (3.7,), 3)
+cv_fptoui(x::Float64)::UInt64 = unsafe_trunc(UInt64, x) ; run("fptoui", cv_fptoui, Tuple{Float64}, (3.7,), UInt64(3))
+cv_fpext(x::Float32)::Float64 = Float64(x) ; run("fpext", cv_fpext, Tuple{Float32}, (1.5f0,), 1.5)
+# fptrunc via Float64-returning roundtrip (bridge float path returns Float64):
+cv_fptrunc(x::Float64)::Float64 = Float64(Float32(x)) ; run("fptrunc", cv_fptrunc, Tuple{Float64}, (1.9,), Float64(Float32(1.9)))
+# sext_int on sub-word (exercises the emit_convert arg-order fix).
+cv_sext(x::Int8)::Int64 = Int64(x) ; run("sext_i8", cv_sext, Tuple{Int8}, (Int8(-5),), -5)
+
+println("\n=== Float math ===")
+fm_sqrt(x::Float64)::Float64 = sqrt(x) ; run("sqrt", fm_sqrt, Tuple{Float64}, (2.0,), sqrt(2.0))
+fm_ceil(x::Float64)::Float64 = ceil(x) ; run("ceil", fm_ceil, Tuple{Float64}, (2.3,), 3.0)
+fm_floor(x::Float64)::Float64 = floor(x) ; run("floor", fm_floor, Tuple{Float64}, (2.7,), 2.0)
+fm_trunc(x::Float64)::Float64 = trunc(x) ; run("truncf", fm_trunc, Tuple{Float64}, (2.7,), 2.0)
+fm_abs(x::Float64)::Float64 = abs(x) ; run("fabs", fm_abs, Tuple{Float64}, (-2.5,), 2.5)
+fm_copysign(x::Float64, y::Float64)::Float64 = copysign(x, y) ; run("copysign", fm_copysign, Tuple{Float64,Float64}, (2.0, -1.0), -2.0)
+
+println("\n=== Bit ops (full-width; sub-word needs renormalization, see CLAUDE.md) ===")
+bo_ctlz(x::UInt64)::UInt64 = leading_zeros(x) ; run("ctlz", bo_ctlz, Tuple{UInt64}, (UInt64(1),), UInt64(63))
+bo_cttz(x::UInt64)::UInt64 = trailing_zeros(x) ; run("cttz", bo_cttz, Tuple{UInt64}, (UInt64(2),), UInt64(1))
+bo_ctpop(x::UInt64)::UInt64 = count_ones(x) ; run("ctpop", bo_ctpop, Tuple{UInt64}, (UInt64(0xFF),), UInt64(8))
+bo_bswap(x::UInt64)::UInt64 = bswap(x) ; run("bswap", bo_bswap, Tuple{UInt64}, (UInt64(0x12345678),), bswap(UInt64(0x12345678)))
+bo_flipsign(x::Int64, y::Int64)::Int64 = flipsign(x, y) ; run("flipsign", bo_flipsign, Tuple{Int64,Int64}, (Int64(3), Int64(-1)), -3)
+bo_abs(x::Int64)::Int64 = abs(x) ; run("absi", bo_abs, Tuple{Int64}, (Int64(-5),), 5)
+
 println("\n=== Done ===")

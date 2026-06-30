@@ -10,8 +10,6 @@ crate-type = ["staticlib"]  # Static library for runtime (.a file)
 [dependencies]
 cranelift-codegen = "0.133"
 cranelift-frontend = "0.133"
-cranelift-jit = "0.133"
-cranelift-reader = "0.133"
 cranelift-module = "0.133"
 target-lexicon = "0.12"
 libc = "0.2"

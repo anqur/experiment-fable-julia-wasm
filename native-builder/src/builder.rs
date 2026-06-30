@@ -44,6 +44,21 @@ use cranelift_codegen::ir::Block;
 pub struct FunctionCtx {
     context: Context,
     fb_ctx: FunctionBuilderContext,
+    // One persistent FunctionBuilder per function, behind a lifetime-erased raw
+    // pointer. The old "transient FunctionBuilder per FFI call" pattern tripped
+    // cranelift-frontend's `func_ctx.is_empty()` debug assertion: every dropped-
+    // but-unfinalized builder leaves the context non-empty, so the *second*
+    // FunctionBuilder::new panicked in debug builds (the assertion is gated on
+    // debug_assertions, so release masked it). Now we create exactly one builder
+    // (in init_entry, after this struct is boxed at a stable address) and reuse
+    // it for every instruction; finalize_ctx frees it.
+    //
+    // Soundness: FunctionCtx owns `context` and `fb_ctx`; the builder borrows
+    // `context.func` and `fb_ctx`; FunctionCtx is never moved after init_entry
+    // (it is boxed once in add_function); no method touches `context` or
+    // `fb_ctx` directly while the builder is alive (everything goes through fb());
+    // and finalize_ctx drops the builder before define_function reads `context`.
+    fb: *mut FunctionBuilder<'static>,
     ssa_values: HashMap<u32, Value>,
     blocks: HashMap<String, Block>,
     current_block: Block,
@@ -52,38 +67,65 @@ pub struct FunctionCtx {
     func_name: String,  // original name for declare_function
 }
 
+#[inline]
+fn block0() -> Block { unsafe { std::mem::transmute::<u32, Block>(0) } }
+
 impl FunctionCtx {
+    /// Phase 1 of two-phase init: build everything *except* the FunctionBuilder.
+    /// Must be followed by `init_entry` once this FunctionCtx is at its final
+    /// (boxed) address, because the builder borrows `context.func` and `fb_ctx`
+    /// and would be invalidated by a move.
     pub fn new(name: &str, ret_type: u32, param_types: &[u32], call_conv: CallConv) -> Option<Self> {
         let mut sig = Signature::new(call_conv);
         if let Some(t) = map_type(ret_type) { sig.returns.push(AbiParam::new(t)); }
         for &pt in param_types {
             if let Some(t) = map_type(pt) { sig.params.push(AbiParam::new(t)); }
         }
-
         let mut context = Context::new();
         context.func.signature = sig.clone();
         context.func.name = UserFuncName::testcase(name);
-        let mut fb_ctx = FunctionBuilderContext::new();
-        let mut ssa_values = HashMap::new();
+        Some(FunctionCtx {
+            context,
+            fb_ctx: FunctionBuilderContext::new(),
+            fb: std::ptr::null_mut(),
+            ssa_values: HashMap::new(),
+            blocks: HashMap::new(),
+            current_block: block0(),  // real entry set in init_entry
+            signature: sig,
+            sealed: HashSet::new(),
+            func_name: name.to_string(),
+        })
+    }
 
-        let entry = {
-            let mut fb = FunctionBuilder::new(&mut context.func, &mut fb_ctx);
-            let e = fb.create_block();
-            fb.switch_to_block(e);
-            fb.append_block_params_for_function_params(e);
-            drop(fb); e
-        };
-
-        for (i, &val) in context.func.dfg.block_params(entry).iter().enumerate() {
-            ssa_values.insert(i as u32, val);
+    /// Phase 2: create the single persistent FunctionBuilder plus the entry block
+    /// and its params. Must run after the FunctionCtx is boxed (stable address).
+    pub fn init_entry(&mut self) {
+        // Create the builder from raw pointers to the borrowed fields, decoupling
+        // from the borrow checker (self-referential borrow is the whole point).
+        let func: *mut cranelift_codegen::ir::Function = &mut self.context.func;
+        let fctx: *mut FunctionBuilderContext = &mut self.fb_ctx;
+        let mut fb = unsafe { FunctionBuilder::new(&mut *func, &mut *fctx) };
+        let entry = fb.create_block();
+        fb.switch_to_block(entry);
+        fb.append_block_params_for_function_params(entry);
+        // Snapshot the entry params before erasing the builder's lifetime.
+        let params: Vec<Value> = fb.func.dfg.block_params(entry).to_vec();
+        self.fb = Box::into_raw(Box::new(fb)) as *mut FunctionBuilder<'static>;
+        for (i, val) in params.iter().enumerate() {
+            self.ssa_values.insert(i as u32, *val);
         }
+        self.blocks.insert("block0".to_string(), entry);
+        self.current_block = entry;
+    }
 
-        let mut blocks = HashMap::new();
-        blocks.insert("block0".to_string(), entry);
-
-        Some(FunctionCtx { context, fb_ctx, ssa_values, blocks,
-            current_block: entry, signature: sig, sealed: HashSet::new(),
-            func_name: name.to_string() })
+    /// Borrow the persistent builder. Callers must read any needed `self` fields
+    /// (current_block, ssa values, blocks) into locals BEFORE this call, and scope
+    /// the returned borrow so it ends before touching `self` again (the borrow is
+    /// tied to `&mut self`).
+    #[inline]
+    fn fb(&mut self) -> &mut FunctionBuilder<'static> {
+        debug_assert!(!self.fb.is_null(), "FunctionBuilder used after finalize_ctx");
+        unsafe { &mut *self.fb }
     }
 
     fn ssa(&self, id: u32) -> Value {
@@ -92,10 +134,15 @@ impl FunctionCtx {
 
     fn emit<F: FnOnce(&mut FunctionBuilder) -> Value>(&mut self, f: F) -> u32 {
         let curr = self.current_block;
-        let mut fb = FunctionBuilder::new(&mut self.context.func, &mut self.fb_ctx);
-        fb.switch_to_block(curr);
-        let v = f(&mut fb);
-        drop(fb);
+        let v = {
+            let fb = self.fb();
+            // Skip the redundant switch when already positioned on `curr`. The
+            // persistent builder tracks fill-state, so re-switching to a Partial
+            // block (instructions but no terminator yet) would trip the
+            // "fill your block before switching" debug assertion.
+            if fb.current_block() != Some(curr) { fb.switch_to_block(curr); }
+            f(fb)
+        };
         let id = v2u(v);
         self.ssa_values.insert(id, v);
         id
@@ -103,15 +150,14 @@ impl FunctionCtx {
 
     fn emit_void<F: FnOnce(&mut FunctionBuilder)>(&mut self, f: F) {
         let curr = self.current_block;
-        let mut fb = FunctionBuilder::new(&mut self.context.func, &mut self.fb_ctx);
-        fb.switch_to_block(curr);
-        f(&mut fb);
-        drop(fb);
+        let fb = self.fb();
+        if fb.current_block() != Some(curr) { fb.switch_to_block(curr); }
+        f(fb);
     }
 
     pub fn create_block_named(&mut self, name: &str) {
         let b = {
-            let mut fb = FunctionBuilder::new(&mut self.context.func, &mut self.fb_ctx);
+            let fb = self.fb();
             fb.create_block()
         };
         self.blocks.insert(name.to_string(), b);
@@ -122,12 +168,10 @@ impl FunctionCtx {
     }
 
     pub fn seal_block(&mut self, name: &str) {
-        if let Some(&b) = self.blocks.get(name) {
-            if !self.sealed.contains(&b) {
-                let mut fb = FunctionBuilder::new(&mut self.context.func, &mut self.fb_ctx);
-                fb.seal_block(b); drop(fb);
-                self.sealed.insert(b);
-            }
+        let to_seal = self.blocks.get(name).copied().filter(|b| !self.sealed.contains(b));
+        if let Some(b) = to_seal {
+            { let fb = self.fb(); fb.seal_block(b); }
+            self.sealed.insert(b);
         }
     }
 
@@ -161,11 +205,27 @@ impl FunctionCtx {
     pub fn emit_ishl(&mut self, l: u32, r: u32) -> u32 { let (lv, rv) = (self.ssa(l), self.ssa(r)); self.emit(|fb| fb.ins().ishl(lv, rv)) }
     pub fn emit_ushr(&mut self, l: u32, r: u32) -> u32 { let (lv, rv) = (self.ssa(l), self.ssa(r)); self.emit(|fb| fb.ins().ushr(lv, rv)) }
     pub fn emit_sshr(&mut self, l: u32, r: u32) -> u32 { let (lv, rv) = (self.ssa(l), self.ssa(r)); self.emit(|fb| fb.ins().sshr(lv, rv)) }
+    // bit-count / byte-swap unops (Cranelift infers operand/result type; same width in/out)
+    pub fn emit_clz(&mut self, v: u32) -> u32 { let vv = self.ssa(v); self.emit(|fb| fb.ins().clz(vv)) }
+    pub fn emit_ctz(&mut self, v: u32) -> u32 { let vv = self.ssa(v); self.emit(|fb| fb.ins().ctz(vv)) }
+    pub fn emit_popcnt(&mut self, v: u32) -> u32 { let vv = self.ssa(v); self.emit(|fb| fb.ins().popcnt(vv)) }
+    pub fn emit_bswap(&mut self, v: u32) -> u32 { let vv = self.ssa(v); self.emit(|fb| fb.ins().bswap(vv)) }
 
     // --- Conversions ---
     pub fn emit_uextend(&mut self, v: u32, tt: u32) -> u32 { let vv = self.ssa(v); let t = map_type(tt).unwrap_or(types::I64); self.emit(|fb| fb.ins().uextend(t, vv)) }
     pub fn emit_sextend(&mut self, v: u32, tt: u32) -> u32 { let vv = self.ssa(v); let t = map_type(tt).unwrap_or(types::I64); self.emit(|fb| fb.ins().sextend(t, vv)) }
     pub fn emit_ireduce(&mut self, v: u32, tt: u32) -> u32 { let vv = self.ssa(v); let t = map_type(tt).unwrap_or(types::I32); self.emit(|fb| fb.ins().ireduce(t, vv)) }
+    // int -> float (result float type tt)
+    pub fn emit_fcvt_from_sint(&mut self, v: u32, tt: u32) -> u32 { let vv = self.ssa(v); let t = map_type(tt).unwrap_or(types::F64); self.emit(|fb| fb.ins().fcvt_from_sint(t, vv)) }
+    pub fn emit_fcvt_from_uint(&mut self, v: u32, tt: u32) -> u32 { let vv = self.ssa(v); let t = map_type(tt).unwrap_or(types::F64); self.emit(|fb| fb.ins().fcvt_from_uint(t, vv)) }
+    // float -> int (saturating; result int type tt). Saturating matches Julia's
+    // unsafe_trunc latitude (NaN->0, out-of-range saturate); the trapping variants
+    // would crash on NaN/overflow.
+    pub fn emit_fcvt_to_sint_sat(&mut self, v: u32, tt: u32) -> u32 { let vv = self.ssa(v); let t = map_type(tt).unwrap_or(types::I64); self.emit(|fb| fb.ins().fcvt_to_sint_sat(t, vv)) }
+    pub fn emit_fcvt_to_uint_sat(&mut self, v: u32, tt: u32) -> u32 { let vv = self.ssa(v); let t = map_type(tt).unwrap_or(types::I64); self.emit(|fb| fb.ins().fcvt_to_uint_sat(t, vv)) }
+    // float width changes (typed — result type tt: F32 for fdemote, F64 for fpromote)
+    pub fn emit_fdemote(&mut self, v: u32, tt: u32) -> u32 { let vv = self.ssa(v); let t = map_type(tt).unwrap_or(types::F32); self.emit(|fb| fb.ins().fdemote(t, vv)) }
+    pub fn emit_fpromote(&mut self, v: u32, tt: u32) -> u32 { let vv = self.ssa(v); let t = map_type(tt).unwrap_or(types::F64); self.emit(|fb| fb.ins().fpromote(t, vv)) }
 
     // --- Float ---
     pub fn emit_fadd(&mut self, l: u32, r: u32) -> u32 { let (lv, rv) = (self.ssa(l), self.ssa(r)); self.emit(|fb| fb.ins().fadd(lv, rv)) }
@@ -173,6 +233,14 @@ impl FunctionCtx {
     pub fn emit_fmul(&mut self, l: u32, r: u32) -> u32 { let (lv, rv) = (self.ssa(l), self.ssa(r)); self.emit(|fb| fb.ins().fmul(lv, rv)) }
     pub fn emit_fdiv(&mut self, l: u32, r: u32) -> u32 { let (lv, rv) = (self.ssa(l), self.ssa(r)); self.emit(|fb| fb.ins().fdiv(lv, rv)) }
     pub fn emit_fneg(&mut self, v: u32) -> u32 { let vv = self.ssa(v); self.emit(|fb| fb.ins().fneg(vv)) }
+    // float math unops (Cranelift infers operand/result type)
+    pub fn emit_sqrt(&mut self, v: u32) -> u32 { let vv = self.ssa(v); self.emit(|fb| fb.ins().sqrt(vv)) }
+    pub fn emit_fceil(&mut self, v: u32) -> u32 { let vv = self.ssa(v); self.emit(|fb| fb.ins().ceil(vv)) }
+    pub fn emit_ffloor(&mut self, v: u32) -> u32 { let vv = self.ssa(v); self.emit(|fb| fb.ins().floor(vv)) }
+    pub fn emit_ftrunc(&mut self, v: u32) -> u32 { let vv = self.ssa(v); self.emit(|fb| fb.ins().trunc(vv)) }
+    pub fn emit_fnearest(&mut self, v: u32) -> u32 { let vv = self.ssa(v); self.emit(|fb| fb.ins().nearest(vv)) }
+    pub fn emit_fabs(&mut self, v: u32) -> u32 { let vv = self.ssa(v); self.emit(|fb| fb.ins().fabs(vv)) }
+    pub fn emit_fcopysign(&mut self, l: u32, r: u32) -> u32 { let (lv, rv) = (self.ssa(l), self.ssa(r)); self.emit(|fb| fb.ins().fcopysign(lv, rv)) }
 
     // --- Memory ---
     pub fn emit_load(&mut self, ptr: u32, offset: i32, ty: u32) -> u32 {
@@ -190,7 +258,7 @@ impl FunctionCtx {
         let t = map_type(ty).unwrap_or(types::I64);
         let b = *self.blocks.get(block_name).unwrap_or(&self.current_block);
         let v = {
-            let mut fb = FunctionBuilder::new(&mut self.context.func, &mut self.fb_ctx);
+            let fb = self.fb();
             fb.append_block_param(b, t)
         };
         let id = v2u(v);
@@ -212,25 +280,22 @@ impl FunctionCtx {
 
     pub fn emit_brif_with_args(&mut self, cond: u32, then_s: &str, then_args: &[u32], else_s: &str, else_args: &[u32]) {
         let cv = self.ssa(cond);
-        // Reduce to i8 only if needed (icmp already produces i8)
-        let cvi8 = {
-            let vt = self.context.func.dfg.value_type(cv);
-            if vt == types::I8 {
-                cv
-            } else {
-                let curr = self.current_block;
-                let mut fb = FunctionBuilder::new(&mut self.context.func, &mut self.fb_ctx);
-                fb.switch_to_block(curr);
-                let r = fb.ins().ireduce(types::I8, cv);
-                drop(fb); r
-            }
-        };
+        let curr = self.current_block;
         let t = *self.blocks.get(then_s).unwrap_or(&self.current_block);
         let e = *self.blocks.get(else_s).unwrap_or(&self.current_block);
         let t_args: Vec<BlockArg> = then_args.iter().map(|&a| self.ssa(a).into()).collect();
         let e_args: Vec<BlockArg> = else_args.iter().map(|&a| self.ssa(a).into()).collect();
-        let curr = self.current_block;
-        self.emit_void(|fb| { fb.ins().brif(cvi8, t, t_args.iter(), e, e_args.iter()); });
+        {
+            let fb = self.fb();
+            if fb.current_block() != Some(curr) { fb.switch_to_block(curr); }
+            // Reduce cond to i8 only if needed (icmp already produces i8).
+            let cvi8 = if fb.func.dfg.value_type(cv) == types::I8 {
+                cv
+            } else {
+                fb.ins().ireduce(types::I8, cv)
+            };
+            fb.ins().brif(cvi8, t, t_args.iter(), e, e_args.iter());
+        }
         self.sealed.insert(curr);
     }
 
@@ -249,27 +314,37 @@ impl FunctionCtx {
         let func_id = *imports.get(name).unwrap_or_else(|| panic!("import not declared: {}", name));
         let args: Vec<Value> = arg_ids.iter().map(|&id| self.ssa(id)).collect();
         let curr = self.current_block;
-        let mut fb = FunctionBuilder::new(&mut self.context.func, &mut self.fb_ctx);
-        fb.switch_to_block(curr);
-        let func_ref = module.declare_func_in_func(func_id, &mut fb.func);
-        let call = fb.ins().call(func_ref, &args);
-        let result = fb.inst_results(call)[0];
-        drop(fb);
+        let result = {
+            let fb = self.fb();
+            if fb.current_block() != Some(curr) { fb.switch_to_block(curr); }
+            let func_ref = module.declare_func_in_func(func_id, &mut fb.func);
+            let call = fb.ins().call(func_ref, &args);
+            fb.inst_results(call)[0]
+        };
         let id = v2u(result);
         self.ssa_values.insert(id, result);
         id
     }
 
     pub fn finalize_ctx(&mut self) -> Result<(), String> {
-        let all: Vec<Block> = self.blocks.values().copied().collect();
-        for b in all {
-            if !self.sealed.contains(&b) {
-                let mut fb = FunctionBuilder::new(&mut self.context.func, &mut self.fb_ctx);
-                fb.seal_block(b); drop(fb); self.sealed.insert(b);
-            }
+        // Seal any blocks not explicitly sealed (e.g. implicit-jump fallthrough).
+        let unsealed: Vec<Block> = self.blocks.values().copied()
+            .filter(|b| !self.sealed.contains(b)).collect();
+        {
+            let fb = self.fb();
+            for b in &unsealed { fb.seal_block(*b); }
         }
-        let fb = FunctionBuilder::new(&mut self.context.func, &mut self.fb_ctx);
-        fb.finalize(); Ok(())
+        // Free the persistent builder. FunctionBuilder has no Drop impl and we
+        // intentionally do NOT call its `finalize(mut self)` here (its seal/fill/
+        // basic-block debug checks would need the context intact, and its safepoint
+        // pass is unused). The Function in self.context is complete; module.define_function
+        // runs Cranelift's verifier during compilation. fb_ctx is left non-empty and
+        // dropped with FunctionCtx — no further builders are created.
+        if !self.fb.is_null() {
+            unsafe { drop(Box::from_raw(self.fb)); }
+            self.fb = std::ptr::null_mut();
+        }
+        Ok(())
     }
 }
 
@@ -301,6 +376,9 @@ impl BuilderContext {
     pub fn add_function(&mut self, n: &str, rt: u32, pts: &[u32]) -> Option<*mut FunctionCtx> {
         let fc = FunctionCtx::new(n, rt, pts, self.call_conv)?;
         let mut bx = Box::new(fc);
+        // Phase 2 init: create the persistent FunctionBuilder now that the
+        // FunctionCtx is at its final (boxed) address.
+        bx.init_entry();
         let p: *mut FunctionCtx = &mut *bx; self.funcs.push(bx); Some(p)
     }
 
@@ -320,17 +398,21 @@ impl BuilderContext {
 
     pub fn finalize(&mut self, path: &Path) -> Result<(), String> {
         if self.done { return Err("already finalized".into()); }
+        // Per-function progress logs are noisy (one declare+defined pair per fn,
+        // printed for every compiled function across the whole test suite). Gate
+        // them behind NATIVE_BUILDER_VERBOSE so the default run is quiet.
+        let verbose = std::env::var("NATIVE_BUILDER_VERBOSE").is_ok();
         let mut module = self.module.take().ok_or("module already taken")?;
         for f in self.funcs.iter_mut() {
             f.finalize_ctx()?;
             let nm = f.func_name.clone();
             let sig = f.signature.clone();
-            eprintln!("[native-builder] declaring: {}", nm);
+            if verbose { eprintln!("[native-builder] declaring: {}", nm); }
             let fid = module.declare_function(&nm, Linkage::Export, &sig)
                 .map_err(|e| format!("declare {}: {}", nm, e))?;
             module.define_function(fid, &mut f.context)
                 .map_err(|e| format!("define {}: {:?}", nm, e))?;
-            eprintln!("[native-builder] defined: {}", nm);
+            if verbose { eprintln!("[native-builder] defined: {}", nm); }
         }
         let obj = module.finish().emit().map_err(|e| format!("emit: {}", e))?;
         std::fs::write(path, &obj).map_err(|e| format!("write: {}", e))?;

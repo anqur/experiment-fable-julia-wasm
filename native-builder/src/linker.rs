@@ -45,8 +45,13 @@ pub fn link_object_to_so(user_object: &Path, runtime_lib: &Path, so_path: &Path)
         ("ld.lld", "-shared")   // ELF shared library
     };
 
-    eprintln!("[linker] Using lld: {:?}", lld_path);
-    eprintln!("[linker] Linking {:?} + {:?} → {:?}", user_object, runtime_lib, so_path);
+    // Gate the per-link progress logs behind NATIVE_BUILDER_VERBOSE so the test
+    // suite output (one link per compiled function) is quiet by default.
+    let verbose = env::var("NATIVE_BUILDER_VERBOSE").is_ok();
+    if verbose {
+        eprintln!("[linker] Using lld: {:?}", lld_path);
+        eprintln!("[linker] Linking {:?} + {:?} → {:?}", user_object, runtime_lib, so_path);
+    }
 
     let mut cmd = Command::new(&lld_path);
     cmd.arg("-flavor")
@@ -67,7 +72,7 @@ pub fn link_object_to_so(user_object: &Path, runtime_lib: &Path, so_path: &Path)
     let output = cmd.output().map_err(|e| format!("Failed to execute lld: {}", e))?;
 
     if output.status.success() {
-        eprintln!("[linker] Linking successful → {:?}", so_path);
+        if verbose { eprintln!("[linker] Linking successful → {:?}", so_path); }
         Ok(())
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);

@@ -37,18 +37,27 @@ instead of serializing/parsing CLIF text.
 
 ## Build & test (native target)
 
-**Use the dev profile (`cargo build`) for local development** — it's ~250×
-faster to rebuild incrementally (~0.3s vs ~60s). Release (`cargo build --release`)
-is only needed for runtime-performance measurements. Both crates set
-`lto = true` + `opt-level = 3` in `[profile.release]`, which is what makes
-release slow; `[profile.dev]` disables `debug-assertions` (needed because
-cranelift-frontend asserts the FunctionBuilderContext is empty on each
-`FunctionBuilder::new`, which our transient-builder-per-FFI-call pattern trips
-— the codegen itself is correct, as the test suite confirms).
+**Use the dev profile (`cargo build`) for local development** — it keeps
+Cranelift's `debug_assertions` ON (Cargo's dev-profile default; neither
+`Cargo.toml` overrides `[profile.dev]`), which is how we catch IR-construction
+bugs. Release (`cargo build --release`) is only for runtime-perf measurement
+(`native-backend` sets `lto = true` + `opt-level = 3` in `[profile.release]`,
+which is what makes it slow).
 
-The Julia loader auto-selects the **newest** built artifact by mtime across
-`target/release` and `target/debug` (see `_newest_artifact` in
-`NativeCodegen.jl`), so whichever profile you built most recently is what runs.
+**The dev-profile gate must stay green.** It enforces two assertions the old
+"transient `FunctionBuilder` per FFI call" pattern silently bypassed in release
+(making debug builds panic). Both are now fixed by holding **one persistent
+`FunctionBuilder` per function** in `FunctionCtx` (raw-pointer field, two-phase
+init) and skipping redundant `switch_to_block` calls — see
+`native-builder/src/builder.rs`. If a debug build panics again, that's a real
+IR bug, not noise.
+
+The Julia loader resolves the **debug artifact only** (`_debug_artifact` in
+`NativeCodegen.jl`); `target/release` is never loaded during local development —
+release carries no debug-assertions and a stale release build has shadowed a fresh
+debug one, masking real bugs. Both `NativeCodegen.jl::_init_builder_lib` and
+`builder_emit.jl::get_native_builder_lib` use it (the latter delegates to the
+former). Release builds for perf measurement must be done out-of-band.
 
 ```bash
 # Build Rust components (two crates) — DEV profile, fast local iteration
@@ -56,7 +65,7 @@ cd native-backend && cargo build && cd ..    # runtime static lib (.a)
 cd native-builder && cargo build && cd ..    # eDSL builder (.so/dylib)
 # (For optimized runtime perf only: add --release — expect ~1 min/crate.)
 
-# Run eDSL pipeline test (41 tests)
+# Run eDSL pipeline test (43 tests)
 julia +nightly --project=. NativeCodegen/test/test_edsl_approach.jl
 
 # Explore IR patterns (read-only inspection)
@@ -164,7 +173,13 @@ for direct memory access (no runtime calls needed):
 - ✅ Scalar comparisons (icmp eq/ne/slt/sle/ult/ule; fcmp)
 - ✅ Bitwise ops (band, bor, bxor, ishl, ushr, sshr)
 - ✅ Float ops (fadd, fsub, fmul, fdiv, fneg)
-- ✅ Integer conversions (uextend, sextend, ireduce/trunc)
+- ✅ Integer conversions (uextend, sextend, ireduce/trunc) — `(Type, value)` arg order
+- ✅ Float↔int conversions (sitofp, uitofp, fptosi, fptoui, fpext, fptrunc) → Cranelift
+  `fcvt_from_sint`/`fcvt_from_uint`/`fcvt_to_sint_sat`/`fcvt_to_uint_sat`/`fpromote`/`fdemote`.
+  `fptosi`/`fptoui` use the **saturating** `_sat` variants (match Julia's unsafe_trunc latitude).
+- ✅ Float math (sqrt_llvm, ceil_llvm, floor_llvm, trunc_llvm, rint_llvm, abs_float, copysign_float)
+- ✅ Bit ops (ctlz/cttz/ctpop_int, bswap_int, flipsign_int, abs via flipsign_int(x,x))
+  — **full-width (Int64/UInt64) correct; sub-word needs renormalization (NYI)**
 - ✅ Control flow (GotoIfNot → brif, GotoNode → jump, ReturnNode → return)
 - ✅ Phi nodes (block params + jump/brif args)
 - ✅ Loops (while, gcd with swapping)
@@ -232,12 +247,15 @@ for direct memory access (no runtime calls needed):
 - **Type enums** must match between Julia (`TYPE_I64=1`, `TYPE_I32=0`, `TYPE_F64=3`, etc.) and Rust
 - **SSA tracking**: `BuilderCtx` tracks `ssa_values::Dict{Core.SSAValue, UInt32}`, `arg_values::Dict{Core.Argument, UInt32}`, `blocks::Dict{Int, String}`
 - **Ref tracking**: `BuilderCtx.ref_tracking` maps SSA values → `(base_ptr_id, composed_offset, struct_type)` for non-loadable types like MemoryRef. When `getfield` encounters a type that `cranelift_type()` can't handle (e.g. MemoryRef is 16 bytes), it records the composed offset. Subsequent `getfield` on that SSA value uses the tracked offset to emit the real load.
-- **FFI pattern**: Julia calls `ccall((:block_add_iadd, "libnative_builder"), ...)` with type enums and SSA IDs. Each FFI call creates a transient `FunctionBuilder`, emits one instruction, then drops it.
+- **FFI pattern**: Julia calls `ccall((:block_add_iadd, "libnative_builder"), ...)` with type enums and SSA IDs. The Rust side keeps **one persistent `FunctionBuilder` per function** in `FunctionCtx` (not one per FFI call); each `block_add_*` emits one instruction through it, skipping `switch_to_block` when already positioned on the target block. Holding one builder is mandatory — the old transient pattern tripped cranelift-frontend's `func_ctx.is_empty()` debug assertion.
 - **Cranelift API**: `FunctionBuilder` in Rust. Methods: `create_block()`, `switch_to_block()`, `ins().iadd()`, `ins().iconst()`, `ins().return_()`, `seal_block()`, `finalize()`
 - **Linking**: Julia's lld at `~/.julia/juliaup/julia-nightly/libexec/julia/lld`. Command: `lld -flavor ld.lld -shared -o out.so in.o libnative_backend.a`
 - **Import declaration**: `builder_declare_import(name, ret_type, param_types)` → declares in ObjectModule with `Linkage::Import`. `block_add_call(name, args)` → emits `call` via `module.declare_func_in_func` + `fb.ins().call`.
 - **Constant emission**: Each `resolve_operand` call for a constant emits a NEW iconst — constants are NOT cached across blocks, as that would cause Cranelift verifier cross-block dominance violations.
 - **PIC required on ARM64 macOS**: The flags builder MUST set `is_pic = true` (requires `use cranelift_codegen::settings::Configurable`). Without PIC, external function calls crash with `ReadOnlyMemoryError` because ARM64 macOS enforces position-independent executables and `dyld` rejects absolute relocations in `.text`.
+- **Conversion intrinsic arg order**: all conversions (`sext_int`/`zext_int`/`trunc_int`/`sitofp`/`uitofp`/`fptosi`/`fptoui`/`fpext`/`fptrunc`) are `(Type, value)` — args[1] is the *result* type, args[2] the value. The type arg can arrive as a bare `DataType`, a `Core.Const`/`QuoteNode`, OR a `GlobalRef` to the type (e.g. `GlobalRef(Base, Float64)`); `_unwrap_type` (`builder_emit.jl`) handles all three. Cranelift op mapping: int↔float via `fcvt_from_sint`/`fcvt_from_uint`/`fcvt_to_sint_sat`/`fcvt_to_uint_sat`; f32↔f64 via `fpromote`/`fdemote` (both take the result `Type`).
+- **Intrinsic dispatch is dual**: intrinsics may arrive as `Core.IntrinsicFunction` (→ `emit_intrinsic`) OR as `GlobalRef` (`Base.sitofp`, `Base.bswap_int`, `Base.ceil_llvm`, … → `emit_globalref`). Each intrinsic must be handled in **both** places. Name via `ccall(:jl_intrinsic_name, …)` for the IntrinsicFunction form.
+- **Bridge ABI gaps (FIXED)**: `native_callable[_from_so]` must ccall with the return type matching the function's actual return, and pass Float32 args via the Float32 ABI. `_call1_i64`/`_call1_i32` handle `Float64`/`Float32` returns (int-arg/float-return, e.g. `sitofp`); `_call1_f32` passes Float32 args (fpext). Float32 args are NOT lumped with Float64 (AArch64 `s0` ≠ `d0` — passing Float64 makes the callee read wrong bits).
 
 ### Known limitations & workarounds
 
