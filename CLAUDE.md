@@ -216,13 +216,34 @@ for direct memory access (no runtime calls needed):
   `__jl_array_resize` → `jl_array_grow_end`/`jl_array_del_end`; **`push!(a, x)`**
   via `invoke Base._growend_internal!(a, 1, oldsize)` → `__jl_array_grow_end`;
   `memoryrefoffset` emitted as constant from `ref_tracking.byte_offset / elem_size + 1`.
-- 🔄 **`pop!(a)` in progress** — `Core.memoryrefunset!` handler added (stores zero
-  for GC safety); `Base.throw` emits trap; terminator-after-trap skipping added.
-  Debug prints active in `emit_memoryrefnew`. Issue: returns `a[end-1]` instead of
-  `a[end]` when combined with `resize!` — root cause under investigation (suspect
-  cross-block SSA value resolution or block ordering).
-- ⏸️ `append!` deferred (needs `invoke unsafe_copyto!` bulk copy between MemoryRefs).
-- ✅ `compile_and_call` supports 0–2 args (was 0–1)
+- ✅ **`pop!(a)`** — lowers through existing plumbing (no dedicated handler):
+  `memoryrefget` reads last element, `Core.memoryrefunset!` zeroes it for GC
+  safety, `Base.setfield!(:size, (n-1,))` shrinks, `Base.throw`→trap with
+  terminator-after-throw block skipping. `pop!` returns the *element* (Int64),
+  not the array, and mutates the caller's array in place.
+- ✅ **`append!(a, b)`** — `_growend_internal!` (handled) + `setfield!(:size)`
+  (handled) + `invoke Base.unsafe_copyto!(dst_memref, src_memref, n)`. The
+  copy lowers to `__jl_memcpy(dst_addr, src_addr, n*sizeof(T))` (a
+  `copy_nonoverlapping` wrapper in `gc.rs`); the two memrefs are resolved from
+  `ref_tracking` (their tracked element addresses). Ranges (`%new(UnitRange,…)`
+  built only for the dead `_throw_boundserror_indices` path) emit a sentinel.
+- ✅ **Runtime-element array literals** — `[a, b, c]` where elements are
+  variables (not constants). Julia lowers to `Core.tuple(%a,%b,%c)`
+  (`emit_core_tuple` allocates a heap tuple) + a `getfield(%t, %k)` loop.
+  `emit_struct_getfield` routes runtime tuples through the new
+  `emit_tuple_index_from_ssa`: loads each field from the tuple pointer at
+  `fieldoffset`, then returns the one requested (constant index) or a
+  `block_add_select` chain over the dynamic index (mirrors the constant-tuple
+  `emit_tuple_index`). Single-element tuples pass through (no allocation).
+  built only for the dead `_throw_boundserror_indices` path) emit a sentinel.
+- ✅ **N-argument bridge** — `compile_and_call`, `native_callable`, and
+  `native_callable_from_so` support **any arity** via a single `@generated _gcall`
+  dispatcher (`NativeCodegen.jl`) that builds the `ccall` argument-type tuple from
+  the declared `argtypes`. Replaced the old enumerated `_call0`/`_call1_*`/`_call2_*`
+  ladder (which capped at 2 args). Marshalling: arg ptr→`Ptr{Cvoid}`(pointer_from_objref),
+  f64→Float64, f32→Float32(abi), i64→Int64(to_wire), else→Int32(to_wire); return
+  Nothing→Cvoid, ptr→unsafe_pointer_to_objref, Float64/Float32→direct, else→Int64+from_wire.
+  Calls the compiled function exactly once.
 - ✅ **Checked-arithmetic overflow pairs** — `checked_{s,u}{add,sub,mul}_int` return
   `(value, overflowed::Bool)` from a *single* IR stmt. Materialized as TWO value
   ids in `bc.ssa_pairs[stmt_idx] = (value_id, flag_id)` (no tuple allocation),
@@ -249,9 +270,21 @@ for direct memory access (no runtime calls needed):
 - `_norm_nargs(argtypes)`: treats a single `Tuple{}` argtype as "no arguments", so
   callers can pass `argtypes = Tuple{}` uniformly (matches `compile_and_call`)
 - `compile_and_call(f, rettype, argtypes::Type{<:Tuple}, args...)`: one-shot helper
-  supporting 0–2 args with automatic pointer↔object conversion (note: index arg
-  types via `argtypes.parameters[i]`, NOT `argtypes[i]` — the latter is Julia's
-  type-array literal syntax)
+  supporting **any arity** via `_gcall` (note: index arg types via
+  `argtypes.parameters[i]`, NOT `argtypes[i]` — the latter is Julia's type-array
+  literal syntax)
+- **`_gcall` generated dispatcher**: ONE `@generated function _gcall(ptr, ::Type{RT},
+  ::Type{AT}, args...) where {RT, AT<:Tuple}` replaces the entire old
+  `_call0`/`_call1_*`/`_call2_*`/`_ret` ladder. It builds the `ccall` argument-type
+  tuple from `AT.parameters` and the return type from `RT`, so any arity / type
+  combination works without enumeration. `native_callable` / `native_callable_from_so`
+  return `(args...) -> _gcall(ptr, rettype, AT, args...)`.
+- **Call exactly once (INVARIANT)**: `_gcall` issues a single `ccall`. The old
+  per-arity helpers once did an unconditional `ccall(...,Ptr{Cvoid},...)` to capture
+  the return pointer THEN re-called for scalar returns — running the function
+  TWICE, which corrupted side-effecting callees (`push!`/`pop!`/`resize!`/`append!`
+  observed their own earlier mutation, e.g. `pop!` returned `a[end-1]` and
+  over-shrank by one). The single-call invariant is now structural to `_gcall`.
 - Also `native_callable_from_so` for loading pre-linked .so files (bypasses Rust ccalls)
 
 ### Key eDSL conventions (builder_emit.jl ↔ native-builder)
@@ -261,7 +294,16 @@ for direct memory access (no runtime calls needed):
 - **Ref tracking**: `BuilderCtx.ref_tracking` maps SSA values → `(base_ptr_id, composed_offset, struct_type)` for non-loadable types like MemoryRef. When `getfield` encounters a type that `cranelift_type()` can't handle (e.g. MemoryRef is 16 bytes), it records the composed offset. Subsequent `getfield` on that SSA value uses the tracked offset to emit the real load.
 - **FFI pattern**: Julia calls `ccall((:block_add_iadd, "libnative_builder"), ...)` with type enums and SSA IDs. The Rust side keeps **one persistent `FunctionBuilder` per function** in `FunctionCtx` (not one per FFI call); each `block_add_*` emits one instruction through it, skipping `switch_to_block` when already positioned on the target block. Holding one builder is mandatory — the old transient pattern tripped cranelift-frontend's `func_ctx.is_empty()` debug assertion.
 - **Cranelift API**: `FunctionBuilder` in Rust. Methods: `create_block()`, `switch_to_block()`, `ins().iadd()`, `ins().iconst()`, `ins().return_()`, `seal_block()`, `finalize()`
-- **Linking**: Julia's lld at `~/.julia/juliaup/julia-nightly/libexec/julia/lld`. Command: `lld -flavor ld.lld -shared -o out.so in.o libnative_backend.a`
+- **Linking**: Julia's lld at `~/.julia/juliaup/julia-nightly/libexec/julia/lld`. Command: `lld -flavor ld.lld -shared -o out.so in.o libnative_backend.a` — note there is **no `-lm`/`-lc`**, so Cranelift libcalls (`ceil`/`floor`/`trunc`, the `mem*` family, …) resolve at `dlopen` against the host Julia process's libm/libc.
+- **Entry symbols are prefixed** with `ENTRY_SYMBOL_PREFIX` (`"__jl_entry_"`) in
+  `compile_native` (`NativeCodegen.jl`), and `comp.func_name` carries the
+  prefixed symbol so `native_callable_from_so`/`compile_and_call` dlsym it
+  consistently. **Why:** with no `-lm`, a libcall like `ceil` resolves to the
+  nearest in-module definition; if an entry were exported bare as `ceil`, the
+  libcall would bind to the entry itself → infinite self-recursion
+  (`StackOverflowError` at the runtime call). The prefix guarantees no user/test
+  `name` can ever shadow a libcall. (Cranelift lowers `ceil_llvm`/`floor_llvm`
+  to libm libcalls on x86-64; `sqrt` is native `sqrtsd`, so it never had the issue.)
 - **Import declaration**: `builder_declare_import(name, ret_type, param_types)` → declares in ObjectModule with `Linkage::Import`. `block_add_call(name, args)` → emits `call` via `module.declare_func_in_func` + `fb.ins().call`.
 - **Constant emission**: Each `resolve_operand` call for a constant emits a NEW iconst — constants are NOT cached across blocks, as that would cause Cranelift verifier cross-block dominance violations.
 - **PIC required on ARM64 macOS**: The flags builder MUST set `is_pic = true` (requires `use cranelift_codegen::settings::Configurable`). Without PIC, external function calls crash with `ReadOnlyMemoryError` because ARM64 macOS enforces position-independent executables and `dyld` rejects absolute relocations in `.text`.
@@ -289,6 +331,11 @@ for direct memory access (no runtime calls needed):
    `getfield(arr, :ref)`/`memoryrefset!` pipeline, exactly as for passed-in arrays.
    Note: `__jl_gc_alloc` / `__jl_gc_alloc_array` (legacy Boehm-header allocators)
    still exist but are NOT used for returnable objects.
+   **Array-vs-range detection**: `emit_new` gates the array path on `T <: Array`
+   (NOT `AbstractArray` — `UnitRange`/`StepRange`/… are `<: AbstractArray` too,
+   via `AbstractVector`, and would wrongly take the array path). Ranges
+   (`T <: AbstractRange`) only appear as `%new(UnitRange, lo, hi)` in dead
+   `_throw_boundserror_indices` paths and emit a `0` sentinel.
 
 2. **Cranelift ObjectModule `call` FIXED** — Added `is_pic = true` to the Cranelift
    flags builder and `use cranelift_codegen::settings::Configurable` import. On

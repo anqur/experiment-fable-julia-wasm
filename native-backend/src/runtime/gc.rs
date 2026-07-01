@@ -257,3 +257,16 @@ pub unsafe extern "C" fn __jl_array_resize(a: *mut u8, n: i64) -> *mut u8 {
     }
     a
 }
+
+/// Bulk byte copy used by `append!` / `Base.unsafe_copyto!` between two array
+/// data regions. `n` is in BYTES (caller multiplies by elem_size). The dst/src
+/// pointers are the resolved element addresses from the MemoryRef pipeline
+/// (already advanced to the correct 0-based offset). Non-overlapping regions
+/// only — matches `unsafe_copyto!` semantics.
+#[no_mangle]
+pub unsafe extern "C" fn __jl_memcpy(dst: *mut u8, src: *const u8, n: i64) -> *mut u8 {
+    if !dst.is_null() && !src.is_null() && n > 0 {
+        std::ptr::copy_nonoverlapping(src, dst, n as usize);
+    }
+    dst
+}

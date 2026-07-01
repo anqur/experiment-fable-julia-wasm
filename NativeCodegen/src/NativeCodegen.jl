@@ -33,8 +33,18 @@ include("builder_emit.jl")
 
 struct NativeCompilation
     so_path::String      # Path to generated .so file
-    func_name::String    # Function name (e.g., "entry")
+    func_name::String    # Exported symbol (prefixed, e.g. "__jl_entry_entry")
 end
+
+# Prefix every exported entry symbol so it can NEVER collide with a Cranelift
+# libcall name. Cranelift lowers some IR ops (ceil_llvm/floor_llvm, and the
+# mem* family) to external libcalls resolved by symbol name at .so load. If an
+# entry were exported under a bare name like "ceil", the libcall would bind to
+# the entry itself → infinite self-recursion (StackOverflowError) — observed
+# when a test named its entry "ceil"/"floor". With this prefix no user/test
+# `name` can shadow a libcall. `comp.func_name` carries the prefixed symbol, so
+# native_callable_from_so / compile_and_call dlsym it consistently.
+const ENTRY_SYMBOL_PREFIX = "__jl_entry_"
 
 const _BUILDER_LIB_PATH = Ref{String}()
 const _RUNTIME_LIB_PATH = Ref{String}()
@@ -77,9 +87,14 @@ end
 function compile_native(f, argtypes::Type{<:Tuple}; name::String="entry")
     interp = WasmInterp()
 
+    # Prefix the exported symbol so it cannot collide with a Cranelift libcall
+    # (see ENTRY_SYMBOL_PREFIX). `name` is just a human label; the symbol is
+    # derived from it and used consistently for both emission and dlsym.
+    symbol = ENTRY_SYMBOL_PREFIX * name
+
     # Generate object file via eDSL builder
     temp_obj = tempname() * ".o"
-    emit_function_via_builder(interp, f, argtypes; name=name, output_path=temp_obj)
+    emit_function_via_builder(interp, f, argtypes; name=symbol, output_path=temp_obj)
 
     # Link object file with runtime library to create final .so
     builder_lib = _init_builder_lib()
@@ -95,118 +110,59 @@ function compile_native(f, argtypes::Type{<:Tuple}; name::String="entry")
     # Clean up temporary object file
     rm(temp_obj)
 
-    return NativeCompilation(so_path, name)
+    return NativeCompilation(so_path, symbol)
 end
 
 # Helper: check if return type needs Ptr{Cvoid} (pointer to GC object)
 _is_ptr_type(T) = (T isa DataType && (Base.ismutabletype(T) || T === String || T <: Tuple) && !(T <: Ptr))
 
-# For pointer returns, use Ptr{Cvoid} instead of from_wire
-function _ret(ptr, raw, rettype)
-    _is_ptr_type(rettype) && return Ptr{Cvoid}(raw)
-    rettype === Float64 && return reinterpret(Float64, raw)
-    rettype === Float32 && return reinterpret(Float32, Int32(raw))
-    return from_wire(rettype, raw)
-end
-
-function _call0(ptr::Ptr{Cvoid}, rettype)
-    rettype === Nothing && return (ccall(ptr, Cvoid, ()); nothing)
-    _is_ptr_type(rettype) && return unsafe_pointer_to_objref(ccall(ptr, Ptr{Cvoid}, ()))
-    rettype === Float64 && return ccall(ptr, Float64, ())
-    rettype === Float32 && return ccall(ptr, Float32, ())
-    return from_wire(rettype, ccall(ptr, Int64, ()))
-end
-
-function _call1_i64(ptr::Ptr{Cvoid}, rettype, T1, a1)
-    w1 = Int64(to_wire(T1, a1))
-    rettype === Nothing && return (ccall(ptr, Cvoid, (Int64,), w1); nothing)
-    # Int arg but float return (e.g. sitofp): ccall must read the float register.
-    rettype === Float64 && return ccall(ptr, Float64, (Int64,), w1)
-    rettype === Float32 && return ccall(ptr, Float32, (Int64,), w1)
-    raw = ccall(ptr, Int64, (Int64,), w1)
-    return _ret(ptr, raw, rettype)
-end
-
-function _call1_f64(ptr::Ptr{Cvoid}, rettype, a1)
-    rettype === Nothing && return (ccall(ptr, Cvoid, (Float64,), a1); nothing)
-    rettype === Float64 && return ccall(ptr, Float64, (Float64,), a1)
-    rettype === Bool && return ccall(ptr, Int32, (Float64,), a1) != 0
-    return from_wire(rettype, ccall(ptr, Int64, (Float64,), a1))
-end
-
-# Float32 arg: must pass via the Float32 ABI (AArch64 s0 != d0 — passing Float64
-# makes the callee read the wrong bits). Handles Float64/Float32/Bool returns.
-function _call1_f32(ptr::Ptr{Cvoid}, rettype, a1)
-    rettype === Nothing && return (ccall(ptr, Cvoid, (Float32,), a1); nothing)
-    rettype === Float32 && return ccall(ptr, Float32, (Float32,), a1)
-    rettype === Float64 && return ccall(ptr, Float64, (Float32,), a1)
-    rettype === Bool && return ccall(ptr, Int32, (Float32,), a1) != 0
-    return from_wire(rettype, ccall(ptr, Int64, (Float32,), a1))
-end
-
-function _call2_ff(ptr::Ptr{Cvoid}, rettype, a1, a2)
-    rettype === Nothing && return (ccall(ptr, Cvoid, (Float64,Float64), a1, a2); nothing)
-    rettype === Float64 && return ccall(ptr, Float64, (Float64,Float64), a1, a2)
-    rettype === Bool && return ccall(ptr, Int32, (Float64,Float64), a1, a2) != 0
-    return from_wire(rettype, ccall(ptr, Int64, (Float64,Float64), a1, a2))
-end
-
-function _call2_fi(ptr::Ptr{Cvoid}, rettype, T2, a1, a2, ::Type{Int64})
-    w2 = Int64(to_wire(T2, a2))
-    rettype === Nothing && return (ccall(ptr, Cvoid, (Float64,Int64), a1, w2); nothing)
-    raw = ccall(ptr, Float64, (Float64,Int64), a1, w2)
-    return from_wire(rettype, raw)
-end
-
-function _call1_i32(ptr::Ptr{Cvoid}, rettype, T1, a1)
-    w1 = Int32(to_wire(T1, a1))
-    rettype === Nothing && return (ccall(ptr, Cvoid, (Int32,), w1); nothing)
-    # Int arg but float return (e.g. sitofp on sub-word): ccall must read the float register.
-    rettype === Float64 && return ccall(ptr, Float64, (Int32,), w1)
-    rettype === Float32 && return ccall(ptr, Float32, (Int32,), w1)
-    raw = ccall(ptr, Int64, (Int32,), w1)
-    return _ret(ptr, raw, rettype)
-end
-
-function _call2_ii(ptr::Ptr{Cvoid}, rettype, T1, T2, a1, a2, ::Type{Int64}, ::Type{Int64})
-    w1 = Int64(to_wire(T1, a1)); w2 = Int64(to_wire(T2, a2))
-    rettype === Nothing && return (ccall(ptr, Cvoid, (Int64,Int64), w1, w2); nothing)
-    raw = ccall(ptr, Int64, (Int64,Int64), w1, w2)
-    return _ret(ptr, raw, rettype)
-end
-
-function _call2_ij(ptr::Ptr{Cvoid}, rettype, T1, T2, a1, a2, ::Type{Int64}, ::Type{Int32})
-    w1 = Int64(to_wire(T1, a1)); w2 = Int32(to_wire(T2, a2))
-    rettype === Nothing && return (ccall(ptr, Cvoid, (Int64,Int32), w1, w2); nothing)
-    raw = ccall(ptr, Int64, (Int64,Int32), w1, w2)
-    return _ret(ptr, raw, rettype)
-end
-
-function _call2_ji(ptr::Ptr{Cvoid}, rettype, T1, T2, a1, a2, ::Type{Int32}, ::Type{Int64})
-    w1 = Int32(to_wire(T1, a1)); w2 = Int64(to_wire(T2, a2))
-    rettype === Nothing && return (ccall(ptr, Cvoid, (Int32,Int64), w1, w2); nothing)
-    raw = ccall(ptr, Int64, (Int32,Int64), w1, w2)
-    return _ret(ptr, raw, rettype)
-end
-
-# Pointer+scalar dispatch: ptr arg is already a Ptr{Cvoid}
-function _call2_pi(ptr::Ptr{Cvoid}, rettype, T2, a1::Ptr{Cvoid}, a2, ::Type{Int64})
-    w2 = Int64(to_wire(T2, a2))
-    rettype === Nothing && return (ccall(ptr, Cvoid, (Ptr{Cvoid},Int64), a1, w2); nothing)
-    raw = ccall(ptr, Int64, (Ptr{Cvoid},Int64), a1, w2)
-    return _ret(ptr, raw, rettype)
-end
-
-function _call2_jj(ptr::Ptr{Cvoid}, rettype, T1, T2, a1, a2, ::Type{Int32}, ::Type{Int32})
-    w1 = Int32(to_wire(T1, a1)); w2 = Int32(to_wire(T2, a2))
-    rettype === Nothing && return (ccall(ptr, Cvoid, (Int32,Int32), w1, w2); nothing)
-    raw = ccall(ptr, Int64, (Int32,Int32), w1, w2)
-    return _ret(ptr, raw, rettype)
-end
-
 _is_i64(T) = let r = scalar_repr(T); !_is_ptr_type(T) && r !== nothing && r.bits == 64 && !r.isfloat; end
 _is_f64(T) = let r = scalar_repr(T); !_is_ptr_type(T) && r !== nothing && r.isfloat && r.bits == 64; end
 _is_f32(T) = let r = scalar_repr(T); !_is_ptr_type(T) && r !== nothing && r.isfloat && r.bits == 32; end
+
+# === N-argument ccall dispatcher ===
+# One @generated function handles ANY arity and type combination, replacing the
+# old enumerated _call0 / _call1_{i64,i32,f64,f32} / _call2_{ii,ij,ji,jj,ff,fi,pi}
+# ladder (which was O(3^N) and capped at 2 args). The ccall argument-type tuple
+# and return type are built from the DECLARED arg-type tuple `AT` and return type
+# `RT`, so the compiled entry's ABI (what `cranelift_type` produced) matches
+# exactly. Marshalling rules (preserved from the old helpers):
+#   arg  : ptr→Ptr{Cvoid}(pointer_from_objref)  f64→Float64  f32→Float32(abi)
+#          i64→Int64(to_wire)  else→Int32(to_wire)
+#   ret  : Nothing→Cvoid  ptr→Ptr{Cvoid}(unsafe_pointer_to_objref)
+#          Float64→Float64  Float32→Float32  else→Int64 then from_wire
+# `AT` is the declared arg-type tuple (classify on it, NOT on typeof(value), so a
+# value passed where a wider type is declared keeps the declared width).
+@generated function _gcall(ptr::Ptr{Cvoid}, ::Type{RT}, ::Type{AT}, args...) where {RT, AT<:Tuple}
+    ccall_types = Type[]
+    arg_exprs = Expr[]
+    for i in eachindex(AT.parameters)
+        T = AT.parameters[i]
+        if _is_ptr_type(T)
+            push!(ccall_types, Ptr{Cvoid}); push!(arg_exprs, :(pointer_from_objref(getfield(args,$i))))
+        elseif _is_f64(T)
+            push!(ccall_types, Float64); push!(arg_exprs, :(getfield(args,$i)))
+        elseif _is_f32(T)
+            push!(ccall_types, Float32); push!(arg_exprs, :(Float32(getfield(args,$i))))
+        elseif _is_i64(T)
+            push!(ccall_types, Int64); push!(arg_exprs, :(Int64(to_wire($T, getfield(args,$i)))))
+        else
+            push!(ccall_types, Int32); push!(arg_exprs, :(Int32(to_wire($T, getfield(args,$i)))))
+        end
+    end
+    sig = Expr(:tuple, ccall_types...)
+    if RT === Nothing
+        return :(ccall(ptr, Cvoid, $sig, $(arg_exprs...)); nothing)
+    elseif _is_ptr_type(RT)
+        return :(unsafe_pointer_to_objref(ccall(ptr, Ptr{Cvoid}, $sig, $(arg_exprs...))))
+    elseif RT === Float64
+        return :(ccall(ptr, Float64, $sig, $(arg_exprs...)))
+    elseif RT === Float32
+        return :(ccall(ptr, Float32, $sig, $(arg_exprs...)))
+    else
+        return :(from_wire($RT, ccall(ptr, Int64, $sig, $(arg_exprs...))))
+    end
+end
 
 # Normalize the no-args convention used across the bridge: a single `Tuple{}`
 # argtype means "this function takes no arguments" (matches `compile_and_call`'s
@@ -215,59 +171,10 @@ _norm_nargs(argtypes) = (length(argtypes) == 1 && argtypes[1] === Tuple{}) ? 0 :
 
 function native_callable(comp::NativeCompilation, rettype, argtypes::Type...)
     ptr = comp.entry_ptr
-    nargs = _norm_nargs(argtypes)
-    if nargs == 0
-        return (() -> _call0(ptr, rettype))
-    elseif nargs == 1
-        T1 = argtypes[1]
-        rt = rettype
-        if _is_ptr_type(T1)
-            return (a1 -> _ret(ptr, ccall(ptr, Int64, (Ptr{Cvoid},), pointer_from_objref(a1)), rettype))
-        end
-        if _is_f64(T1)
-            return (a1 -> _call1_f64(ptr, rt, Float64(a1)))
-        end
-        if _is_f32(T1)
-            return (a1 -> _call1_f32(ptr, rt, Float32(a1)))
-        end
-        if _is_i64(T1)
-            return (a1 -> _call1_i64(ptr, rt, T1, a1))
-        else
-            return (a1 -> _call1_i32(ptr, rt, T1, a1))
-        end
-    elseif nargs == 2
-        T1, T2 = argtypes[1], argtypes[2]
-        rt = rettype
-        if _is_ptr_type(T1) && !_is_ptr_type(T2)
-            if _is_i64(T2)
-                return ((a1,a2) -> _call2_pi(ptr, rt, T2, pointer_from_objref(a1), a2, Int64))
-            else
-                return ((a1,a2) -> _call2_pi(ptr, rt, T2, pointer_from_objref(a1), a2, Int32))
-            end
-        end
-        # Float + Float
-        if _is_f64(T1) && _is_f64(T2)
-            return ((a1,a2) -> _call2_ff(ptr, rt, a1, a2))
-        end
-        # Float + Int
-        if _is_f64(T1) && _is_i64(T2)
-            return ((a1,a2) -> _call2_fi(ptr, rt, T2, a1, a2, Int64))
-        end
-        i641, i642 = _is_i64(T1), _is_i64(T2)
-        VT1 = i641 ? Int64 : Int32
-        VT2 = i642 ? Int64 : Int32
-        if i641 && i642
-            return ((a1,a2) -> _call2_ii(ptr, rt, T1, T2, a1, a2, VT1, VT2))
-        elseif i641 && !i642
-            return ((a1,a2) -> _call2_ij(ptr, rt, T1, T2, a1, a2, VT1, VT2))
-        elseif !i641 && i642
-            return ((a1,a2) -> _call2_ji(ptr, rt, T1, T2, a1, a2, VT1, VT2))
-        else
-            return ((a1,a2) -> _call2_jj(ptr, rt, T1, T2, a1, a2, VT1, VT2))
-        end
-    else
-        error("unsupported arg count $nargs for Phase 1")
-    end
+    # AT = declared arg-type tuple (Tuple{} for the 0-arg case, incl. the
+    # `(Tuple{},)` convention). One uniform closure dispatches via _gcall for any N.
+    AT = _norm_nargs(argtypes) == 0 ? Tuple{} : Tuple{argtypes...}
+    return ((args...) -> _gcall(ptr, rettype, AT, args...))
 end
 
 # Direct .so loading from Julia (no Rust needed for testing)
@@ -275,171 +182,25 @@ function native_callable_from_so(comp::NativeCompilation, rettype::Type, argtype
     lib = Libdl.dlopen(comp.so_path)
     func_ptr = Libdl.dlsym(lib, comp.func_name)
 
-    nargs = _norm_nargs(argtypes)
-    if nargs == 0
-        # _call0 already handles pointer returns via unsafe_pointer_to_objref,
-        # so no special-casing is needed here. The closure calls the function
-        # on each invocation (lib must stay open for the closure's lifetime).
-        return (() -> _call0(func_ptr, rettype))
-    elseif nargs == 1
-        T1 = argtypes[1]
-        rt = rettype
-        if _is_ptr_type(T1)
-            return (a1 -> _ret(func_ptr, ccall(func_ptr, Int64, (Ptr{Cvoid},), pointer_from_objref(a1)), rettype))
-        end
-        if _is_f64(T1)
-            return (a1 -> _call1_f64(func_ptr, rt, Float64(a1)))
-        end
-        if _is_f32(T1)
-            return (a1 -> _call1_f32(func_ptr, rt, Float32(a1)))
-        end
-        if _is_i64(T1)
-            return (a1 -> _call1_i64(func_ptr, rt, T1, a1))
-        else
-            return (a1 -> _call1_i32(func_ptr, rt, T1, a1))
-        end
-    elseif nargs == 2
-        T1, T2 = argtypes[1], argtypes[2]
-        rt = rettype
-        if _is_ptr_type(T1) && !_is_ptr_type(T2)
-            if _is_i64(T2)
-                return ((a1,a2) -> _call2_pi(func_ptr, rt, T2, pointer_from_objref(a1), a2, Int64))
-            else
-                return ((a1,a2) -> _call2_pi(func_ptr, rt, T2, pointer_from_objref(a1), a2, Int32))
-            end
-        end
-        # Float + Float
-        if _is_f64(T1) && _is_f64(T2)
-            return ((a1,a2) -> _call2_ff(func_ptr, rt, a1, a2))
-        end
-        # Float + Int
-        if _is_f64(T1) && _is_i64(T2)
-            return ((a1,a2) -> _call2_fi(func_ptr, rt, T2, a1, a2, Int64))
-        end
-        i641, i642 = _is_i64(T1), _is_i64(T2)
-        VT1 = i641 ? Int64 : Int32
-        VT2 = i642 ? Int64 : Int32
-        if i641 && i642
-            return ((a1,a2) -> _call2_ii(func_ptr, rt, T1, T2, a1, a2, VT1, VT2))
-        elseif i641 && !i642
-            return ((a1,a2) -> _call2_ij(func_ptr, rt, T1, T2, a1, a2, VT1, VT2))
-        elseif !i641 && i642
-            return ((a1,a2) -> _call2_ji(func_ptr, rt, T1, T2, a1, a2, VT1, VT2))
-        else
-            return ((a1,a2) -> _call2_jj(func_ptr, rt, T1, T2, a1, a2, VT1, VT2))
-        end
-    else
-        error("unsupported arg count $nargs for eDSL approach")
-    end
+    # AT = declared arg-type tuple (Tuple{} for the 0-arg case). One uniform
+    # closure dispatches via _gcall for any N. (lib must stay open for the
+    # closure's lifetime.)
+    AT = _norm_nargs(argtypes) == 0 ? Tuple{} : Tuple{argtypes...}
+    return ((args...) -> _gcall(func_ptr, rettype, AT, args...))
 end
 
-# Helper function to compile and call directly (handles object returns properly)
+# Helper function to compile and call directly (handles object returns properly).
+# Routes through the N-arg _gcall dispatcher — supports any arity, and calls the
+# compiled function exactly once (no double-call, so side-effecting callees like
+# push!/pop!/resize!/append! are safe).
 function compile_and_call(f, rettype::Type, argtypes::Type{<:Tuple}, args...; name::String="entry")
     comp = compile_native(f, argtypes; name=name)
     lib = Libdl.dlopen(comp.so_path)
     func = Libdl.dlsym(lib, comp.func_name)
-
-    nargs = length(args)
-    if nargs == 0
-        result_ptr = ccall(func, Ptr{Cvoid}, ())
-        result = _is_ptr_type(rettype) ? unsafe_pointer_to_objref(result_ptr) :
-                  rettype === Float64 ? ccall(func, Float64, ()) :
-                  rettype === Float32 ? ccall(func, Float32, ()) :
-                  from_wire(rettype, ccall(func, Int64, ()))
-        Libdl.dlclose(lib)
-        rm(comp.so_path)
-        return result
-    elseif nargs == 1
-        T1, a1 = argtypes.parameters[1], args[1]
-        # Handle struct arguments by passing as pointer
-        if _is_ptr_type(T1)
-            arg_ptr = pointer_from_objref(a1)
-            result_ptr = ccall(func, Ptr{Cvoid}, (Ptr{Cvoid},), arg_ptr)
-            result = _is_ptr_type(rettype) ? unsafe_pointer_to_objref(result_ptr) :
-                      rettype === Float64 ? reinterpret(Float64, ccall(func, Float64, (Ptr{Cvoid},), arg_ptr)) :
-                      rettype === Float32 ? reinterpret(Float32, ccall(func, Float32, (Ptr{Cvoid},), arg_ptr)) :
-                      from_wire(rettype, ccall(func, Int64, (Ptr{Cvoid},), arg_ptr))
-            Libdl.dlclose(lib)
-            rm(comp.so_path)
-            return result
-        elseif _is_f64(T1)
-            # Float64 arg: pass directly (NOT via to_wire, which is for integer wire bits).
-            # Float returns come back in XMM0, so the ccall return type must match rettype.
-            result = rettype === Float64 ? ccall(func, Float64, (Float64,), Float64(a1)) :
-                      rettype === Float32 ? ccall(func, Float32, (Float64,), Float64(a1)) :
-                      from_wire(rettype, ccall(func, Int64, (Float64,), Float64(a1)))
-            Libdl.dlclose(lib)
-            rm(comp.so_path)
-            return result
-        elseif _is_f32(T1)
-            result = rettype === Float64 ? ccall(func, Float64, (Float32,), Float32(a1)) :
-                      rettype === Float32 ? ccall(func, Float32, (Float32,), Float32(a1)) :
-                      from_wire(rettype, ccall(func, Int64, (Float32,), Float32(a1)))
-            Libdl.dlclose(lib)
-            rm(comp.so_path)
-            return result
-        elseif isbitstype(T1)
-            # Integer bitstypes are passed by value as Int64 wire bits.
-            raw = ccall(func, Int64, (Int64,), to_wire(T1, a1))
-            result = _is_ptr_type(rettype) ? unsafe_pointer_to_objref(Ptr{Cvoid}(raw)) :
-                      rettype === Float64 ? reinterpret(Float64, raw) :
-                      rettype === Float32 ? reinterpret(Float32, Int32(raw)) :
-                      from_wire(rettype, raw)
-            Libdl.dlclose(lib)
-            rm(comp.so_path)
-            return result
-        else
-            error("compile_and_call: unsupported arg type $T1")
-        end
-    elseif nargs == 2
-        T1, T2 = argtypes.parameters[1], argtypes.parameters[2]
-        a1, a2 = args[1], args[2]
-        p1, p2 = _is_ptr_type(T1), _is_ptr_type(T2)
-        # Integer/pointer return: read RAX as Int64 (pointers fit). Exactly one ccall.
-        if !_is_f64(rettype) && !_is_f32(rettype)
-            raw = if p1 && p2
-                ccall(func, Int64, (Ptr{Cvoid}, Ptr{Cvoid}), pointer_from_objref(a1), pointer_from_objref(a2))
-            elseif p1 && _is_i64(T2)
-                ccall(func, Int64, (Ptr{Cvoid}, Int64), pointer_from_objref(a1), Int64(to_wire(T2, a2)))
-            elseif p1
-                ccall(func, Int64, (Ptr{Cvoid}, Int32), pointer_from_objref(a1), Int32(to_wire(T2, a2)))
-            elseif _is_i64(T1) && _is_i64(T2)
-                ccall(func, Int64, (Int64, Int64), Int64(to_wire(T1, a1)), Int64(to_wire(T2, a2)))
-            elseif _is_i64(T1)
-                ccall(func, Int64, (Int64, Int32), Int64(to_wire(T1, a1)), Int32(to_wire(T2, a2)))
-            elseif _is_i64(T2)
-                ccall(func, Int64, (Int32, Int64), Int32(to_wire(T1, a1)), Int64(to_wire(T2, a2)))
-            else
-                ccall(func, Int64, (Int32, Int32), Int32(to_wire(T1, a1)), Int32(to_wire(T2, a2)))
-            end
-            result = _is_ptr_type(rettype) ? unsafe_pointer_to_objref(Ptr{Cvoid}(raw)) : from_wire(rettype, raw)
-            Libdl.dlclose(lib); rm(comp.so_path)
-            return result
-        elseif _is_f64(rettype)
-            # Float64 return must use Float64 ccall (XMM0). Common float combos.
-            raw = if _is_f64(T1) && _is_f64(T2)
-                ccall(func, Float64, (Float64, Float64), Float64(a1), Float64(a2))
-            elseif _is_f64(T1) && _is_i64(T2)
-                ccall(func, Float64, (Float64, Int64), Float64(a1), Int64(to_wire(T2, a2)))
-            elseif _is_i64(T1) && _is_f64(T2)
-                ccall(func, Float64, (Int64, Float64), Int64(to_wire(T1, a1)), Float64(a2))
-            else
-                error("compile_and_call: unsupported 2-arg float combo $T1, $T2")
-            end
-            Libdl.dlclose(lib); rm(comp.so_path)
-            return raw
-        else # Float32 return
-            raw = if _is_f32(T1) && _is_f32(T2)
-                ccall(func, Float32, (Float32, Float32), Float32(a1), Float32(a2))
-            else
-                error("compile_and_call: unsupported 2-arg float32 combo $T1, $T2")
-            end
-            Libdl.dlclose(lib); rm(comp.so_path)
-            return raw
-        end
-    else
-        error("compile_and_call: more than 2 args not implemented yet")
-    end
+    result = _gcall(func, rettype, argtypes, args...)
+    Libdl.dlclose(lib)
+    rm(comp.so_path)
+    return result
 end
 
 export compile_native, native_callable, native_callable_from_so, compile_and_call, NativeCompilation, CompileError

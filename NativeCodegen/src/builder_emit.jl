@@ -849,6 +849,37 @@ function emit_invoke(bc::BuilderCtx, invoke_target, f, args, ir, stmt_idx)
         return emit_call_runtime(bc, "__jl_array_resize", UInt32[a_id, n_id])
     end
 
+    # append! bulk copy: `unsafe_copyto!(dst_memref, src_memref, n)`. The two
+    # memrefs arrive already tracked in ref_tracking (from prior memoryrefnew)
+    # as (elem_addr_id, 0, T) — i.e. resolved 0-based element addresses. Copy
+    # n*sizeof(T) bytes via __jl_memcpy. (The surrounding _growend_internal!
+    # grow + setfield!(:size) in append!'s IR are handled above.)
+    if fn_name == :unsafe_copyto! && length(args) >= 3
+        dst_val, src_val, n_val = args[1], args[2], args[3]
+        dst_tracked = (dst_val isa Core.SSAValue && haskey(bc.ref_tracking, dst_val)) ?
+                      bc.ref_tracking[dst_val] : nothing
+        src_tracked = (src_val isa Core.SSAValue && haskey(bc.ref_tracking, src_val)) ?
+                      bc.ref_tracking[src_val] : nothing
+        if dst_tracked !== nothing && src_tracked !== nothing
+            dst_addr_id = dst_tracked[1]
+            src_addr_id = src_tracked[1]
+            elem_T = dst_tracked[3] isa DataType && length(dst_tracked[3].parameters) >= 2 ?
+                     dst_tracked[3].parameters[2] : Int64
+            elem_size = sizeof(elem_T)
+            n_id = resolve_operand(bc, n_val, ir)
+            if elem_size == 1
+                nbytes_id = n_id
+            else
+                size_id = emit_constant(bc, Int64(elem_size))
+                mul_ptr = Libdl.dlsym(bc.lib_handle, :block_add_imul)
+                nbytes_id = ccall(mul_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
+                                  bc.fctx_handle, n_id, size_id)
+            end
+            return emit_call_runtime(bc, "__jl_memcpy",
+                                     UInt32[dst_addr_id, src_addr_id, nbytes_id])
+        end
+    end
+
     # Unknown invoke — emit sentinel (e.g. bounds-error path, unreachable)
     iconst_ptr = Libdl.dlsym(bc.lib_handle, :block_add_iconst)
     return ccall(iconst_ptr, UInt32, (Ptr{Cvoid}, Int64, UInt32),
@@ -1098,6 +1129,63 @@ function emit_tuple_index(bc::BuilderCtx, tuple_val, idx, ir)
     return acc
 end
 
+# getfield on a RUNTIME-built tuple: `obj` is an SSA value / Argument of a concrete
+# Tuple type — the heap pointer produced by `emit_core_tuple` (n≥2) or the
+# pass-through element (n==1). Load each field from the pointer at `fieldoffset`
+# (which matches `emit_core_tuple`'s aligned stores) and either return the one
+# requested field (constant index) or select over a dynamic index. This is how
+# array literals with runtime elements (`[a, b, c]`) read their values back.
+function emit_tuple_index_from_ssa(bc::BuilderCtx, obj, idx, ir)
+    T = get_operand_type(obj, ir)
+    T = T isa Core.Const ? T.val : T
+    (T isa DataType && isconcretetype(T) && T <: Tuple) ||
+        throw(CompileError("dynamic getfield on non-concrete tuple type $T"))
+    elem_types = Any[T.parameters...]
+    n = length(elem_types)
+    # n==1: emit_core_tuple passed the element through (no allocation); obj IS it.
+    n == 1 && return resolve_operand(bc, obj, ir)
+
+    # select() needs matching operand Cranelift types; array literals are
+    # homogeneous. Heterogeneous dynamic indexing is unsupported (loud failure).
+    first_ct = cranelift_type(elem_types[1])
+    all(i -> cranelift_type(elem_types[i]) == first_ct, 2:n) ||
+        throw(CompileError("heterogeneous dynamic tuple indexing not supported ($T)"))
+
+    ptr_id = resolve_operand(bc, obj, ir)
+    load_ptr = Libdl.dlsym(bc.lib_handle, :block_add_load)
+    elem_ids = UInt32[]
+    for i in 1:n
+        off = Int32(fieldoffset(T, i))
+        ct = cranelift_type(elem_types[i])
+        push!(elem_ids, ccall(load_ptr, UInt32, (Ptr{Cvoid}, UInt32, Int32, UInt32),
+                              bc.fctx_handle, ptr_id, off, ct))
+    end
+
+    # Constant index → single load (also fixes the latent bitstype-path miscompile
+    # where the tuple POINTER was treated as the value).
+    k = idx isa Core.QuoteNode ? idx.value : idx
+    if k isa Integer
+        (1 ≤ k ≤ n) || throw(CompileError("tuple index $k out of range (1:$n)"))
+        return elem_ids[k]
+    end
+
+    # Dynamic index → right-to-left select chain (mirrors emit_tuple_index).
+    idx_id = resolve_operand(bc, idx, ir)
+    icmp_ptr = Libdl.dlsym(bc.lib_handle, :block_add_icmp)
+    iconst_ptr = Libdl.dlsym(bc.lib_handle, :block_add_iconst)
+    select_ptr = Libdl.dlsym(bc.lib_handle, :block_add_select)
+    acc = elem_ids[n]
+    for i in (n - 1):-1:1
+        i_id = ccall(iconst_ptr, UInt32, (Ptr{Cvoid}, Int64, UInt32),
+                     bc.fctx_handle, Int64(i), TYPE_I64)
+        cmp = ccall(icmp_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32, UInt32),
+                    bc.fctx_handle, ICMP_EQ, idx_id, i_id)
+        acc = ccall(select_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32, UInt32),
+                    bc.fctx_handle, cmp, elem_ids[i], acc)
+    end
+    return acc
+end
+
 function emit_struct_getfield(bc::BuilderCtx, args, ir, stmt_idx)
     obj = args[1]
     # checked-arithmetic pair: getfield(pair, 1)=value, getfield(pair, 2)=flag.
@@ -1116,6 +1204,18 @@ function emit_struct_getfield(bc::BuilderCtx, args, ir, stmt_idx)
     if obj isa Tuple && length(args) >= 2 &&
        (args[2] isa Core.SSAValue || args[2] isa Core.Argument || args[2] isa Integer)
         return emit_tuple_index(bc, obj, args[2], ir)
+    end
+    # Runtime tuple: obj is an SSA/Argument of concrete Tuple type (the heap
+    # pointer from Core.tuple/emit_core_tuple). Lower getfield to per-field loads
+    # + select — this is how array literals with runtime elements ([a,b,c]) read
+    # their values back. (Handles constant AND dynamic index; before this, a
+    # constant index miscompiled via the bitstype path and a dynamic index erred.)
+    if (obj isa Core.SSAValue || obj isa Core.Argument) && length(args) >= 2
+        local oT = get_operand_type(obj, ir)
+        oT = oT isa Core.Const ? oT.val : oT
+        if oT isa DataType && isconcretetype(oT) && oT <: Tuple
+            return emit_tuple_index_from_ssa(bc, obj, args[2], ir)
+        end
     end
     field_sym = args[2] isa QuoteNode ? args[2].value :
                 args[2] isa Symbol ? args[2] :
@@ -1487,6 +1587,10 @@ function _declare_imports(bc::BuilderCtx)
         ccall(declare_ptr, Cint, (Ptr{Cvoid}, Ptr{UInt8}, UInt32, Ptr{UInt32}, Csize_t),
               bc.builder_handle, fn, TYPE_PTR, grow_args, length(grow_args))
     end
+    # Bulk byte copy for append! / unsafe_copyto! between array data regions.
+    memcpy_args = UInt32[TYPE_PTR, TYPE_PTR, TYPE_I64]
+    ccall(declare_ptr, Cint, (Ptr{Cvoid}, Ptr{UInt8}, UInt32, Ptr{UInt32}, Csize_t),
+          bc.builder_handle, "__jl_memcpy", TYPE_PTR, memcpy_args, length(memcpy_args))
 end
 
 function emit_call_runtime(bc::BuilderCtx, func_name::String, arg_ids::Vector{UInt32})
@@ -1614,7 +1718,10 @@ function emit_new(bc::BuilderCtx, T, field_args, ir, stmt_idx)
     # allocator. Subsequent getfield(%new, :ref)/memoryrefset! element stores then
     # work exactly as they do for arrays passed in from Julia. field_args is
     # (memref, size_tuple); only the 1-d constant size_tuple is supported here.
-    if T isa DataType && T <: AbstractArray
+    # NOTE: restrict to `Array` — `AbstractArray` would also catch UnitRange and
+    # other ranges (Range <: AbstractVector <: AbstractArray), which are 2-field
+    # immutable index objects, not contiguous arrays.
+    if T isa DataType && T <: Array
         size_arg = field_args[end]
         if !(size_arg isa Tuple) || length(size_arg) != 1
             error("emit_new(array): only 1-d arrays with constant size supported, got size $size_arg")
@@ -1624,6 +1731,15 @@ function emit_new(bc::BuilderCtx, T, field_args, ir, stmt_idx)
         type_ptr_id = emit_constant(bc, Int64(reinterpret(UInt64, type_ptr)))
         nel_id = emit_constant(bc, Int64(nel))
         return emit_call_runtime(bc, "__jl_array_new_1d", UInt32[type_ptr_id, nel_id])
+    end
+
+    # Ranges (UnitRange, StepRange, …) appear ONLY in dead bounds-error-report
+    # paths (`_throw_boundserror_indices(a, range)`), which trap. Emit a sentinel
+    # — the value is never observed at runtime.
+    if T isa DataType && T <: AbstractRange
+        iconst_ptr = Libdl.dlsym(bc.lib_handle, :block_add_iconst)
+        return ccall(iconst_ptr, UInt32, (Ptr{Cvoid}, Int64, UInt32),
+                     bc.fctx_handle, Int64(0), TYPE_I64)
     end
 
     if !(T isa DataType) || !Base.ismutabletype(T)

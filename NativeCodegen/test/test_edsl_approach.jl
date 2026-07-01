@@ -169,6 +169,48 @@ function buildpush(n::Int64)::Vector{Int64}
 end
 run_cc("bldpush", buildpush, Tuple{Int64}, (5,), [1,4,9,16,25])
 
+println("\n=== pop! ===")
+# pop! returns the last element AND mutates the caller's array in place.
+# Both must be checked — use direct compile_and_call (not run_cc's equality form).
+popone(a::Vector{Int64}) = pop!(a)
+print("  popone ... ")
+try
+    global popone
+    a = Int64[10,20,30]
+    r = compile_and_call(popone, Int64, Tuple{Vector{Int64}}, a)
+    ok = (r == 30 && length(a) == 2 && a == [10,20])
+    println("$(ok ? "✅" : "❌") r=$r (want 30), a after=$a (want [10,20])")
+catch e
+    println("❌ $e")
+end
+# pop! in a loop: sum the popped elements; array is emptied. (2-arg ptr+i64 → Int64.)
+function popsum(a::Vector{Int64}, k::Int64)
+    s = 0
+    for i in 1:k; s += pop!(a); end
+    s
+end
+print("  popsum ... ")
+try
+    global popsum
+    a = Int64[1,2,3,4]
+    r = compile_and_call(popsum, Int64, Tuple{Vector{Int64},Int64}, a, 4)
+    ok = (r == 10 && isempty(a))
+    println("$(ok ? "✅" : "❌") r=$r (want 10), a after=$a (want Int64[])")
+catch e
+    println("❌ $e")
+end
+
+println("\n=== append! ===")
+# append! mutates the destination in place and returns it.
+appendsrc(a::Vector{Int64}, b::Vector{Int64}) = (append!(a, b); a)
+run_cc("appendsrc", appendsrc, Tuple{Vector{Int64},Vector{Int64}}, (Int64[1,2,3], Int64[4,5]), [1,2,3,4,5])
+# append! in a loop with real growth (2-arg ptr+ptr → Vector).
+function appendloop(a::Vector{Int64}, b::Vector{Int64})::Vector{Int64}
+    for i in 1:3; append!(a, b); end
+    a
+end
+run_cc("appendloop", appendloop, Tuple{Vector{Int64},Vector{Int64}}, (Int64[0], Int64[1,2]), [0,1,2,1,2,1,2])
+
 println("\n=== Conversions (int <-> float) ===")
 cv_sitofp(x::Int64)::Float64 = Float64(x) ; run("sitofp", cv_sitofp, Tuple{Int64}, (Int64(5),), 5.0)
 cv_uitofp(x::UInt64)::Float64 = Float64(x) ; run("uitofp", cv_uitofp, Tuple{UInt64}, (UInt64(7),), 7.0)
@@ -272,5 +314,59 @@ run_checked("cumul_v", cumul_v, Tuple{UInt64,UInt64},
 run_checked("cumul_f", cumul_f, Tuple{UInt64,UInt64},
     [(UInt64(3),UInt64(4)), (UX,UInt64(2)), (UInt64(0),UInt64(7)), (UX,UX)],
     (a,b)->last(Core.Intrinsics.checked_umul_int(a,b)))
+
+println("\n=== N-arg (3+ args via generated _gcall dispatcher) ===")
+# 3× Int64 → Int64
+add3(a::Int64, b::Int64, c::Int64)::Int64 = a + b + c ; run("add3", add3, Tuple{Int64,Int64,Int64}, (1,2,3), 6)
+fma3(a::Int64, b::Int64, c::Int64)::Int64 = a + b * c ; run("fma3", fma3, Tuple{Int64,Int64,Int64}, (Int64(10),Int64(3),Int64(4)), 22)
+# 3× Int64 → Bool
+between3(x::Int64, lo::Int64, hi::Int64)::Bool = (lo <= x) && (x <= hi)
+run("between3T", between3, Tuple{Int64,Int64,Int64}, (5,1,10), true)
+run("between3F", between3, Tuple{Int64,Int64,Int64}, (15,1,10), false)
+# control flow at N=3
+myclamp(x::Int64, lo::Int64, hi::Int64)::Int64 = x < lo ? lo : (x > hi ? hi : x)
+run("clamp_lo", myclamp, Tuple{Int64,Int64,Int64}, (Int64(-1),Int64(0),Int64(10)), 0)
+run("clamp_hi", myclamp, Tuple{Int64,Int64,Int64}, (Int64(99),Int64(0),Int64(10)), 10)
+run("clamp_mid", myclamp, Tuple{Int64,Int64,Int64}, (Int64(5),Int64(0),Int64(10)), 5)
+# 4× Int64 → Int64
+add4(a::Int64, b::Int64, c::Int64, d::Int64)::Int64 = a + b + c + d ; run("add4", add4, Tuple{Int64,Int64,Int64,Int64}, (1,2,3,4), 10)
+# ptr + 3× Int64 → Int64 (mixes pointer and scalar args at N=4)
+mix4(a::Vector{Int64}, x::Int64, y::Int64, z::Int64)::Int64 = length(a) + x + y + z
+run_cc("mix4", mix4, Tuple{Vector{Int64},Int64,Int64,Int64}, (Int64[10,20], 1, 2, 3), 8)
+# 3× Float32 → Float32 (Float32 ABI must hold at N=3)
+fma3f(a::Float32, b::Float32, c::Float32)::Float32 = a + b * c ; run("fma3f", fma3f, Tuple{Float32,Float32,Float32}, (Float32(1),Float32(2),Float32(3)), 7.0f0)
+# ptr return at N=3: construct a 3-tuple from 3 Int64 args
+maketri(x::Int64, y::Int64, z::Int64)::Tuple{Int64,Int64,Int64} = (x, y, z)
+run_cc("maketri", maketri, Tuple{Int64,Int64,Int64}, (1,2,3), (1,2,3))
+# 8× Int64 → Int64 (exercises the generated dispatcher well past the old 2-arg ceiling)
+add8(a::Int64, b::Int64, c::Int64, d::Int64, e::Int64, f::Int64, g::Int64, h::Int64)::Int64 = a + b + c + d + e + f + g + h
+run("add8", add8, Tuple{Int64,Int64,Int64,Int64,Int64,Int64,Int64,Int64},
+    (Int64(1),Int64(2),Int64(3),Int64(4),Int64(5),Int64(6),Int64(7),Int64(8)), 36)
+
+println("\n=== Runtime-element array literals ([a,b,c] with variables) ===")
+lit2(a::Int64, b::Int64)::Vector{Int64} = [a, b]
+run_cc("lit2", lit2, Tuple{Int64,Int64}, (Int64(3),Int64(4)), [3,4])
+lit3(a::Int64, b::Int64, c::Int64)::Vector{Int64} = [a, b, c]
+run_cc("lit3", lit3, Tuple{Int64,Int64,Int64}, (Int64(1),Int64(2),Int64(3)), [1,2,3])
+# same variable thrice in a 1-arg literal
+lit_dup(i::Int64)::Vector{Int64} = [i, i, i]
+run_cc("litdup", lit_dup, Tuple{Int64}, (Int64(7),), [7,7,7])
+# Float64 element type
+litf(a::Float64, b::Float64)::Vector{Float64} = [a, b]
+run_cc("litf", litf, Tuple{Float64,Float64}, (Float64(1.5),Float64(2.5)), [1.5,2.5])
+# restore the appendloop test using the dynamic literal that originally hit the bug
+function appendloop_dyn(n::Int64)::Vector{Int64}
+    a = Int64[]
+    for i in 1:n; append!(a, [i, i+1]); end
+    a
+end
+print("  appendloop_dyn ... ")
+try
+    global appendloop_dyn
+    r = compile_and_call(appendloop_dyn, Vector{Int64}, Tuple{Int64}, Int64(3))
+    println(r == [1,2,2,3,3,4] ? "✅ $r" : "❌ $r (want [1,2,2,3,3,4])")
+catch e
+    println("❌ $e")
+end
 
 println("\n=== Done ===")
