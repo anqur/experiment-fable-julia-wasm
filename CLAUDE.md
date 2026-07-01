@@ -119,8 +119,9 @@ Two Rust crates:
 - **`native-builder`** (`cdylib`): eDSL builder. Uses Cranelift `ObjectModule` +
   `FunctionBuilder` API. Produces `.o` files programmatically. Called via FFI
   from `builder_emit.jl`.
-- **`native-backend`** (`staticlib`): Runtime only — Boehm GC, string ops,
-  exception handling, arrays. Linked into the final `.so` by Julia's lld.
+- **`native-backend`** (`staticlib`): Self-contained runtime — Boehm GC, string ops,
+  exception handling, arrays. **Zero libjulia dependency** — all allocation and
+  mutation is pure Rust. Linked into the final `.so` by Julia's lld.
 
 ### What's reused from WasmCodegen (do NOT rebuild)
 
@@ -134,7 +135,6 @@ of `NativeCodegen.jl`. They are target-agnostic and work identically for native:
 | `scalar_repr(T)`, `isghost(T)`, `ghost_instance` | `WasmCodegen/src/reprs.jl` | Type queries |
 | `from_wire(T, v)`, `to_wire(T, v)` | `WasmCodegen/src/reprs.jl` | Julia ↔ wire format conversion |
 | `CompileError` | `WasmCodegen/src/WasmCodegen.jl` | Exception type for unsupported constructs |
-| `INTERCEPTS`, `EXTERNREF_TYPES` | `WasmCodegen/src/interp.jl` | Interception registry |
 | `CC` (= `Core.Compiler`) | | Julia's compiler internals |
 
 The overlay method table (`WASM_MT`) is also shared — stubs that replace
@@ -155,8 +155,8 @@ etc. with loop-based equivalents.
 | `native-builder/src/linker.rs` | Invokes Julia's lld: `lld -flavor ld.lld -shared -o out.so in.o libnative_backend.a` |
 | `native-builder/src/lib.rs` | FFI entry points: `create_builder`, `builder_add_function`, `builder_declare_import`, all `block_add_*` instruction emitters, `builder_finalize`, `link_object_to_so`. |
 | `native-builder/src/runtime.rs` | Runtime stubs (linked via native-backend.a) |
-| `native-backend/src/runtime/gc.rs` | Boehm GC (`bdwgc-alloc`), `GCHeader`, `__jl_gc_alloc`, `__jl_gc_alloc_array`, `__jl_gc_array_len`, `__jl_gc_type_tag`, `__jl_array_elem_ptr/get/set`, **`__jl_gc_alloc_julia`** (Julia-compatible struct/tuple alloc), **`__jl_array_new_1d`** (real `jl_alloc_array_1d` wrapper), **`__jl_array_grow_end`/`__jl_array_del_end`/`__jl_array_resize`** (real `jl_array_grow_end`/`del_end` wrappers for resize!) |
-| `native-backend/src/runtime/strings.rs` | **`__jl_string_concat`** (real `jl_alloc_string` wrapper for `a*b`); legacy `__jl_string_new`/`_len`/`_get`/`_set` (old header — deprecated, not used for returnable strings) |
+| `native-backend/src/runtime/gc.rs` | Boehm GC (`bdwgc-alloc`), `GCHeader`, `__jl_gc_alloc`, `__jl_gc_alloc_array`, `__jl_gc_array_len`, `__jl_gc_type_tag`, `__jl_array_elem_ptr/get/set`, **`__jl_gc_alloc_julia`** (Julia-compatible struct/tuple alloc), **`__jl_array_new_1d`** (pure-Rust array allocator via Boehm GC), **`__jl_array_grow_end`/`__jl_array_del_end`/`__jl_array_resize`** (pure-Rust array mutation), **`rust_alloc_string`** (pure-Rust String allocator) |
+| `native-backend/src/runtime/strings.rs` | **`__jl_string_concat`** (pure-Rust via `rust_alloc_string`); legacy `__jl_string_new`/`_len`/`_get`/`_set` (old header — deprecated, not used for returnable strings) |
 
 ### Key Julia object layouts (known from empirical exploration)
 
@@ -205,7 +205,7 @@ for direct memory access (no runtime calls needed):
 - ✅ `native_callable_from_so` — load compiled .so and call entry function
 - ✅ String operations — read ops (ncodeunits, codeunit, sizeof, isempty) via direct
   load from String layout; **concatenation** (`a*b`, `a*b*c`, …) via `invoke Base._string`
-  / `invoke *` → left-fold of `__jl_string_concat` (real `jl_alloc_string` String);
+  / `invoke *` → left-fold of `__jl_string_concat` (pure-Rust via `rust_alloc_string`);
   **string-literal return** (`return "hi"`) via `pointer_from_objref` constant
 - ✅ Mutable struct getfield/setfield! — load/store at `fieldoffset` (nested access works)
 - ✅ Array length — `length(a)` via bitstype getfield from Vector layout
@@ -221,7 +221,7 @@ for direct memory access (no runtime calls needed):
 - ✅ **Returning allocated objects to Julia** — mutable structs, tuples, AND fresh
   arrays (`Vector{T}`) round-trip through `unsafe_pointer_to_objref`. Structs/tuples
   use `__jl_gc_alloc_julia` (Julia-compatible `jl_value_t` header = type ptr + fields);
-  arrays use Julia's own `jl_alloc_array_1d` (a *real* `jl_array_t`).
+  arrays use `__jl_array_new_1d` (pure-Rust allocator producing `JuliaArrayRepr` layout).
 - ✅ Multi-field bitstype getfield with offset≠0 — shift/mask extraction
 - ✅ Multi-element tuples — allocated via `__jl_gc_alloc_julia` with the real tuple
   type pointer; constant tuples in returns lower to `emit_core_tuple`
@@ -231,9 +231,11 @@ for direct memory access (no runtime calls needed):
   — zero-placeholder args keep jump arg counts aligned with block params
 - ✅ `arraysize`/`size(arr, dim)` — via `getfield(getfield(arr, :size), dim)`
 - ✅ **Array growth/shrink** — `resize!(a, n)` (grow + shrink) via
-  `__jl_array_resize` → `jl_array_grow_end`/`jl_array_del_end`; **`push!(a, x)`**
-  via `invoke Base._growend_internal!(a, 1, oldsize)` → `__jl_array_grow_end`;
+  `__jl_array_resize` (pure-Rust, manipulates `JuliaArrayRepr` directly); **`push!(a, x)`**
+  via `invoke Base._growend_internal!(a, 1, oldsize)` → `__jl_array_grow_end` (pure-Rust);
   `memoryrefoffset` emitted as constant from `ref_tracking.byte_offset / elem_size + 1`.
+  Note: push!/append! on internally-allocated arrays has a known crash (segfault at entry)
+  — tracked as a bridge/IR issue, not a runtime dependency problem.
 - ✅ **`pop!(a)`** — lowers through existing plumbing (no dedicated handler):
   `memoryrefget` reads last element, `Core.memoryrefunset!` zeroes it for GC
   safety, `Base.setfield!(:size, (n-1,))` shrinks, `Base.throw`→trap with
@@ -283,14 +285,12 @@ for direct memory access (no runtime calls needed):
   f64→Float64, f32→Float32(abi), i64→Int64(to_wire), else→Int32(to_wire); return
   Nothing→Cvoid, ptr→unsafe_pointer_to_objref, Float64/Float32→direct, else→Int64+from_wire.
   Calls the compiled function exactly once.
-- ✅ **`string(n)` integer formatting** — `string(::Int64)` lowers to
-  `invoke Base.var"#string#N"(base, count, fn, val)`. The `#string#N` handler in
-  `emit_invoke` detects the generated function (matching `"#string#"` prefix) and
-  routes single-value (`count==1`) through `__jl_int_to_string(val, base)` in
-  `native-backend/src/runtime/print.rs` — a direct `jl_alloc_string`-based
-  formatter (bypasses Julia's IOBuffer/print infrastructure). Supports bases 2–36.
-  Keyword args (`string(n, base=2)`) and multi‑arg (`string(a,b)`) are deferred
-  — they go through `print_to_string` (varargs) or keyword‑argument desugaring
+- ⏸️ **`string(n)` integer formatting** — NOT YET WIRED. The Rust runtime
+  previously had `__jl_int_to_string` (since removed as dead code in `print.rs`).
+  Adding this requires a `#string#` prefix handler in `emit_invoke` + a new
+  pure-Rust `__jl_int_to_string` backed by `rust_alloc_string`. Keyword args
+  (`string(n, base=2)`) and multi‑arg (`string(a,b)`) are deferred — they go
+  through `print_to_string` (varargs) or keyword‑argument desugaring
   (`Core._apply_iterate`, `kwerr`).
 - ✅ **Sub-word integer renormalization** — `native_norm!(bc, val, T)` in
   `builder_emit.jl` post‑op: signed→`(val << pad) >> pad` (shift‑left then
@@ -439,6 +439,33 @@ for direct memory access (no runtime calls needed):
 
 7. **CLIF text format is DEAD CODE**. The old `clif_emit.jl` has been removed.
    Do not add CLIF text generation — use the eDSL builder API instead.
+
+### Runtime independence
+
+The `.so` produced by the native pipeline has **zero runtime dependency on libjulia**.
+All object allocation, string operations, array growth/shrink, and GC are
+implemented entirely in Rust (`native-backend` crate) using the Boehm GC allocator
+(`bdwgc-alloc`). The linker verifies this with `verify_no_julia_symbols` (runs `nm -u`
+on the output `.so` and fails if any `jl_` symbols are undefined).
+
+**What this means:**
+- `nm -u out.so | grep jl_` returns nothing (no undefined libjulia symbols)
+- The `.so` links against libSystem/libc (for `memcpy`, `bzero`, Cranelift libcalls),
+  but NOT against libjulia
+- Object layouts produced by the runtime are Julia-compatible (so `unsafe_pointer_to_objref`
+  works in the test harness), but the allocation is done by Boehm GC, not Julia's GC
+
+**Object layouts:**
+- **String**: `[jl_datatype_t* tag (8)] [length: i64 (8)] [inline char data...nul]` — allocated by `rust_alloc_string`
+- **Array**: `[jl_datatype_t* tag (8)] [JuliaArrayRepr {data_ptr, _pad0, length, capacity}]` — allocated by `__jl_array_new_1d`
+- **Struct/tuple**: `[jl_datatype_t* tag (8)] [field data at fieldoffset]` — allocated by `__jl_gc_alloc_julia`
+- **Internal objects** (Memory, temporaries): `GCHeader {type_tag, flags, length}` — legacy layout, never returned to Julia
+
+**Post-link verification:**
+The `link_object_to_so` function in `native-builder/src/linker.rs` runs `nm -u` on
+the output `.so` after linking. Any undefined `jl_` symbol (e.g. `_jl_alloc_string`,
+`_jl_array_grow_end`) causes an immediate error. LibSystem/libc undefined symbols
+(e.g. `_memcpy`, `_bzero`, `_abort`) are legitimate and pass through.
 
 8. **Unknown invoke sentinel** — unsupported `:invoke` calls emit constant 0
    instead of erroring. This allows functions with dead branches

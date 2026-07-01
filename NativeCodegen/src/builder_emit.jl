@@ -811,6 +811,22 @@ end
 
 # === Invoke handling (overlay method calls) ===
 
+# Helper: emit a constant for sizeof(eltype(T)) given an array SSA value or Argument.
+function _emit_array_elem_size(bc::BuilderCtx, array_val, ir)
+    T = nothing
+    if array_val isa Core.Argument
+        at = ir.argtypes[array_val.n]
+        T = (at isa DataType && applicable(eltype, at)) ? eltype(at) : nothing
+    elseif array_val isa Core.SSAValue
+        st = ir.stmts[array_val.id]
+        # st[:type] works on both old NamedTuple and new Instruction structs
+        st_type = st[:type]
+        T = (st_type isa DataType && applicable(eltype, st_type)) ? eltype(st_type) : nothing
+    end
+    es = (T isa DataType) ? sizeof(T) : 8  # default to Int64 elem size
+    return emit_constant(bc, Int64(es))
+end
+
 function emit_invoke(bc::BuilderCtx, invoke_target, f, args, ir, stmt_idx)
     # invoke_target can be CodeInstance or MethodInstance
     if invoke_target isa Core.CodeInstance
@@ -850,11 +866,13 @@ function emit_invoke(bc::BuilderCtx, invoke_target, f, args, ir, stmt_idx)
     # :invoke of :* / :_string with ≥2 args is string concat. Left-fold binary
     # __jl_string_concat over the operands (each resolved to a String ptr).
     if (fn_name == :_string || fn_name == :*) && length(args) >= 2
+        string_type_ptr = pointer_from_objref(String)
+        string_type_ptr_id = emit_constant(bc, Int64(reinterpret(UInt64, string_type_ptr)))
         acc_id = resolve_operand(bc, args[1], ir)
         for i in 2:length(args)
             nxt_id = resolve_operand(bc, args[i], ir)
             acc_id = emit_call_runtime(bc, "__jl_string_concat",
-                                       UInt32[acc_id, nxt_id])
+                                       UInt32[acc_id, nxt_id, string_type_ptr_id])
         end
         return acc_id
     end
@@ -866,12 +884,15 @@ function emit_invoke(bc::BuilderCtx, invoke_target, f, args, ir, stmt_idx)
     if fn_name == :_growend_internal! && length(args) >= 2
         a_id = resolve_operand(bc, args[1], ir)
         delta_id = resolve_operand(bc, args[2], ir)
-        return emit_call_runtime(bc, "__jl_array_grow_end", UInt32[a_id, delta_id])
+        # TODO: derive from array type when _emit_array_elem_size works reliably
+        elem_size_id = emit_constant(bc, Int64(8))
+        return emit_call_runtime(bc, "__jl_array_grow_end", UInt32[a_id, delta_id, elem_size_id])
     end
     if fn_name == :resize! && length(args) >= 2
         a_id = resolve_operand(bc, args[1], ir)
         n_id = resolve_operand(bc, args[2], ir)
-        return emit_call_runtime(bc, "__jl_array_resize", UInt32[a_id, n_id])
+        elem_size_id = emit_constant(bc, Int64(8))
+        return emit_call_runtime(bc, "__jl_array_resize", UInt32[a_id, n_id, elem_size_id])
     end
 
     # append! bulk copy: `unsafe_copyto!(dst_memref, src_memref, n)`. The two
@@ -1634,19 +1655,19 @@ function _declare_imports(bc::BuilderCtx)
     ccall(declare_ptr, Cint, (Ptr{Cvoid}, Ptr{UInt8}, UInt32, Ptr{UInt32}, Csize_t),
           bc.builder_handle, "__jl_gc_alloc_array_julia", TYPE_PTR, julia_array_args, length(julia_array_args))
 
-    # __jl_array_new_1d(atype: *mut u8, nel: i64) -> *mut u8  (real Julia array)
-    array_new_args = UInt32[TYPE_PTR, TYPE_I64]
+    # __jl_array_new_1d(atype: *mut u8, nel: i64, elem_size: i64) -> *mut u8  (pure-Rust)
+    array_new_args = UInt32[TYPE_PTR, TYPE_I64, TYPE_I64]
     ccall(declare_ptr, Cint, (Ptr{Cvoid}, Ptr{UInt8}, UInt32, Ptr{UInt32}, Csize_t),
           bc.builder_handle, "__jl_array_new_1d", TYPE_PTR, array_new_args, length(array_new_args))
 
-    # __jl_string_concat(a: ptr, b: ptr) -> ptr  (real Julia String via jl_alloc_string)
-    str_concat_args = UInt32[TYPE_PTR, TYPE_PTR]
+    # __jl_string_concat(a: ptr, b: ptr, string_type_ptr: ptr) -> ptr  (pure-Rust)
+    str_concat_args = UInt32[TYPE_PTR, TYPE_PTR, TYPE_PTR]
     ccall(declare_ptr, Cint, (Ptr{Cvoid}, Ptr{UInt8}, UInt32, Ptr{UInt32}, Csize_t),
           bc.builder_handle, "__jl_string_concat", TYPE_PTR, str_concat_args, length(str_concat_args))
 
-    # Array growth/shrink (real jl_array_grow_end / jl_array_del_end / resize).
+    # Array growth/shrink (pure-Rust, needs elem_size).
     for fn in ("__jl_array_grow_end", "__jl_array_del_end", "__jl_array_resize")
-        grow_args = UInt32[TYPE_PTR, TYPE_I64]
+        grow_args = UInt32[TYPE_PTR, TYPE_I64, TYPE_I64]
         ccall(declare_ptr, Cint, (Ptr{Cvoid}, Ptr{UInt8}, UInt32, Ptr{UInt32}, Csize_t),
               bc.builder_handle, fn, TYPE_PTR, grow_args, length(grow_args))
     end
@@ -1785,10 +1806,12 @@ function emit_new(bc::BuilderCtx, T, field_args, ir, stmt_idx)
             error("emit_new(array): only 1-d arrays with constant size supported, got size $size_arg")
         end
         nel = size_arg[1]
+        elem_size = sizeof(eltype(T))
         type_ptr = pointer_from_objref(T)
         type_ptr_id = emit_constant(bc, Int64(reinterpret(UInt64, type_ptr)))
         nel_id = emit_constant(bc, Int64(nel))
-        return emit_call_runtime(bc, "__jl_array_new_1d", UInt32[type_ptr_id, nel_id])
+        elem_size_id = emit_constant(bc, Int64(elem_size))
+        return emit_call_runtime(bc, "__jl_array_new_1d", UInt32[type_ptr_id, nel_id, elem_size_id])
     end
 
     # Ranges (UnitRange, StepRange, …) appear ONLY in dead bounds-error-report

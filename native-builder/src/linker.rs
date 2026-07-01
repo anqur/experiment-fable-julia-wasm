@@ -61,22 +61,59 @@ pub fn link_object_to_so(user_object: &Path, runtime_lib: &Path, so_path: &Path)
        .arg(user_object)
        .arg(runtime_lib);
 
-    // macOS: specify architecture and allow undefined symbols
+    // macOS: specify architecture.  The .so may have undefined libSystem symbols
+    // (bzero, memcpy, abort, __Unwind_Resume, Cranelift libcalls, etc.) which
+    // resolve at dlopen time against the host process's libSystem — these are
+    // legitimate.  libjulia symbols (jl_alloc_*, jl_array_*) must NOT appear as
+    // undefined — we verify this after linking (see verify_no_julia_symbols).
     if cfg!(target_os = "macos") {
         let arch = if cfg!(target_arch = "aarch64") { "arm64" } else { "x86_64" };
         cmd.arg("-arch").arg(arch);
         cmd.arg("-undefined").arg("dynamic_lookup");
         cmd.arg("-platform_version").arg("macos").arg("14.0").arg("14.0");
     }
+    // Linux: allow undefined libc/libm symbols.
+    if cfg!(target_os = "linux") {
+        // ELF allows undefined by default — no flag needed
+    }
 
     let output = cmd.output().map_err(|e| format!("Failed to execute lld: {}", e))?;
 
     if output.status.success() {
         if verbose { eprintln!("[linker] Linking successful → {:?}", so_path); }
-        Ok(())
+        verify_no_julia_symbols(so_path)
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
         Err(format!("lld failed: {}\nstdout: {}\nstderr: {}", output.status, stdout, stderr))
     }
+}
+
+/// Verify the .so has no undefined libjulia symbols.  On macOS, `nm -u`
+/// lists undefined symbols; we grep for `jl_` (lowercase, matches
+/// `_jl_alloc_string`, `_jl_array_grow_end`, etc.).  The `.so` may have
+/// undefined libSystem/libc symbols — those are legitimate.
+fn verify_no_julia_symbols(so_path: &Path) -> Result<(), String> {
+    let output = Command::new("nm")
+        .arg("-u")
+        .arg(so_path)
+        .output()
+        .map_err(|e| format!("Failed to run nm: {}", e))?;
+
+    // nm writes symbol names to stdout; stderr is empty on success
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // macOS nm -u output: each line is a symbol name (with leading underscore)
+    // Linux nm -u output: "                 U symbol_name"
+    for line in stdout.lines() {
+        let sym = line.trim().trim_start_matches('U').trim().trim_start_matches('_');
+        // Catch any jl_ C-API symbol.  Our runtime functions are __jl_ prefix
+        // (double underscore) — those are defined, not undefined.
+        if sym.starts_with("jl_") {
+            return Err(format!(
+                "FATAL: .so has undefined libjulia symbol: {}. The .so must be self-contained with zero libjulia dependency.",
+                sym
+            ));
+        }
+    }
+    Ok(())
 }

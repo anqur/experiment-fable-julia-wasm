@@ -1,31 +1,33 @@
-// String operations — Phase 2: implementation.
+// String operations — pure-Rust, zero libjulia dependency.
+//
+// Julia String layout (from pointer_from_objref):
+//   offset -8: jl_datatype_t* (type tag, 8 bytes)
+//   offset  0: length: i64 (ncodeunits, 8 bytes)
+//   offset  8: inline char data (null-terminated)
+//
+// The type tag (pointer_from_objref(String)) is embedded as a constant by the
+// compiled code and passed as string_type_ptr.
 
-const STRING_TYPE_TAG: u32 = 1;
+const STRING_TYPE_TAG: u32 = 1;  // legacy: for __jl_string_new (internal use only)
 
-// Julia's own string allocator — produces a real, GC-tracked `jl_string_t` whose
-// layout matches what Julia expects (length@0, inline data@8). Resolves against
-// libjulia at .so load time, same as jl_alloc_array_1d in gc.rs. The legacy
-// __jl_gc_alloc_array-based allocators cannot produce a returnable String.
-extern "C" {
-    fn jl_alloc_string(n: usize) -> *mut u8;
-}
-
-/// Concatenate two Julia Strings into a new real String.
+/// Concatenate two Julia Strings into a new String.
 /// `a`/`b` are String pointers (past the type tag): length (i64) at offset 0,
-/// inline char data at offset 8. jl_alloc_string(n) returns a String of length n
-/// with n+1 bytes (null-terminated); data starts at result+8.
+/// inline char data at offset 8.  `string_type_ptr` is pointer_from_objref(String),
+/// embedded as a constant by the compiled code.
 #[no_mangle]
-pub unsafe extern "C" fn __jl_string_concat(a: *const u8, b: *const u8) -> *mut u8 {
+pub unsafe extern "C" fn __jl_string_concat(
+    a: *const u8, b: *const u8, string_type_ptr: *mut u8,
+) -> *mut u8 {
     if a.is_null() || b.is_null() {
         return std::ptr::null_mut();
     }
     let la = *(a as *const i64) as usize;
     let lb = *(b as *const i64) as usize;
-    let r = jl_alloc_string(la + lb);
+    let r = crate::runtime::gc::rust_alloc_string(la + lb, string_type_ptr);
     if r.is_null() {
         return std::ptr::null_mut();
     }
-    // jl_alloc_string sets the length; copy both operands' inline data into r+8.
+    // rust_alloc_string sets the length; copy both operands' inline data into r+8.
     std::ptr::copy_nonoverlapping(a.add(8), r.add(8), la);
     std::ptr::copy_nonoverlapping(b.add(8), r.add(8 + la), lb);
     r
