@@ -22,6 +22,7 @@ pub const TYPE_F32: u32 = 2;
 pub const TYPE_F64: u32 = 3;
 pub const TYPE_PTR: u32 = 4;
 pub const TYPE_I8: u32 = 5;
+pub const TYPE_I16: u32 = 6;
 
 pub const ICMP_EQ: u32 = 0;  pub const ICMP_NE: u32 = 1;
 pub const ICMP_SLT: u32 = 2; pub const ICMP_SGE: u32 = 3;
@@ -423,7 +424,7 @@ impl BuilderContext {
 // === Helpers ===
 
 pub fn map_type(t: u32) -> Option<Type> {
-    match t { TYPE_I32=>Some(types::I32), TYPE_I64=>Some(types::I64), TYPE_F32=>Some(types::F32), TYPE_F64=>Some(types::F64), TYPE_PTR=>Some(types::I64), TYPE_I8=>Some(types::I8), _=>None }
+    match t { TYPE_I32=>Some(types::I32), TYPE_I64=>Some(types::I64), TYPE_F32=>Some(types::F32), TYPE_F64=>Some(types::F64), TYPE_PTR=>Some(types::I64), TYPE_I8=>Some(types::I8), TYPE_I16=>Some(types::I16), _=>None }
 }
 pub fn map_icmp_cond(c: u32) -> IntCC { match c { ICMP_EQ=>IntCC::Equal, ICMP_NE=>IntCC::NotEqual, ICMP_SLT=>IntCC::SignedLessThan, ICMP_SGE=>IntCC::SignedGreaterThanOrEqual, ICMP_SGT=>IntCC::SignedGreaterThan, ICMP_SLE=>IntCC::SignedLessThanOrEqual, ICMP_ULT=>IntCC::UnsignedLessThan, ICMP_UGE=>IntCC::UnsignedGreaterThanOrEqual, ICMP_UGT=>IntCC::UnsignedGreaterThan, ICMP_ULE=>IntCC::UnsignedLessThanOrEqual, _=>IntCC::Equal } }
 pub fn map_fcmp_cond(c: u32) -> FloatCC { match c { FCMP_EQ=>FloatCC::Equal, FCMP_NE=>FloatCC::NotEqual, FCMP_LT=>FloatCC::LessThan, FCMP_LE=>FloatCC::LessThanOrEqual, FCMP_GT=>FloatCC::GreaterThan, FCMP_GE=>FloatCC::GreaterThanOrEqual, _=>FloatCC::Equal } }

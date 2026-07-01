@@ -7,3 +7,4 @@ pub mod gc;
 pub mod exceptions;
 pub mod strings;
 pub mod offload;
+pub mod print;

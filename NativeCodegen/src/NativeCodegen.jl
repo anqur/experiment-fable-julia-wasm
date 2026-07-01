@@ -26,7 +26,6 @@ const CC = Core.Compiler
 include("reprs.jl")
 include("interp.jl")
 include("intrinsics.jl")
-include("clif_types.jl")
 include("builder_emit.jl")
 
 # === Bridge: native compilation + FFI ===
@@ -114,7 +113,11 @@ function compile_native(f, argtypes::Type{<:Tuple}; name::String="entry")
 end
 
 # Helper: check if return type needs Ptr{Cvoid} (pointer to GC object)
-_is_ptr_type(T) = (T isa DataType && (Base.ismutabletype(T) || T === String || T <: Tuple) && !(T <: Ptr))
+_is_ptr_type(T) = (T isa DataType && !(T <: Ptr) && (
+    Base.ismutabletype(T) || T === String || T <: Tuple ||
+    (isconcretetype(T) && !isbitstype(T) &&
+     !(T.name.name in (:GenericMemoryRef, :GenericMemory)))
+))
 
 _is_i64(T) = let r = scalar_repr(T); !_is_ptr_type(T) && r !== nothing && r.bits == 64 && !r.isfloat; end
 _is_f64(T) = let r = scalar_repr(T); !_is_ptr_type(T) && r !== nothing && r.isfloat && r.bits == 64; end
@@ -139,7 +142,15 @@ _is_f32(T) = let r = scalar_repr(T); !_is_ptr_type(T) && r !== nothing && r.isfl
     for i in eachindex(AT.parameters)
         T = AT.parameters[i]
         if _is_ptr_type(T)
-            push!(ccall_types, Ptr{Cvoid}); push!(arg_exprs, :(pointer_from_objref(getfield(args,$i))))
+            push!(ccall_types, Ptr{Cvoid})
+            # pointer_from_objref works on mutable structs, String, and Tuple.
+            # For immutable non-bitstype structs (e.g. GreenNode), wrap with Ref.
+            if isconcretetype(T) && !isbitstype(T) && !Base.ismutabletype(T) &&
+               T !== String && !(T <: Tuple)
+                push!(arg_exprs, :(pointer_from_objref(Ref(getfield(args,$i)))))
+            else
+                push!(arg_exprs, :(pointer_from_objref(getfield(args,$i))))
+            end
         elseif _is_f64(T)
             push!(ccall_types, Float64); push!(arg_exprs, :(getfield(args,$i)))
         elseif _is_f32(T)

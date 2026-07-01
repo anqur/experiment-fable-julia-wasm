@@ -3,34 +3,20 @@
 using NativeCodegen
 using Test
 
-function run(name, f, argtypes, args, expected)
+# Unified test runner. `use_cc` selects compile_and_call (for GC-object returns);
+# otherwise uses compile_native + native_callable_from_so.
+function run(name, f, argtypes, args, expected; use_cc=false)
     print("  $name ... ")
     try
-        comp = compile_native(f, argtypes; name=name)
-        nf = native_callable_from_so(comp, expected isa Nothing ? Nothing : typeof(expected), argtypes.parameters...)
-        r = nf(args...)
-        if r == expected
-            println("✅ $r")
-            rm(comp.so_path)
-            return true
+        r = if use_cc
+            compile_and_call(f, expected isa Nothing ? Nothing : typeof(expected), argtypes, args...)
         else
-            println("❌ got $r, expected $expected")
+            comp = compile_native(f, argtypes; name=name)
+            nf = native_callable_from_so(comp, expected isa Nothing ? Nothing : typeof(expected), argtypes.parameters...)
+            result = nf(args...)
             rm(comp.so_path)
-            return false
+            result
         end
-    catch e
-        println("❌ $e")
-        return false
-    end
-end
-
-# Like `run`, but via the one-shot compile_and_call — needed for tests that
-# return GC objects (Strings, structs, arrays) with 1+ args, since
-# native_callable_from_so's multi-arg return path still yields a raw Ptr.
-function run_cc(name, f, argtypes, args, expected)
-    print("  $name ... ")
-    try
-        r = compile_and_call(f, expected isa Nothing ? Nothing : typeof(expected), argtypes, args...)
         if r == expected
             println("✅ $r")
             return true
@@ -126,24 +112,24 @@ ar_size(a::Vector{Int64}) = size(a, 1) ; run("arsz3", ar_size, Tuple{Vector{Int6
 
 println("\n=== Strings (concat/return) ===")
 # String concatenation (a*b → invoke Base._string; literal-literal → invoke *).
-sc_cat2(a::String,b::String) = a * b ; run_cc("scat2", sc_cat2, Tuple{String,String}, ("foo","bar"), "foobar")
+sc_cat2(a::String,b::String) = a * b ; run("scat2", sc_cat2, Tuple{String,String}, ("foo","bar"), "foobar"; use_cc=true)
 # 3-way concat via left-fold (2 args + literal).
-sc_cat3(a::String,b::String) = a * b * "!" ; run_cc("scat3", sc_cat3, Tuple{String,String}, ("ab","cd"), "abcd!")
+sc_cat3(a::String,b::String) = a * b * "!" ; run("scat3", sc_cat3, Tuple{String,String}, ("ab","cd"), "abcd!"; use_cc=true)
 # String literal return.
-sc_mkstr() = "hello" ; run_cc("smkstr", sc_mkstr, Tuple{}, (), "hello")
+sc_mkstr() = "hello" ; run("smkstr", sc_mkstr, Tuple{}, (), "hello"; use_cc=true)
 # Literal-literal concat (inference may constant-fold; both paths handled).
-sc_greet() = "Hello, " * "World!" ; run_cc("sgreet", sc_greet, Tuple{}, (), "Hello, World!")
+sc_greet() = "Hello, " * "World!" ; run("sgreet", sc_greet, Tuple{}, (), "Hello, World!"; use_cc=true)
 
 println("\n=== Array Growth (resize!) ===")
 # resize! shrink: [1,2,3,4] -> [1,2].
-ag_shrink(a::Vector{Int64}) = (resize!(a, 2); a) ; run_cc("ashrk", ag_shrink, Tuple{Vector{Int64}}, (Int64[1,2,3,4],), [1,2])
+ag_shrink(a::Vector{Int64}) = (resize!(a, 2); a) ; run("ashrk", ag_shrink, Tuple{Vector{Int64}}, (Int64[1,2,3,4],), [1,2]; use_cc=true)
 # Build an array dynamically by growing + filling (the headline growth case).
 function ag_build(n::Int64)::Vector{Int64}
     a = Vector{Int64}(undef, 0)
     for i in 1:n; resize!(a, i); a[i] = i*i; end
     a
 end
-run_cc("abuild", ag_build, Tuple{Int64}, (5,), [1,4,9,16,25])
+run("abuild", ag_build, Tuple{Int64}, (5,), [1,4,9,16,25]; use_cc=true)
 # resize! grow: length grows, original elements preserved (new slots are undef,
 # so check length + first elements explicitly rather than full-array equality).
 ag_grow(a::Vector{Int64}, n::Int64) = (resize!(a, n); a)
@@ -160,18 +146,18 @@ end
 println("\n=== push! ===")
 # push! mutates in place: [1,2] + push!(9) → length 3, last element 9.
 pushone(a::Vector{Int64}, x::Int64) = (push!(a, x); a)
-run_cc("pushone", pushone, Tuple{Vector{Int64},Int64}, (Int64[1,2], Int64(9)), [1,2,9])
+run("pushone", pushone, Tuple{Vector{Int64},Int64}, (Int64[1,2], Int64(9)), [1,2,9]; use_cc=true)
 # Build by pushing in a loop: empty alloc + grow loop + return.
 function buildpush(n::Int64)::Vector{Int64}
     a = Int64[]
     for i in 1:n; push!(a, i*i); end
     a
 end
-run_cc("bldpush", buildpush, Tuple{Int64}, (5,), [1,4,9,16,25])
+run("bldpush", buildpush, Tuple{Int64}, (5,), [1,4,9,16,25]; use_cc=true)
 
 println("\n=== pop! ===")
 # pop! returns the last element AND mutates the caller's array in place.
-# Both must be checked — use direct compile_and_call (not run_cc's equality form).
+# Both must be checked — use direct compile_and_call (not run's equality form).
 popone(a::Vector{Int64}) = pop!(a)
 print("  popone ... ")
 try
@@ -203,13 +189,13 @@ end
 println("\n=== append! ===")
 # append! mutates the destination in place and returns it.
 appendsrc(a::Vector{Int64}, b::Vector{Int64}) = (append!(a, b); a)
-run_cc("appendsrc", appendsrc, Tuple{Vector{Int64},Vector{Int64}}, (Int64[1,2,3], Int64[4,5]), [1,2,3,4,5])
+run("appendsrc", appendsrc, Tuple{Vector{Int64},Vector{Int64}}, (Int64[1,2,3], Int64[4,5]), [1,2,3,4,5]; use_cc=true)
 # append! in a loop with real growth (2-arg ptr+ptr → Vector).
 function appendloop(a::Vector{Int64}, b::Vector{Int64})::Vector{Int64}
     for i in 1:3; append!(a, b); end
     a
 end
-run_cc("appendloop", appendloop, Tuple{Vector{Int64},Vector{Int64}}, (Int64[0], Int64[1,2]), [0,1,2,1,2,1,2])
+run("appendloop", appendloop, Tuple{Vector{Int64},Vector{Int64}}, (Int64[0], Int64[1,2]), [0,1,2,1,2,1,2]; use_cc=true)
 
 println("\n=== Conversions (int <-> float) ===")
 cv_sitofp(x::Int64)::Float64 = Float64(x) ; run("sitofp", cv_sitofp, Tuple{Int64}, (Int64(5),), 5.0)
@@ -332,12 +318,12 @@ run("clamp_mid", myclamp, Tuple{Int64,Int64,Int64}, (Int64(5),Int64(0),Int64(10)
 add4(a::Int64, b::Int64, c::Int64, d::Int64)::Int64 = a + b + c + d ; run("add4", add4, Tuple{Int64,Int64,Int64,Int64}, (1,2,3,4), 10)
 # ptr + 3× Int64 → Int64 (mixes pointer and scalar args at N=4)
 mix4(a::Vector{Int64}, x::Int64, y::Int64, z::Int64)::Int64 = length(a) + x + y + z
-run_cc("mix4", mix4, Tuple{Vector{Int64},Int64,Int64,Int64}, (Int64[10,20], 1, 2, 3), 8)
+run("mix4", mix4, Tuple{Vector{Int64},Int64,Int64,Int64}, (Int64[10,20], 1, 2, 3), 8; use_cc=true)
 # 3× Float32 → Float32 (Float32 ABI must hold at N=3)
 fma3f(a::Float32, b::Float32, c::Float32)::Float32 = a + b * c ; run("fma3f", fma3f, Tuple{Float32,Float32,Float32}, (Float32(1),Float32(2),Float32(3)), 7.0f0)
 # ptr return at N=3: construct a 3-tuple from 3 Int64 args
 maketri(x::Int64, y::Int64, z::Int64)::Tuple{Int64,Int64,Int64} = (x, y, z)
-run_cc("maketri", maketri, Tuple{Int64,Int64,Int64}, (1,2,3), (1,2,3))
+run("maketri", maketri, Tuple{Int64,Int64,Int64}, (1,2,3), (1,2,3); use_cc=true)
 # 8× Int64 → Int64 (exercises the generated dispatcher well past the old 2-arg ceiling)
 add8(a::Int64, b::Int64, c::Int64, d::Int64, e::Int64, f::Int64, g::Int64, h::Int64)::Int64 = a + b + c + d + e + f + g + h
 run("add8", add8, Tuple{Int64,Int64,Int64,Int64,Int64,Int64,Int64,Int64},
@@ -345,15 +331,15 @@ run("add8", add8, Tuple{Int64,Int64,Int64,Int64,Int64,Int64,Int64,Int64},
 
 println("\n=== Runtime-element array literals ([a,b,c] with variables) ===")
 lit2(a::Int64, b::Int64)::Vector{Int64} = [a, b]
-run_cc("lit2", lit2, Tuple{Int64,Int64}, (Int64(3),Int64(4)), [3,4])
+run("lit2", lit2, Tuple{Int64,Int64}, (Int64(3),Int64(4)), [3,4]; use_cc=true)
 lit3(a::Int64, b::Int64, c::Int64)::Vector{Int64} = [a, b, c]
-run_cc("lit3", lit3, Tuple{Int64,Int64,Int64}, (Int64(1),Int64(2),Int64(3)), [1,2,3])
+run("lit3", lit3, Tuple{Int64,Int64,Int64}, (Int64(1),Int64(2),Int64(3)), [1,2,3]; use_cc=true)
 # same variable thrice in a 1-arg literal
 lit_dup(i::Int64)::Vector{Int64} = [i, i, i]
-run_cc("litdup", lit_dup, Tuple{Int64}, (Int64(7),), [7,7,7])
+run("litdup", lit_dup, Tuple{Int64}, (Int64(7),), [7,7,7]; use_cc=true)
 # Float64 element type
 litf(a::Float64, b::Float64)::Vector{Float64} = [a, b]
-run_cc("litf", litf, Tuple{Float64,Float64}, (Float64(1.5),Float64(2.5)), [1.5,2.5])
+run("litf", litf, Tuple{Float64,Float64}, (Float64(1.5),Float64(2.5)), [1.5,2.5]; use_cc=true)
 # restore the appendloop test using the dynamic literal that originally hit the bug
 function appendloop_dyn(n::Int64)::Vector{Int64}
     a = Int64[]

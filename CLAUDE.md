@@ -25,6 +25,24 @@ instead of serializing/parsing CLIF text.
 - Top-level dev env: `julia +nightly --project=.` (devs all packages via
   `[sources]` in Project.toml).
 
+### Milestone planning
+
+**Always plan next milestones based on real-world compilation gap analysis,**
+not speculative feature lists. The primary driver is **JuliaSyntax.jl**
+(`julia +nightly --project=. NativeCodegen/test/debug_jlsyntax_probe.jl`) —
+a production parser library shipped with Julia 1.14. Probe representative
+functions from it through `compile_native`, catalog systematic failures, and
+rank by effort × number-of-functions-unblocked. The probe results determine
+which work items are worth doing next.
+
+The probe file exercises: bitwise predicates, Kind construction, type
+predicates, field accessors, pointer loops, GreenNode constructors, varargs,
+and literal parsing dispatch. A function that compiles successfully counts
+as a win; a `CompileError` / verifier failure / bridge `MethodError` is a
+gap. Group failures by root cause (e.g. "Bool return ABI", "GreenNode
+pointer classification") and attack the causes that block the most functions
+first.
+
 ### Testing rules
 
 - **NEVER use inline `julia -e` for exploratory tests.** Always create real
@@ -179,7 +197,7 @@ for direct memory access (no runtime calls needed):
   `fptosi`/`fptoui` use the **saturating** `_sat` variants (match Julia's unsafe_trunc latitude).
 - ✅ Float math (sqrt_llvm, ceil_llvm, floor_llvm, trunc_llvm, rint_llvm, abs_float, copysign_float)
 - ✅ Bit ops (ctlz/cttz/ctpop_int, bswap_int, flipsign_int, abs via flipsign_int(x,x))
-  — **full-width (Int64/UInt64) correct; sub-word needs renormalization (NYI)**
+  — **full-width (Int64/UInt64) correct; sub-word now renormalized** ✅ (see `native_norm!` below)
 - ✅ Control flow (GotoIfNot → brif, GotoNode → jump, ReturnNode → return)
 - ✅ Phi nodes (block params + jump/brif args)
 - ✅ Loops (while, gcd with swapping)
@@ -235,7 +253,28 @@ for direct memory access (no runtime calls needed):
   `fieldoffset`, then returns the one requested (constant index) or a
   `block_add_select` chain over the dynamic index (mirrors the constant-tuple
   `emit_tuple_index`). Single-element tuples pass through (no allocation).
-  built only for the dead `_throw_boundserror_indices` path) emit a sentinel.
+- ✅ **Bitstype immutable struct construction** — `%new(T, fields...)` where
+  `isbitstype(T)` packs fields into a register via `uextend` + `ishl` + `bor`
+  (the inverse of the existing getfield Case 3 `ushr` + `band` extraction). The
+  struct's Cranelift type determines the register width; sub-word field types
+  (`Int16`/`Int8`) are `uextend`-ed to match. Only ≤8-byte structs supported
+  (`cranelift_type` throws for larger). Non-bitstype immutable structs (heap
+  fields) — `emit_new` heap-allocates via `isconcretetype(T)` guard (was
+  `ismutabletype`). `_gcall` wraps immutable args with `Ref` so `pointer_from_objref`
+  works. The `cranelift_type`/`_is_ptr_type`/`is_ptr_type` immutable-nonbitstype
+  clause excludes `GenericMemoryRef`/`GenericMemory` (Core memory types, by
+  `T.name.name`) to keep the ref_tracking pipeline intact.
+- ✅ **Bool return ABI** — `emit_not_int` now `uextend`s to I32 (like `emit_icmp`
+  already did). `Core.ReturnNode` previously passed raw I8 from `icmp` to the
+  return instruction, which Cranelift rejected against the I32 function signature.
+- ✅ **`GlobalRef` as operand** — `resolve_operand` resolves `Core.GlobalRef` to
+  its module-constant value at compile time (e.g. `JuliaSyntax.TRIVIA_FLAG`).
+- ✅ **`Base.add_ptr`** — `emit_globalref` routes `add_ptr(ptr, offset)` to
+  `emit_binop(:block_add_iadd, ...)` — pointer addition is just integer addition
+  in Cranelift.
+- ✅ **Primitive-type operands** — `resolve_operand` handles `isprimitivetype`
+  values (e.g. `JuliaSyntax.Kind`, a `UInt16`-backed primitive) by
+  `reinterpret(UInt, val)` → iconst.
 - ✅ **N-argument bridge** — `compile_and_call`, `native_callable`, and
   `native_callable_from_so` support **any arity** via a single `@generated _gcall`
   dispatcher (`NativeCodegen.jl`) that builds the `ccall` argument-type tuple from
@@ -244,6 +283,23 @@ for direct memory access (no runtime calls needed):
   f64→Float64, f32→Float32(abi), i64→Int64(to_wire), else→Int32(to_wire); return
   Nothing→Cvoid, ptr→unsafe_pointer_to_objref, Float64/Float32→direct, else→Int64+from_wire.
   Calls the compiled function exactly once.
+- ✅ **`string(n)` integer formatting** — `string(::Int64)` lowers to
+  `invoke Base.var"#string#N"(base, count, fn, val)`. The `#string#N` handler in
+  `emit_invoke` detects the generated function (matching `"#string#"` prefix) and
+  routes single-value (`count==1`) through `__jl_int_to_string(val, base)` in
+  `native-backend/src/runtime/print.rs` — a direct `jl_alloc_string`-based
+  formatter (bypasses Julia's IOBuffer/print infrastructure). Supports bases 2–36.
+  Keyword args (`string(n, base=2)`) and multi‑arg (`string(a,b)`) are deferred
+  — they go through `print_to_string` (varargs) or keyword‑argument desugaring
+  (`Core._apply_iterate`, `kwerr`).
+- ✅ **Sub-word integer renormalization** — `native_norm!(bc, val, T)` in
+  `builder_emit.jl` post‑op: signed→`(val << pad) >> pad` (shift‑left then
+  arithmetic‑shift‑right, pads `32 - bits`), unsigned→`band` with `0xFF`/`0xFFFF`
+  mask. Mirrors WasmCodegen's `emit_norm!`. Applied at every arithmetic binop
+  (add/sub/mul/div/rem), `neg_int`, `not_int`, `flipsign_int`, `emit_icmp`
+  operand pre‑comparison, and `emit_trunc` post‑ireduce. (Bit‑ops like `clz`/
+  `ctz`/`ctpop` on sub‑word are deferred — they need width‑aware correction:
+  `op - (32 - logical_bits)`.)
 - ✅ **Checked-arithmetic overflow pairs** — `checked_{s,u}{add,sub,mul}_int` return
   `(value, overflowed::Bool)` from a *single* IR stmt. Materialized as TWO value
   ids in `bc.ssa_pairs[stmt_idx] = (value_id, flag_id)` (no tuple allocation),
@@ -255,7 +311,26 @@ for direct memory access (no runtime calls needed):
   else `a`) so the guarding `sdiv`/`udiv` never traps — sidestepping the
   `typemin/-1` trap case without control flow (SSA `select` evaluates both arms).
   Only full-word widths (`sizeof∈{4,8}`: Int32/UInt32/Int64/UInt64) supported;
-  sub-word throws `CompileError` (loud failure — needs width renormalization).
+  sub‑word checked arithmetic throws `CompileError` (the i64‑widening overflow
+  detection from WasmCodegen's `emit_checked!` is deferred — needs width‑aware
+  widening). Regular sub‑word arithmetic is renormalized via `native_norm!`.
+- ✅ **`bitcast` intrinsic** — `Core.Intrinsics.bitcast` recognized via identity check
+  in `emit_intrinsic` (like `checked_*`); no-op at Cranelift level (same bits,
+  different type annotation). Also handles `GlobalRef` form in `emit_globalref`.
+- ✅ **`isa` built-in** — `Core.isa` dispatched in `emit_instruction` as a `Core.Builtin`.
+  `isa(x, Nothing)` lowers to `icmp eq ptr_val, 0` (null check) for pointer values.
+- ✅ **`Union{Nothing, T}` field access** — `emit_struct_getfield` detects Union
+  field types before `ref_tracking` and loads them as raw pointers (`TYPE_PTR`).
+  `nothing` maps to null (0), a value maps to its heap pointer. Fixes the
+  `convert(DataType, Union{...})` MethodError in dict `setindex!`.
+- ✅ **`AbstractString` in `cranelift_type`** — `AbstractString` (used in
+  `ArgumentError.msg` / `ErrorException.msg` fields) returns `TYPE_PTR` (always a
+  heap-allocated `String`).
+- ✅ **JuliaSyntax compilation acceptance** — 5 of 5 probe functions now compile
+  through `compile_native`: `has_flags`, `is_number`, `is_leaf`, `Kind(Int)`,
+  `call_type_flags`. `numchildren`, `span`, `child_position_span` also work.
+  Remaining deferred gaps: sub-word `clz`/`ctz`/`ctpop` correction; varargs
+  tuple pointer width. Probe at `NativeCodegen/test/debug_jlsyntax_probe.jl`.
 
 ### Bridge type dispatch
 
@@ -285,6 +360,9 @@ for direct memory access (no runtime calls needed):
   TWICE, which corrupted side-effecting callees (`push!`/`pop!`/`resize!`/`append!`
   observed their own earlier mutation, e.g. `pop!` returned `a[end-1]` and
   over-shrank by one). The single-call invariant is now structural to `_gcall`.
+- **Immutable struct arg marshalling**: `_gcall` wraps non-bitstype immutable
+  struct args with `Ref()` before `pointer_from_objref` (which otherwise fails
+  on immutables). Mutable structs, String, and Tuple args are passed directly.
 - Also `native_callable_from_so` for loading pre-linked .so files (bypasses Rust ccalls)
 
 ### Key eDSL conventions (builder_emit.jl ↔ native-builder)
@@ -368,9 +446,10 @@ for direct memory access (no runtime calls needed):
    `codeunit`, `sizeof`, `isempty`, and string concat `:*`/`Base._string`.)
 
 9. **String ops — what's deferred** — String **read** ops + **concatenation** +
-   **literal return** work. NOT yet supported: mixed-type `string(n)` (lowers to
-   `invoke Base.print_to_string` / generated `Base.var"#string#N"` — needs
-   integer-to-decimal formatting), `String(bytes::Vector{UInt8})` (lowers to
+   **literal return** + **single‑arg `string(n::Int64)`** work. NOT yet supported:
+   `string(n, base=2)` with keyword args (desugars to `_apply_iterate` +
+   `Vector{Symbol}`), multi‑arg `string(a,b,...)` (lowers to vararg
+   `print_to_string`), `String(bytes::Vector{UInt8})` (lowers to
    `invoke WasmCodegen._memory_to_string` — needs Memory-pipeline data-ptr
    extraction), and string mutation / UTF-8 character indexing (byte/codeunit
    access works).

@@ -44,10 +44,13 @@ function cranelift_type(T)
     T isa DataType && Base.ismutabletype(T) && !(T <: Ptr) && return TYPE_PTR
     # Handle tuples as pointer types (multi-element tuples need memory allocation)
     T isa DataType && T <: Tuple && return TYPE_PTR
+    # Immutable non-bitstype structs with heap fields (e.g. GreenNode, Wrapper)
+    # are also pointers. Exclude MemoryRef/Memory (need Case 2 ref_tracking).
+    _is_heap_struct(T) && return TYPE_PTR
     r = scalar_repr(T)
     if r !== nothing
-        return r.vt == WasmTools.I64 ? TYPE_I64 : r.vt == WasmTools.I32 ? TYPE_I32 :
-               r.vt == WasmTools.F64 ? TYPE_F64 : TYPE_F32
+        return r.vt == WasmCodegen.I64 ? TYPE_I64 : r.vt == WasmCodegen.I32 ? TYPE_I32 :
+               r.vt == WasmCodegen.F64 ? TYPE_F64 : TYPE_F32
     end
     # Bitstypes: map to Cranelift type by sizeof
     if T isa DataType && isbitstype(T)
@@ -56,11 +59,20 @@ function cranelift_type(T)
         sz == 4 && return TYPE_I32
         sz == 1 && return TYPE_I8
     end
+    # Abstract types that are always heap pointers (e.g. AbstractString, Exception)
+    isabstracttype(T) && return TYPE_PTR
     throw(CompileError("unsupported type $T"))
 end
 
+# Predicate: concrete immutable struct with heap fields that should be pointer-typed.
+# Excludes GenericMemoryRef/GenericMemory (Core memory types managed via ref_tracking).
+_is_heap_struct(T) = T isa DataType && isconcretetype(T) && !isbitstype(T) &&
+                     !(T.name.name in (:GenericMemoryRef, :GenericMemory)) && !(T <: Ptr)
+
 function is_ptr_type(T)
-    T isa DataType && (Base.ismutabletype(T) || T === String || T <: Tuple) && !(T <: Ptr)
+    T isa DataType && !(T <: Ptr) && (
+        Base.ismutabletype(T) || T === String || T <: Tuple || _is_heap_struct(T)
+    )
 end
 
 # === BuilderCtx: tracks a Rust FunctionCtx for one Julia function ===
@@ -72,9 +84,7 @@ mutable struct BuilderCtx
     # SSA value tracking
     ssa_values::Dict{Core.SSAValue, UInt32}
     arg_values::Dict{Core.Argument, UInt32}
-    const_values::Dict{Any, UInt32}
     blocks::Dict{Int, String}   # Julia block index → Cranelift block name
-    ir::Any
     # Composed offset tracking: SSA value → (base_ptr_id, composed_offset, struct_type)
     # Used when getfield loads a non-loadable type like MemoryRef — subsequent
     # getfield on that SSA value recomposes the full offset from the base pointer.
@@ -93,8 +103,7 @@ function BuilderCtx(lib_path::String)
     BuilderCtx(ctx, C_NULL, lib,
                Dict{Core.SSAValue, UInt32}(),
                Dict{Core.Argument, UInt32}(),
-               Dict{Any, UInt32}(),
-               Dict{Int, String}(), nothing,
+               Dict{Int, String}(),
                Dict{Core.SSAValue, Tuple{UInt32, Int, DataType}}(),
                Dict{Int, Tuple{UInt32, UInt32}}())
 end
@@ -123,7 +132,6 @@ function emit_function_via_builder(interp::WasmInterp, f, argtypes::Type{<:Tuple
 
     builder_lib = get_native_builder_lib()
     bc = BuilderCtx(builder_lib)
-    bc.ir = ir
 
     try
         # Declare runtime imports (GC allocation, string ops, etc.)
@@ -253,6 +261,10 @@ function emit_instruction(bc::BuilderCtx, e, ir, stmt_idx::Int)
         elseif f === Core.memoryrefunset!
             # memoryrefunset!(ref, ordering, boundscheck) — store zero at ref for GC safety
             result_id = emit_memoryrefunset(bc, args, ir)
+        elseif f === Core.isa
+            # isa(x, Type) — type check. Currently only handles isa(x, Nothing)
+            # on pointer values (icmp eq ptr_val, 0).
+            result_id = emit_isa(bc, args, ir)
         else
             error("Unsupported call: $(f)")
         end
@@ -424,6 +436,10 @@ function resolve_operand(bc::BuilderCtx, val, ir)
     elseif val isa Core.Const
         # Extract the constant value and resolve it
         return resolve_operand(bc, val.val, ir)
+    elseif val isa Core.GlobalRef
+        # Module-level constant (e.g. JuliaSyntax.TRIVIA_FLAG) — fetch value at
+        # compile time and emit as a Cranelift immediate.
+        return emit_constant(bc, getglobal(val.mod, val.name))
     elseif isa(val, Number)
         # Create constant each time (caching causes cross-block dominance issues)
         return emit_constant(bc, val)
@@ -447,6 +463,11 @@ function resolve_operand(bc::BuilderCtx, val, ir)
         return ccall(iconst_ptr, UInt32, (Ptr{Cvoid}, Int64, UInt32),
                      bc.fctx_handle, Int64(reinterpret(UInt64, pointer_from_objref(val))),
                      TYPE_PTR)
+    elseif Base.isprimitivetype(typeof(val))
+        # Primitive type (e.g. JuliaSyntax.Kind is `primitive type Kind 16 end`) —
+        # reinterpret to integer bits and emit as constant.
+        raw = reinterpret(UInt16, val)
+        return emit_constant(bc, Int32(raw))
     else
         error("Unsupported operand type: $(typeof(val))")
     end
@@ -483,6 +504,8 @@ function emit_intrinsic(bc::BuilderCtx, f::Core.IntrinsicFunction, args, ir, stm
     f === Core.Intrinsics.checked_usub_int && return emit_checked_pair(bc, :sub, false, args, ir, stmt_idx)
     f === Core.Intrinsics.checked_smul_int && return emit_checked_pair(bc, :mul, true,  args, ir, stmt_idx)
     f === Core.Intrinsics.checked_umul_int && return emit_checked_pair(bc, :mul, false, args, ir, stmt_idx)
+    # bitcast reinterprets the same bits as a different type — no-op at Cranelift level
+    f === Core.Intrinsics.bitcast && return resolve_operand(bc, args[2], ir)
 
     # Map intrinsic to Rust FFI call
     fn_name = ccall(:jl_intrinsic_name, Ptr{UInt8}, (Any,), f)
@@ -649,12 +672,14 @@ end
 # not_int: for Bool → logical NOT using icmp_eq(val, 0)
 function emit_not_int(bc::BuilderCtx, args, ir)
     val = resolve_operand(bc, args[1], ir)
-    # Use i32 zero since not_int operates on Bool (i32 after extend)
     zero = emit_constant(bc, Int32(0))
     fn_ptr = Libdl.dlsym(bc.lib_handle, :block_add_icmp)
-    # Return raw i8 (no uextend) — brif handles the reduce itself
-    return ccall(fn_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32, UInt32),
-                 bc.fctx_handle, ICMP_EQ, val, zero)
+    result = ccall(fn_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32, UInt32),
+                   bc.fctx_handle, ICMP_EQ, val, zero)
+    # Like emit_icmp: Cranelift icmp returns i8; uextend to i32 for Bool.
+    ext_ptr = Libdl.dlsym(bc.lib_handle, :block_add_uextend)
+    return ccall(ext_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
+                 bc.fctx_handle, result, TYPE_I32)
 end
 
 # flipsign_int(x, y) = y >= 0 ? x : -x, lowered as (x ⊻ s) - s with
@@ -950,6 +975,7 @@ function emit_globalref(bc::BuilderCtx, f::Core.GlobalRef, args, ir, stmt_idx)
     if fn == :or_int || fn == :|  ; return emit_binop(bc, :block_add_bor, args, ir) end
     if fn == :xor_int ; return emit_binop(bc, :block_add_bxor, args, ir) end
     if fn == :shl_int ; return emit_binop(bc, :block_add_ishl, args, ir) end
+    if fn == :add_ptr && length(args) >= 2 ; return emit_binop(bc, :block_add_iadd, args, ir) end
     if fn == :lshr_int ; return emit_binop(bc, :block_add_ushr, args, ir) end
     if fn == :ashr_int ; return emit_binop(bc, :block_add_sshr, args, ir) end
     # Bit-count / byte-swap (full-width correct; sub-word needs renormalization)
@@ -1247,6 +1273,23 @@ function emit_struct_getfield(bc::BuilderCtx, args, ir, stmt_idx)
     end
 
     if !field_loadable && (T isa DataType)
+        # Union{Nothing, T} where T is a heap-allocated type: load field as raw
+        # pointer. nothing → null(0), a value → its heap pointer. Must handle
+        # BEFORE ref_tracking — the ref_tracking dict expects Tuple{UInt32,
+        # Int64, DataType} and a Union type causes convert(DataType, Union).
+        if field_T isa Union
+            # Union{a, b} — check for Union{Nothing, PointerType}
+            a_T, b_T = field_T.a, field_T.b  # avoids Base.uniontypes allocation
+            other_T = a_T === Nothing ? b_T :
+                      b_T === Nothing ? a_T : nothing
+            if other_T !== nothing && other_T isa DataType && is_ptr_type(other_T)
+                offset = fieldoffset(T, field_sym)
+                load_ptr = Libdl.dlsym(bc.lib_handle, :block_add_load)
+                result = ccall(load_ptr, UInt32, (Ptr{Cvoid}, UInt32, Int32, UInt32),
+                              bc.fctx_handle, obj_id, Int32(offset), TYPE_PTR)
+                return result
+            end
+        end
         # Track composed offset for later getfield sub-accesses
         offset = fieldoffset(T, field_sym)
         bc.ref_tracking[Core.SSAValue(stmt_idx)] = (obj_id, offset, field_T)
@@ -1525,6 +1568,26 @@ function emit_memoryrefset(bc::BuilderCtx, args, ir)
     return val_id
 end
 
+function emit_isa(bc::BuilderCtx, args, ir)
+    # isa(x, Type) — currently only handles isa(x, Nothing) on pointer values.
+    # args[1] = value, args[2] = the type to check against (Nothing / QuoteNode / Const)
+    target_type = args[2]
+    target_type isa QuoteNode && (target_type = target_type.value)
+    target_type isa Core.Const && (target_type = target_type.val)
+    if target_type === Nothing
+        val_id = resolve_operand(bc, args[1], ir)
+        zero_id = emit_constant(bc, Int64(0))
+        fn_ptr = Libdl.dlsym(bc.lib_handle, :block_add_icmp)
+        result = ccall(fn_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32, UInt32),
+                      bc.fctx_handle, ICMP_EQ, val_id, zero_id)
+        # uextend I8 → I32 for Bool ABI
+        ext_ptr = Libdl.dlsym(bc.lib_handle, :block_add_uextend)
+        return ccall(ext_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
+                    bc.fctx_handle, result, TYPE_I32)
+    end
+    throw(CompileError("unsupported isa target: $target_type"))
+end
+
 function emit_memoryrefunset(bc::BuilderCtx, args, ir)
     # memoryrefunset!(memref::MemoryRef{T}, ordering, boundscheck) → Nothing
     # Stores zero at the MemoryRef address (GC safety for reference types).
@@ -1600,9 +1663,6 @@ function emit_call_runtime(bc::BuilderCtx, func_name::String, arg_ids::Vector{UI
                  (Ptr{Cvoid}, Ptr{Cvoid}, Ptr{UInt8}, Ptr{UInt32}, Csize_t),
                  bc.fctx_handle, bc.builder_handle, func_name, arg_ids, nargs)
 end
-
-const ARRAY_TYPE_TAG = UInt32(2)
-const VECTOR_TYPE_TAG = UInt32(3)
 
 function emit_memorynew(bc::BuilderCtx, args, ir)
     # Core.memorynew(Memory{T}, n) → allocate raw memory with Julia-compatible layout
@@ -1699,8 +1759,6 @@ function emit_core_tuple(bc::BuilderCtx, args, ir)
     return ptr_id
 end
 
-const STRUCT_TYPE_TAG = UInt32(1)
-
 function emit_new(bc::BuilderCtx, T, field_args, ir, stmt_idx)
     # %new(T, fields...) — construct a new struct with Julia-compatible allocation
     # T can be: Core.Const, Core.GlobalRef, or direct DataType
@@ -1742,8 +1800,39 @@ function emit_new(bc::BuilderCtx, T, field_args, ir, stmt_idx)
                      bc.fctx_handle, Int64(0), TYPE_I64)
     end
 
-    if !(T isa DataType) || !Base.ismutabletype(T)
-        error("new only supported for mutable structs, got $T ($(typeof(T)))")
+    # Bitstype immutable struct — pack fields into a register via uextend + ishl +
+    # bor (the inverse of the existing getfield Case 3 ushr + band extraction).
+    # Only ≤8-byte structs (cranelift_type succeeds); larger need multi-register.
+    if T isa DataType && isbitstype(T)
+        ct = cranelift_type(T)
+        field_ids = [resolve_operand(bc, fa, ir) for fa in field_args]
+        nf = length(field_ids)
+        nf == 0 && return emit_constant(bc, Int64(0))
+        uext_ptr  = Libdl.dlsym(bc.lib_handle, :block_add_uextend)
+        shl_ptr   = Libdl.dlsym(bc.lib_handle, :block_add_ishl)
+        bor_ptr   = Libdl.dlsym(bc.lib_handle, :block_add_bor)
+        acc_id = emit_constant(bc, Int64(0))
+        for i in 1:nf
+            f_id = field_ids[i]
+            bitpos = fieldoffset(T, i) * 8
+            field_type_enum = cranelift_type(fieldtype(T, i))
+            if field_type_enum != ct
+                f_id = ccall(uext_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
+                             bc.fctx_handle, f_id, ct)
+            end
+            if bitpos != 0
+                shift_id = emit_constant(bc, Int64(bitpos))
+                f_id = ccall(shl_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
+                             bc.fctx_handle, f_id, shift_id)
+            end
+            acc_id = ccall(bor_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
+                           bc.fctx_handle, f_id, acc_id)
+        end
+        return acc_id
+    end
+
+    if !(T isa DataType) || !isconcretetype(T)
+        error("new only supported for concrete types, got $T ($(typeof(T)))")
     end
 
     # Resolve all field values
