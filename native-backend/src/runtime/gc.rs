@@ -142,7 +142,11 @@ pub unsafe extern "C" fn __jl_gc_alloc_julia(
     ptr.add(JULIA_HEADER_SIZE)
 }
 
-/// Allocate array with Julia-compatible layout
+/// Allocate array with Julia-compatible layout.
+/// Layout: [type_tag(8)] [length(i64,8)] [element data...]
+/// Returns pointer to element data area (past type tag + length field).
+/// Memory{Int64} layout (verified via fieldoffset probes):
+///   fieldoffset(:length) = 0 (i64, 8 bytes), fieldoffset(:ptr) = 8
 #[no_mangle]
 pub unsafe extern "C" fn __jl_gc_alloc_array_julia(
     type_ptr: *mut u8,  // Julia datatype pointer
@@ -150,7 +154,9 @@ pub unsafe extern "C" fn __jl_gc_alloc_array_julia(
     elem_size: u32,
 ) -> *mut u8 {
     let data_size = (length as usize) * (elem_size as usize);
-    let total = JULIA_HEADER_SIZE + data_size;
+    // Always include the 8-byte length field in the allocation, even for length==0.
+    let len_field_size = std::mem::size_of::<i64>();
+    let total = JULIA_HEADER_SIZE + len_field_size + data_size;
     let layout = Layout::from_size_align(total, 16).unwrap();
     let ptr = GlobalAlloc::alloc(&GC_ALLOC, layout);
     if ptr.is_null() { return std::ptr::null_mut(); }
@@ -159,15 +165,12 @@ pub unsafe extern "C" fn __jl_gc_alloc_array_julia(
     let h = ptr as *mut JuliaGCHeader;
     (*h).type_ptr = type_ptr;
 
-    // Return pointer to data after type pointer
-    let data_ptr = ptr.add(JULIA_HEADER_SIZE);
+    // Length field (i64, 8 bytes) after type tag — matches fieldoffset(:length)==0
+    let len_ptr = ptr.add(JULIA_HEADER_SIZE) as *mut i64;
+    *len_ptr = length as i64;
 
-    // Store length in first sizeof(i32) bytes of data (Julia array convention)
-    let len_ptr = data_ptr as *mut i32;
-    *len_ptr = length;
-
-    // Return pointer to element data after length field
-    data_ptr.add(std::mem::size_of::<i32>())
+    // Return pointer to element data (past type tag + length field)
+    ptr.add(JULIA_HEADER_SIZE + len_field_size)
 }
 
 /// Get Julia type pointer from object allocated with __jl_gc_alloc_julia
@@ -188,24 +191,35 @@ pub unsafe extern "C" fn __jl_gc_get_julia_type_ptr(ptr: *const u8) -> *mut u8 {
 // matches the Julia-visible fields of jl_array_t (empirically verified via
 // NativeCodegen/test/debug_array_layout.jl on Julia nightly 1.14-DEV):
 //
-//   [type_tag (8)] [data_ptr (+0)] [_unknown (+8)] [length (+16)] [...]
+//   [type_tag (8)] [mem_ptr (+0)] [idx (+8)] [length (+16)] [capacity (+24)]
 //
-// pointer_from_objref returns offset +0 (past the type tag).  sizeof(Vector{T})
-// is 24 (= 3 words).  Beyond +24 are internal jl_array_t fields that Julia
-// never exposes; we store our own capacity at +24 for arrays we allocate.
+// offset +0..+15: MemoryRef {mem, idx} (inlined in Vector's :ref field)
+// offset +16:     :size as inline Int64 (Tuple{Int64} stored bare)
+// offset +24:     our capacity tracking (beyond Julia-visible sizeof=24)
 //
-// For arrays allocated by Julia and passed in as arguments: we cannot safely
-// read nalloc (it lives at a version-dependent offset inside jl_array_t).
-// Instead we always allocate a fresh data buffer on grow — correct and simple,
-// with the old buffer left for Julia's GC to collect.
+// mem_ptr points to the element data area of a Memory{T} object allocated by
+// __jl_gc_alloc_array_julia (emitted via emit_memorynew).  The Memory header
+// is at mem_ptr - 4 (i32 length) and mem_ptr - 12 (type tag).
 
 /// Julia-compatible 1-d array representation.  pointer_from_objref returns
-/// &data_ptr — offset 0 of this struct.
+/// &elem_ptr — offset 0 of this struct.
+///
+/// Julia field order (verified via fieldoffset probes):
+///   MemoryRef{Int64}:  fieldoffset(:ptr_or_offset) = 0, fieldoffset(:mem) = 8
+///   Memory{Int64}:     fieldoffset(:length) = 0 (i64), fieldoffset(:ptr) = 8
+///   Vector{Int64}:     sizeof=24, :ref at 0, :size at 16
+///
+/// Memory layout (from __jl_gc_alloc_array_julia):
+///   [type_tag(8)] [length(i64,8)] [element data...]
+///   pointer_from_objref  → type_tag + 8   (points to length field)
+///   alloc_array_julia ret → type_tag + 16  (points to element data)
 #[repr(C)]
 pub struct JuliaArrayRepr {
-    pub data_ptr: *mut u8,  // offset +0: element buffer
-    pub _pad0: i64,         // offset +8: internal (ndims/offset in jl_array_t)
-    pub length: i64,        // offset +16: nrows / current element count
+    // offset +0..+7:  MemoryRef.ptr_or_offset (= element data pointer)
+    // offset +8..+15: MemoryRef.mem (= pointer_from_objref(Memory))
+    pub elem_ptr: *mut u8,  // offset +0: direct element data pointer
+    pub mem_obj: *mut u8,   // offset +8: Memory object ref (= pointer_from_objref)
+    pub length: i64,        // offset +16: :size as inline Int64
     pub capacity: i64,      // offset +24: allocated element count (OUR field)
 }
 
@@ -236,19 +250,20 @@ pub unsafe fn rust_alloc_string(n: usize, type_ptr: *mut u8) -> *mut u8 {
 }
 
 /// Allocate a 1-d Julia-compatible array.  `atype` is the array type as a
-/// jl_value_t* (e.g. pointer_from_objref(Vector{Int64})), embedded as a
-/// constant by the compiled code.  `elem_size` is sizeof(eltype(T)).
+/// jl_value_t* (e.g. pointer_from_objref(Vector{Int64})).  `mem_ptr` is the
+/// element-data pointer returned by __jl_gc_alloc_array_julia (from the
+/// already-emitted emit_memorynew call).  `nel` is the initial element count.
+/// The caller (emit_new) already allocated the Memory{T} object; we build the
+/// Vector wrapper around it — we do NOT allocate a separate element buffer.
 #[no_mangle]
 pub unsafe extern "C" fn __jl_array_new_1d(
-    atype: *mut u8, nel: i64, elem_size: i64,
+    atype: *mut u8, mem_ptr: *mut u8, nel: i64,
 ) -> *mut u8 {
-    if atype.is_null() || nel < 0 {
+    if atype.is_null() {
         return std::ptr::null_mut();
     }
-    let nel = nel.max(0) as usize;
-    let elem_size = elem_size.max(1) as usize;
+    let nel = nel.max(0);
 
-    // Allocate the struct: type tag + JuliaArrayRepr
     let struct_total = JULIA_HEADER_SIZE + ARRAY_REPR_SIZE;
     let struct_layout = Layout::from_size_align(struct_total, 16).unwrap();
     let alloc = GlobalAlloc::alloc(&GC_ALLOC, struct_layout);
@@ -256,26 +271,14 @@ pub unsafe extern "C" fn __jl_array_new_1d(
         return std::ptr::null_mut();
     }
 
-    // Write type tag
     *(alloc as *mut *mut u8) = atype;
 
-    // Allocate the element buffer (0 bytes is fine for empty arrays)
-    let data_bytes = nel * elem_size;
-    let data_buf = if data_bytes > 0 {
-        let data_layout = Layout::from_size_align(data_bytes, 16).unwrap();
-        GlobalAlloc::alloc(&GC_ALLOC, data_layout)
-    } else {
-        std::ptr::null_mut()
-    };
-    if data_buf.is_null() && data_bytes > 0 {
-        GlobalAlloc::dealloc(&GC_ALLOC, alloc, struct_layout);
-        return std::ptr::null_mut();
-    }
-
-    // Initialize struct fields (data_ptr is at alloc + JULIA_HEADER_SIZE)
     let arr = alloc.add(JULIA_HEADER_SIZE) as *mut JuliaArrayRepr;
-    (*arr).data_ptr = data_buf;
-    (*arr)._pad0 = 0;
+    // Memory: [type_tag(8)] [length(i64,8)] [element data...]
+    // elem_data_ptr (= mem_ptr arg) = alloc+16 (past type_tag+length)
+    // mem_obj (= pointer_from_objref) = alloc+8
+    (*arr).elem_ptr = mem_ptr;
+    (*arr).mem_obj = mem_ptr.sub(8);
     (*arr).length = nel as i64;
     (*arr).capacity = nel as i64;
 
@@ -304,7 +307,7 @@ pub unsafe extern "C" fn __jl_array_grow_end(
     let old_bytes = (old_len as usize) * elem_size;
     let new_bytes = (new_len as usize) * elem_size;
 
-    let old_data = (*arr).data_ptr;
+    let old_data = (*arr).elem_ptr;
     // Allocate fresh buffer and copy — always works regardless of who
     // originally allocated the old buffer (us or Julia's GC).
     let layout = Layout::from_size_align(new_bytes.max(1), 16).unwrap();
@@ -313,12 +316,16 @@ pub unsafe extern "C" fn __jl_array_grow_end(
         if old_bytes > 0 && !old_data.is_null() {
             std::ptr::copy_nonoverlapping(old_data, new_data, old_bytes);
         }
-        (*arr).data_ptr = new_data;
+        (*arr).elem_ptr = new_data;
+        (*arr).mem_obj = new_data.sub(8);  // mem_obj = elem_ptr - 8
         (*arr).capacity = new_len as i64;
     }
     // If alloc failed, keep old data and length unchanged (arr stays valid)
-    if !(*arr).data_ptr.is_null() {
+    if !(*arr).elem_ptr.is_null() {
         (*arr).length = new_len;
+        // Sync Memory object's internal length (i64 at mem_obj + 0).
+        // mem_obj = pointer_from_objref(Memory), length at fieldoffset 0.
+        *((*arr).mem_obj as *mut i64) = new_len as i64;
     }
     a
 }
@@ -340,12 +347,16 @@ pub unsafe extern "C" fn __jl_array_del_end(
     let zero_start = (new_len as usize) * (elem_size as usize);
     let zero_bytes = (dec as usize) * (elem_size as usize);
     if zero_bytes > 0 {
-        let data = (*arr).data_ptr;
+        let data = (*arr).elem_ptr;
         if !data.is_null() {
             std::ptr::write_bytes(data.add(zero_start), 0, zero_bytes);
         }
     }
     (*arr).length = new_len;
+    // Sync Memory object's internal length (i64 at mem_obj+0)
+    if !(*arr).mem_obj.is_null() {
+        *((*arr).mem_obj as *mut i64) = new_len as i64;
+    }
     a
 }
 

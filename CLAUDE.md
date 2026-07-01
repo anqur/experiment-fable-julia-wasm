@@ -234,7 +234,6 @@ for direct memory access (no runtime calls needed):
   `__jl_array_resize` (pure-Rust, manipulates `JuliaArrayRepr` directly); **`push!(a, x)`**
   via `invoke Base._growend_internal!(a, 1, oldsize)` → `__jl_array_grow_end` (pure-Rust);
   `memoryrefoffset` emitted as constant from `ref_tracking.byte_offset / elem_size + 1`.
-  Note: push!/append! on internally-allocated arrays has a known crash (segfault at entry)
   — tracked as a bridge/IR issue, not a runtime dependency problem.
 - ✅ **`pop!(a)`** — lowers through existing plumbing (no dedicated handler):
   `memoryrefget` reads last element, `Core.memoryrefunset!` zeroes it for GC
@@ -457,7 +456,7 @@ on the output `.so` and fails if any `jl_` symbols are undefined).
 
 **Object layouts:**
 - **String**: `[jl_datatype_t* tag (8)] [length: i64 (8)] [inline char data...nul]` — allocated by `rust_alloc_string`
-- **Array**: `[jl_datatype_t* tag (8)] [JuliaArrayRepr {data_ptr, _pad0, length, capacity}]` — allocated by `__jl_array_new_1d`
+- **Array**: `[jl_datatype_t* tag (8)] [JuliaArrayRepr {elem_ptr, mem_obj, length, capacity}]` — allocated by `__jl_array_new_1d`
 - **Struct/tuple**: `[jl_datatype_t* tag (8)] [field data at fieldoffset]` — allocated by `__jl_gc_alloc_julia`
 - **Internal objects** (Memory, temporaries): `GCHeader {type_tag, flags, length}` — legacy layout, never returned to Julia
 

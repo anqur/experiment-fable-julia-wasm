@@ -1655,8 +1655,8 @@ function _declare_imports(bc::BuilderCtx)
     ccall(declare_ptr, Cint, (Ptr{Cvoid}, Ptr{UInt8}, UInt32, Ptr{UInt32}, Csize_t),
           bc.builder_handle, "__jl_gc_alloc_array_julia", TYPE_PTR, julia_array_args, length(julia_array_args))
 
-    # __jl_array_new_1d(atype: *mut u8, nel: i64, elem_size: i64) -> *mut u8  (pure-Rust)
-    array_new_args = UInt32[TYPE_PTR, TYPE_I64, TYPE_I64]
+    # __jl_array_new_1d(atype: ptr, mem_ptr: ptr, nel: i64) -> ptr  (pure-Rust)
+    array_new_args = UInt32[TYPE_PTR, TYPE_PTR, TYPE_I64]
     ccall(declare_ptr, Cint, (Ptr{Cvoid}, Ptr{UInt8}, UInt32, Ptr{UInt32}, Csize_t),
           bc.builder_handle, "__jl_array_new_1d", TYPE_PTR, array_new_args, length(array_new_args))
 
@@ -1806,12 +1806,20 @@ function emit_new(bc::BuilderCtx, T, field_args, ir, stmt_idx)
             error("emit_new(array): only 1-d arrays with constant size supported, got size $size_arg")
         end
         nel = size_arg[1]
-        elem_size = sizeof(eltype(T))
+        # The first field arg is the MemoryRef SSA value returned by emit_memoryref_from_mem.
+        # Its .mem field is the Memory pointer (from __jl_gc_alloc_array_julia via emit_memorynew).
+        # Extract it from ref_tracking and pass to __jl_array_new_1d instead of allocating a
+        # separate raw element buffer.
+        memref_arg = field_args[1]
+        if memref_arg isa Core.SSAValue && haskey(bc.ref_tracking, memref_arg)
+            mem_ptr_id, _, _ = bc.ref_tracking[memref_arg]
+        else
+            error("emit_new(array): memref not in ref_tracking")
+        end
         type_ptr = pointer_from_objref(T)
         type_ptr_id = emit_constant(bc, Int64(reinterpret(UInt64, type_ptr)))
         nel_id = emit_constant(bc, Int64(nel))
-        elem_size_id = emit_constant(bc, Int64(elem_size))
-        return emit_call_runtime(bc, "__jl_array_new_1d", UInt32[type_ptr_id, nel_id, elem_size_id])
+        return emit_call_runtime(bc, "__jl_array_new_1d", UInt32[type_ptr_id, mem_ptr_id, nel_id])
     end
 
     # Ranges (UnitRange, StepRange, …) appear ONLY in dead bounds-error-report
