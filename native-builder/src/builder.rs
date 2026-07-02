@@ -355,6 +355,7 @@ pub struct BuilderContext {
     module: Option<ObjectModule>,
     pub(crate) funcs: Vec<Box<FunctionCtx>>,
     pub(crate) imports: HashMap<String, FuncId>,
+    pub(crate) self_imports: HashMap<String, FuncId>,
     call_conv: CallConv,
     done: bool,
 }
@@ -371,7 +372,7 @@ impl BuilderContext {
         let lcn = Box::new(cranelift_module::default_libcall_names());
         let ob = ObjectBuilder::new(isa, "obj", lcn).expect("ObjBuilder");
         let module = ObjectModule::new(ob);
-        BuilderContext { module: Some(module), funcs: Vec::new(), imports: HashMap::new(), call_conv, done: false }
+        BuilderContext { module: Some(module), funcs: Vec::new(), imports: HashMap::new(), self_imports: HashMap::new(), call_conv, done: false }
     }
 
     pub fn add_function(&mut self, n: &str, rt: u32, pts: &[u32]) -> Option<*mut FunctionCtx> {
@@ -397,6 +398,24 @@ impl BuilderContext {
         Ok(())
     }
 
+    /// Pre-declare the function being compiled as callable BEFORE its body is emitted,
+    /// enabling recursive self-calls. Uses Linkage::Export so it can be called from
+    /// within the module AND from external callers. The FuncId is stored in
+    /// self_imports and reused in finalize() to avoid duplicate declaration.
+    pub fn declare_self_function(&mut self, name: &str, ret_type: u32, param_types: &[u32]) -> Result<(), String> {
+        let mut sig = Signature::new(self.call_conv);
+        if let Some(t) = map_type(ret_type) { sig.returns.push(AbiParam::new(t)); }
+        for &pt in param_types {
+            if let Some(t) = map_type(pt) { sig.params.push(AbiParam::new(t)); }
+        }
+        let fid = self.module.as_mut().unwrap()
+            .declare_function(name, Linkage::Export, &sig)
+            .map_err(|e| format!("declare self-function {}: {}", name, e))?;
+        self.imports.insert(name.to_string(), fid);
+        self.self_imports.insert(name.to_string(), fid);
+        Ok(())
+    }
+
     pub fn finalize(&mut self, path: &Path) -> Result<(), String> {
         if self.done { return Err("already finalized".into()); }
         // Per-function progress logs are noisy (one declare+defined pair per fn,
@@ -409,8 +428,14 @@ impl BuilderContext {
             let nm = f.func_name.clone();
             let sig = f.signature.clone();
             if verbose { eprintln!("[native-builder] declaring: {}", nm); }
-            let fid = module.declare_function(&nm, Linkage::Export, &sig)
-                .map_err(|e| format!("declare {}: {}", nm, e))?;
+            // Reuse pre-declared FuncId (from declare_self_function) to avoid
+            // duplicate Linkage::Export declaration for recursive functions.
+            let fid = if let Some(&fid) = self.self_imports.get(&nm) {
+                fid
+            } else {
+                module.declare_function(&nm, Linkage::Export, &sig)
+                    .map_err(|e| format!("declare {}: {}", nm, e))?
+            };
             module.define_function(fid, &mut f.context)
                 .map_err(|e| format!("define {}: {:?}", nm, e))?;
             if verbose { eprintln!("[native-builder] defined: {}", nm); }

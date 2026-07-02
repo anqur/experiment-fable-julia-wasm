@@ -10,6 +10,7 @@ const TYPE_F32 = UInt32(2)
 const TYPE_F64 = UInt32(3)
 const TYPE_PTR = UInt32(4)
 const TYPE_I8  = UInt32(5)
+const TYPE_I16 = UInt32(6)
 
 # === IntCC condition enums ===
 const ICMP_EQ  = UInt32(0)
@@ -57,10 +58,25 @@ function cranelift_type(T)
         sz = sizeof(T)
         sz == 8 && return TYPE_I64
         sz == 4 && return TYPE_I32
+        sz == 2 && return TYPE_I32
         sz == 1 && return TYPE_I8
+        sz == 0 && return TYPE_PTR  # singleton ghost types (Nothing, Union{})
     end
     # Abstract types that are always heap pointers (e.g. AbstractString, Exception)
     isabstracttype(T) && return TYPE_PTR
+    # Union types: classify by arms. All-pointer → TYPE_PTR; all-same-scalar → that.
+    if T isa Union
+        arms = _union_arms(T)
+        pointer_arms = filter(a -> a !== Nothing && is_ptr_type(a), arms)
+        if length(pointer_arms) == length(filter(!=(Nothing), arms))
+            return TYPE_PTR  # all non-Nothing arms are heap pointers
+        end
+        # Check if all arms have the same Cranelift type
+        arm_types = try cranelift_type.(arms) catch _; [] end
+        if length(arm_types) == length(arms) && all(==(arm_types[1]), arm_types)
+            return arm_types[1]
+        end
+    end
     throw(CompileError("unsupported type $T"))
 end
 
@@ -69,6 +85,10 @@ end
 _is_heap_struct(T) = T isa DataType && isconcretetype(T) && !isbitstype(T) &&
                      !(T.name.name in (:GenericMemoryRef, :GenericMemory)) && !(T <: Ptr)
 
+# Flatten a (potentially nested binary) Union into a tuple of leaf types.
+_union_arms(T::Union) = (_union_arms(T.a)..., _union_arms(T.b)...)
+_union_arms(T) = (T,)
+
 function is_ptr_type(T)
     T isa DataType && !(T <: Ptr) && (
         Base.ismutabletype(T) || T === String || T <: Tuple || _is_heap_struct(T)
@@ -76,6 +96,31 @@ function is_ptr_type(T)
 end
 
 # === BuilderCtx: tracks a Rust FunctionCtx for one Julia function ===
+
+# In Julia structs, `Union{Nothing, T}` fields (where T is a pointer type) represent
+# `nothing` as a tagged sentinel value. The sentinel cannot be a const because it
+# depends on the runtime heap layout (changes every session). We compute it lazily
+# at first use via get_nothing_tag().
+struct _UnionProbe
+    children::Union{Nothing, Vector{Int}}
+end
+const _NOTHING_TAG_CACHE = Ref{UInt64}(0)
+
+function get_nothing_tag()
+    tag = _NOTHING_TAG_CACHE[]
+    tag != 0 && return tag
+    try
+        probe = _UnionProbe(nothing)
+        r = Ref(probe)
+        ref_ptr = convert(Ptr{Cvoid}, pointer_from_objref(r))
+        offs = fieldoffset(_UnionProbe, :children)
+        tag = unsafe_load(Ptr{UInt64}(ref_ptr + offs))
+        _NOTHING_TAG_CACHE[] = tag
+    catch e
+        @warn "Failed to compute nothing tag, isnothing may be broken" exception = e
+    end
+    return tag
+end
 
 mutable struct BuilderCtx
     builder_handle::Ptr{Cvoid}  # *mut BuilderContext (Rust side)
@@ -94,6 +139,12 @@ mutable struct BuilderCtx
     # unchecked result + the overflow flag); getfield(pair, 1/2) reads them.
     # Mirrors WasmCodegen's `ssapair` mechanism (compiler.jl).
     ssa_pairs::Dict{Int, Tuple{UInt32, UInt32}}
+    # Recursion support: name and MethodInstance of the function being compiled.
+    # Used by emit_invoke to detect self-recursive :invoke calls.
+    current_func_name::String
+    current_mi::Union{Core.MethodInstance, Nothing}
+    # Lazy foreign-import tracking: set of foreigncall names already declared
+    imported_foreign::Set{String}
 end
 
 function BuilderCtx(lib_path::String)
@@ -105,7 +156,9 @@ function BuilderCtx(lib_path::String)
                Dict{Core.Argument, UInt32}(),
                Dict{Int, String}(),
                Dict{Core.SSAValue, Tuple{UInt32, Int, DataType}}(),
-               Dict{Int, Tuple{UInt32, UInt32}}())
+               Dict{Int, Tuple{UInt32, UInt32}}(),
+               "", nothing,
+               Set{String}())
 end
 
 function free_builder(bc::BuilderCtx)
@@ -117,6 +170,10 @@ function free_builder(bc::BuilderCtx)
         Libdl.dlclose(bc.lib_handle)
     end
 end
+
+# Unwrap Core.Const from ir.argtypes elements (first element is always Core.Const(f)).
+_ir_type(t) = t isa Core.Const ? typeof(t.val) : t
+_ir_type(t::Type) = t
 
 # === Main entry point ===
 
@@ -139,7 +196,9 @@ function emit_function_via_builder(interp::WasmInterp, f, argtypes::Type{<:Tuple
 
         # Register argument values: Julia Argument(1)=function, Argument(2)=first param, ...
         # Map to 0-based: Argument(2) → 0, Argument(3) → 1, etc.
-        nparams = length(mi.specTypes.parameters) - 1  # first is Tuple type
+        # Use ir.argtypes (not mi.specTypes) because varargs functions have
+        # trailing args packed into a Tuple in the IR but expanded in specTypes.
+        nparams = length(ir.argtypes) - 1  # first is the function itself
         for i in 1:nparams
             bc.arg_values[Core.Argument(i + 1)] = UInt32(i - 1)  # first param → 0
         end
@@ -148,7 +207,9 @@ function emit_function_via_builder(interp::WasmInterp, f, argtypes::Type{<:Tuple
 
         # Add function to builder
         ret_type_enum = cranelift_type(rettype)
-        param_type_enums = UInt32[cranelift_type(t) for t in mi.specTypes.parameters[2:end]]
+        # Use ir.argtypes for param types — mi.specTypes expands varargs, but the
+        # IR packs trailing args into a Tuple that must be passed as TYPE_PTR.
+        param_type_enums = UInt32[cranelift_type(_ir_type(t)) for t in ir.argtypes[2:end]]
 
         add_func_ptr = Libdl.dlsym(bc.lib_handle, :builder_add_function)
         bc.fctx_handle = ccall(add_func_ptr, Ptr{Cvoid},
@@ -172,6 +233,17 @@ function emit_function_via_builder(interp::WasmInterp, f, argtypes::Type{<:Tuple
             ccall(add_block_ptr, Cvoid, (Ptr{Cvoid}, Ptr{UInt8}),
                   bc.fctx_handle, block_name)
         end
+
+        # Declare self as callable (enables recursive self-calls).
+        # Uses Linkage::Export so the function can be called from within the module
+        # (via block_add_call) AND as an external entry point after finalization.
+        self_decl_ptr = Libdl.dlsym(bc.lib_handle, :builder_declare_self_function)
+        ccall(self_decl_ptr, Cint,
+              (Ptr{Cvoid}, Ptr{UInt8}, UInt32, Ptr{UInt32}, Csize_t),
+              bc.builder_handle, name, ret_type_enum,
+              param_type_enums, length(param_type_enums))
+        bc.current_func_name = String(name)
+        bc.current_mi = mi
 
         # Pre-scan for phi nodes: create Cranelift block params
         add_bp = Libdl.dlsym(bc.lib_handle, :function_add_block_param)
@@ -206,8 +278,12 @@ function emit_function_via_builder(interp::WasmInterp, f, argtypes::Type{<:Tuple
                     had_terminator = true
                 elseif e isa Expr && e.head == :call && length(e.args) >= 1
                     f = e.args[1]
-                    if f isa Core.GlobalRef && f.name == :throw
-                        had_terminator = true
+                    if f isa Core.GlobalRef
+                        fn_sym = f.name
+                        if fn_sym == :throw || fn_sym == :throw_methoderror ||
+                           fn_sym == :throw_inexacterror || fn_sym == :throw_undef_if_null
+                            had_terminator = true
+                        end
                     end
                 end
             end
@@ -265,6 +341,9 @@ function emit_instruction(bc::BuilderCtx, e, ir, stmt_idx::Int)
             # isa(x, Type) — type check. Currently only handles isa(x, Nothing)
             # on pointer values (icmp eq ptr_val, 0).
             result_id = emit_isa(bc, args, ir)
+        elseif f === Core.ifelse
+            # ifelse(cond, a, b) → Cranelift select(cond, a, b)
+            result_id = emit_select(bc, args, ir)
         else
             error("Unsupported call: $(f)")
         end
@@ -287,6 +366,23 @@ function emit_instruction(bc::BuilderCtx, e, ir, stmt_idx::Int)
         if result_id !== nothing
             bc.ssa_values[Core.SSAValue(stmt_idx)] = result_id
         end
+    elseif e isa Expr && (e.head == :gc_preserve_begin || e.head == :gc_preserve_end)
+        # GC-preserve markers: no-op at the Cranelift level. Emit a placeholder
+        # with the SSA type's Cranelift representation so downstream references work.
+        stmt_type = ir.stmts[stmt_idx][:type]
+        if stmt_type === Nothing || (stmt_type isa Core.Const && stmt_type.val === nothing)
+            result_id = emit_constant(bc, Int64(0))
+        else
+            result_id = resolve_operand(bc, e.args[1], ir)
+        end
+        bc.ssa_values[Core.SSAValue(stmt_idx)] = result_id
+    elseif e isa Expr && e.head == :foreigncall
+        # Foreigncall: C function call via ccall. Map known simple functions to
+        # inline operations; unrecognized functions resolve via import.
+        result_id = emit_foreigncall(bc, e, ir, stmt_idx)
+        if result_id !== nothing
+            bc.ssa_values[Core.SSAValue(stmt_idx)] = result_id
+        end
     elseif e isa Core.ReturnNode
         val = try e.val; catch; nothing end
         if val !== nothing
@@ -300,8 +396,23 @@ function emit_instruction(bc::BuilderCtx, e, ir, stmt_idx::Int)
                 trap_ptr = Libdl.dlsym(bc.lib_handle, :block_add_trap)
                 ccall(trap_ptr, Cvoid, (Ptr{Cvoid},), bc.fctx_handle)
             else
-                return_ptr = Libdl.dlsym(bc.lib_handle, :block_add_return_void)
-                ccall(return_ptr, Cvoid, (Ptr{Cvoid},), bc.fctx_handle)
+                # Return `nothing` (singleton ghost type) — emit null pointer
+                # (iconst 0, TYPE_I64) to match function signature typed as
+                # TYPE_PTR (Cranelift I64). cranelift_type(Nothing) returns
+                # TYPE_PTR via the sizeof==0 fallback, so a bare `nothing`
+                # literal via `ReturnNode` would hit a void-return which emits
+                # return_(&[]), but the signature expects an I64 value →
+                # verifier error. This applies regardless of the statement
+                # level type (it may be `Any` even when the function's
+                # overall rettype is `Nothing`). Create a zero I64 constant
+                # instead; the bridge (ccall with Cvoid return) discards the
+                # return value.
+                iconst_ptr = Libdl.dlsym(bc.lib_handle, :block_add_iconst)
+                zero_id = ccall(iconst_ptr, UInt32, (Ptr{Cvoid}, Int64, UInt32),
+                                bc.fctx_handle, Int64(0), TYPE_I64)
+                return_ptr = Libdl.dlsym(bc.lib_handle, :block_add_return)
+                ccall(return_ptr, Cvoid, (Ptr{Cvoid}, UInt32),
+                      bc.fctx_handle, zero_id)
             end
         end
     elseif e isa Core.GotoNode
@@ -439,14 +550,21 @@ function resolve_operand(bc::BuilderCtx, val, ir)
     elseif val isa Core.GlobalRef
         # Module-level constant (e.g. JuliaSyntax.TRIVIA_FLAG) — fetch value at
         # compile time and emit as a Cranelift immediate.
-        return emit_constant(bc, getglobal(val.mod, val.name))
+        return resolve_operand(bc, getglobal(val.mod, val.name), ir)
+    elseif val isa Core.QuoteNode
+        # QuoteNode wraps a value; unwrap and resolve
+        return resolve_operand(bc, val.value, ir)
     elseif isa(val, Number)
         # Create constant each time (caching causes cross-block dominance issues)
         return emit_constant(bc, val)
     elseif val === nothing || isghost(typeof(val))
+        # nothing in union fields has a specific tag (0x103 in Julia v1.x), not 0x0.
+        # Use get_nothing_tag() so comparisons with union-field values work correctly.
+        # The tag is a tagged sentinel specific to the current Julia session's heap.
+        nothing_tag = get_nothing_tag()
         iconst_ptr = Libdl.dlsym(bc.lib_handle, :block_add_iconst)
         return ccall(iconst_ptr, UInt32, (Ptr{Cvoid}, Int64, UInt32),
-                   bc.fctx_handle, Int64(0), TYPE_I32)
+                   bc.fctx_handle, Int64(nothing_tag), TYPE_PTR)
     elseif val isa Bool
         iconst_ptr = Libdl.dlsym(bc.lib_handle, :block_add_iconst)
         return ccall(iconst_ptr, UInt32, (Ptr{Cvoid}, Int64, UInt32),
@@ -455,14 +573,20 @@ function resolve_operand(bc::BuilderCtx, val, ir)
         # Handle tuple constants by emitting tuple creation
         args = [Core.Const(v) for v in val]
         return emit_core_tuple(bc, args, ir)
-    elseif val isa AbstractString
-        # String literal/constant: emit its object pointer as a constant. The
-        # value is already a real Julia String; it round-trips back via
+    elseif val isa AbstractString || val isa Symbol
+        # String/Symbol literal: emit its object pointer as a constant. The
+        # value is already a real Julia object; it round-trips back via
         # unsafe_pointer_to_objref on return.
         iconst_ptr = Libdl.dlsym(bc.lib_handle, :block_add_iconst)
         return ccall(iconst_ptr, UInt32, (Ptr{Cvoid}, Int64, UInt32),
-                     bc.fctx_handle, Int64(reinterpret(UInt64, pointer_from_objref(val))),
+                   bc.fctx_handle, Int64(reinterpret(UInt64, pointer_from_objref(val))),
                      TYPE_PTR)
+    elseif val === nothing
+        # nothing → null pointer constant (0)
+        return emit_constant(bc, Int64(0))
+    elseif val isa Ptr
+        # Raw pointer constant — emit as i64
+        return emit_constant(bc, Int64(reinterpret(UInt64, val)))
     elseif Base.isprimitivetype(typeof(val))
         # Primitive type (e.g. JuliaSyntax.Kind is `primitive type Kind 16 end`) —
         # reinterpret to integer bits and emit as constant.
@@ -527,6 +651,10 @@ function emit_intrinsic(bc::BuilderCtx, f::Core.IntrinsicFunction, args, ir, stm
     fn_sym == :sle_int && return emit_icmp(bc, ICMP_SLE, args, ir)
     fn_sym == :ult_int && return emit_icmp(bc, ICMP_ULT, args, ir)
     fn_sym == :ule_int && return emit_icmp(bc, ICMP_ULE, args, ir)
+    fn_sym == :sgt_int && return emit_icmp(bc, ICMP_SGT, args, ir)
+    fn_sym == :sge_int && return emit_icmp(bc, ICMP_SGE, args, ir)
+    fn_sym == :ugt_int && return emit_icmp(bc, ICMP_UGT, args, ir)
+    fn_sym == :uge_int && return emit_icmp(bc, ICMP_UGE, args, ir)
 
     # Bitwise
     fn_sym == :and_int && return emit_binop(bc, :block_add_band, args, ir)
@@ -568,6 +696,8 @@ function emit_intrinsic(bc::BuilderCtx, f::Core.IntrinsicFunction, args, ir, stm
     fn_sym == :ne_float && return emit_fcmp(bc, FCMP_NE, args, ir)
     fn_sym == :lt_float && return emit_fcmp(bc, FCMP_LT, args, ir)
     fn_sym == :le_float && return emit_fcmp(bc, FCMP_LE, args, ir)
+    fn_sym == :gt_float && return emit_fcmp(bc, FCMP_GT, args, ir)
+    fn_sym == :ge_float && return emit_fcmp(bc, FCMP_GE, args, ir)
 
     # neg_int = 0 - x
     fn_sym == :neg_int && return emit_neg_int(bc, args, ir)
@@ -575,8 +705,8 @@ function emit_intrinsic(bc::BuilderCtx, f::Core.IntrinsicFunction, args, ir, stm
     fn_sym == :not_int && return emit_not_int(bc, args, ir)
 
     # Bit-count / byte-swap unops (same width in/out; Cranelift infers width)
-    fn_sym == :ctlz_int && return emit_unop(bc, :block_add_clz, args, ir)
-    fn_sym == :cttz_int && return emit_unop(bc, :block_add_ctz, args, ir)
+    fn_sym == :ctlz_int && return emit_clz(bc, args, ir)
+    fn_sym == :cttz_int && return emit_ctz(bc, args, ir)
     fn_sym == :ctpop_int && return emit_unop(bc, :block_add_popcnt, args, ir)
     fn_sym == :bswap_int && return emit_unop(bc, :block_add_bswap, args, ir)
     # flipsign_int(x, y) = (x ⊻ s) - s with s = y >>> (bits-1). Also covers abs
@@ -592,9 +722,35 @@ function emit_binop(bc::BuilderCtx, ffi_sym::Symbol, args, ir)
     length(args) < 2 && error("Binary op needs 2 args")
     lhs = resolve_operand(bc, args[1], ir)
     rhs = resolve_operand(bc, args[2], ir)
+    # Type-harmonize: if operands have different Cranelift register widths
+    # (e.g. Ptr{I64} + UInt8(I32) in pointer arithmetic), extend the narrower
+    # one to match. Without this, Cranelift's verifier rejects e.g. isub.i64
+    # with an i32 second operand.
+    lhs = _harmonize_binop_type(bc, lhs, args[1], rhs, args[2], ir)
+    rhs = _harmonize_binop_type(bc, rhs, args[2], lhs, args[1], ir)
     fn_ptr = Libdl.dlsym(bc.lib_handle, ffi_sym)
     return ccall(fn_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
                  bc.fctx_handle, lhs, rhs)
+end
+
+# If `self_val` has a narrower Cranelift type than `other_val`, uextend it.
+# Uses cranelift_type enum values: I8/I16/I32 are narrower than I64/PTR.
+_is_narrow_ct(ct) = ct == TYPE_I8 || ct == TYPE_I16 || ct == TYPE_I32
+_is_wide_ct(ct)   = ct == TYPE_I64 || ct == TYPE_PTR
+
+function _harmonize_binop_type(bc, self_id, self_arg, other_id, other_arg, ir)
+    self_T = get_operand_type(self_arg, ir)
+    self_T = self_T isa Core.Const ? self_T.val : self_T
+    other_T = get_operand_type(other_arg, ir)
+    other_T = other_T isa Core.Const ? other_T.val : other_T
+    ct_self = try cranelift_type(self_T) catch; UInt32(0xFF) end
+    ct_other = try cranelift_type(other_T) catch; UInt32(0xFF) end
+    if _is_narrow_ct(ct_self) && _is_wide_ct(ct_other) && ct_self != ct_other
+        ext_ptr = Libdl.dlsym(bc.lib_handle, :block_add_uextend)
+        return ccall(ext_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
+                    bc.fctx_handle, self_id, ct_other)
+    end
+    return self_id
 end
 
 function emit_unop(bc::BuilderCtx, ffi_sym::Symbol, args, ir)
@@ -608,6 +764,9 @@ function emit_icmp(bc::BuilderCtx, cond::UInt32, args, ir)
     length(args) < 2 && error("icmp needs 2 args")
     lhs = resolve_operand(bc, args[1], ir)
     rhs = resolve_operand(bc, args[2], ir)
+    # Type-harmonize like emit_binop
+    lhs = _harmonize_binop_type(bc, lhs, args[1], rhs, args[2], ir)
+    rhs = _harmonize_binop_type(bc, rhs, args[2], lhs, args[1], ir)
     fn_ptr = Libdl.dlsym(bc.lib_handle, :block_add_icmp)
     result = ccall(fn_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32, UInt32),
                    bc.fctx_handle, cond, lhs, rhs)
@@ -653,33 +812,71 @@ function emit_trunc(bc::BuilderCtx, args, ir)
     # trunc_int(Int8, x) — args[1] is the (narrower) target type.
     to_T = _unwrap_type(args[1])
     val = resolve_operand(bc, args[2], ir)
-    to_type_enum = cranelift_type(to_T)
+    # Use the REAL bit-width type for ireduce, NOT the storage type.
+    # cranelift_type returns TYPE_I32 for sub-word storage, but ireduce
+    # must narrow to the actual bit width (types::I8 / types::I16).
+    sz = sizeof(to_T)
+    to_type_enum = sz == 1 ? TYPE_I8 : sz == 2 ? TYPE_I16 : cranelift_type(to_T)
     fn_ptr = Libdl.dlsym(bc.lib_handle, :block_add_ireduce)
-    return ccall(fn_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
-                 bc.fctx_handle, val, to_type_enum)
+    reduced = ccall(fn_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
+                    bc.fctx_handle, val, to_type_enum)
+    # If the target is sub-word, extend back to i32 to match storage convention.
+    # Sub-word values live in i32 registers; ireduce narrows to i8/i16, which
+    # must be widened back so the result type matches the function signature.
+    if sz < 4
+        ext_ptr = Libdl.dlsym(bc.lib_handle, :block_add_uextend)
+        return ccall(ext_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
+                     bc.fctx_handle, reduced, TYPE_I32)
+    end
+    return reduced
 end
 
 # neg_int: 0 - x
 function emit_neg_int(bc::BuilderCtx, args, ir)
     val = resolve_operand(bc, args[1], ir)
-    # Create constant 0 of same "size" — use i64 for now
-    zero_id = emit_constant(bc, Int64(0))
+    T = get_operand_type(args[1], ir)
+    T = T isa Core.Const ? T.val : T
+    sz = sizeof(T)
+    zero_id = emit_constant(bc, sz >= 4 ? Int64(0) : Int32(0))
     fn_ptr = Libdl.dlsym(bc.lib_handle, :block_add_isub)
     return ccall(fn_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
                  bc.fctx_handle, zero_id, val)
 end
 
-# not_int: for Bool → logical NOT using icmp_eq(val, 0)
+# not_int: Bool → logical NOT (icmp_eq); integer → bitwise NOT (xor + mask)
 function emit_not_int(bc::BuilderCtx, args, ir)
+    T = get_operand_type(args[1], ir)
+    T = T isa Core.Const ? T.val : T
     val = resolve_operand(bc, args[1], ir)
-    zero = emit_constant(bc, Int32(0))
-    fn_ptr = Libdl.dlsym(bc.lib_handle, :block_add_icmp)
-    result = ccall(fn_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32, UInt32),
-                   bc.fctx_handle, ICMP_EQ, val, zero)
-    # Like emit_icmp: Cranelift icmp returns i8; uextend to i32 for Bool.
-    ext_ptr = Libdl.dlsym(bc.lib_handle, :block_add_uextend)
-    return ccall(ext_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
-                 bc.fctx_handle, result, TYPE_I32)
+    if T === Bool
+        # Bool: logical NOT = icmp_eq(val, 0), then uextend to i32
+        zero = emit_constant(bc, Int32(0))
+        fn_ptr = Libdl.dlsym(bc.lib_handle, :block_add_icmp)
+        result = ccall(fn_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32, UInt32),
+                       bc.fctx_handle, ICMP_EQ, val, zero)
+        ext_ptr = Libdl.dlsym(bc.lib_handle, :block_add_uextend)
+        return ccall(ext_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
+                     bc.fctx_handle, result, TYPE_I32)
+    else
+        sz = sizeof(T)
+        # Use the same width as the operand for the -1 sentinel and mask
+        if sz >= 4
+            ones_id = emit_constant(bc, Int64(-1))
+        else
+            ones_id = emit_constant(bc, Int32(-1))
+        end
+        xor_ptr = Libdl.dlsym(bc.lib_handle, :block_add_bxor)
+        xored = ccall(xor_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
+                      bc.fctx_handle, val, ones_id)
+        if sz < 4
+            mask = (1 << (8 * sz)) - 1  # e.g. 0xFFFF for UInt16
+            mask_id = emit_constant(bc, Int32(mask))
+            band_ptr = Libdl.dlsym(bc.lib_handle, :block_add_band)
+            return ccall(band_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
+                         bc.fctx_handle, xored, mask_id)
+        end
+        return xored
+    end
 end
 
 # flipsign_int(x, y) = y >= 0 ? x : -x, lowered as (x ⊻ s) - s with
@@ -706,6 +903,57 @@ function emit_flipsign_int(bc::BuilderCtx, args, ir)
     sub_ptr = Libdl.dlsym(bc.lib_handle, :block_add_isub)
     return ccall(sub_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
                  bc.fctx_handle, xors_id, s_id)
+end
+
+# emit_clz: count-leading-zeros with sub-word correction.
+# Cranelift clz counts across the full register width (i32 for sub-word types
+# stored as i32). For types narrower than 32 bits, the extra leading zeros
+# above the logical width inflate the count → subtract padding bits.
+# ctz and ctpop are correct as-is for zero-extended values (trailing zeros
+# and set-bit count don't change), so they stay with emit_unop.
+function emit_clz(bc::BuilderCtx, args, ir)
+    val = resolve_operand(bc, args[1], ir)
+    T = get_operand_type(args[1], ir)
+    T = T isa Core.Const ? T.val : T
+    sz = sizeof(T)
+
+    fn_ptr = Libdl.dlsym(bc.lib_handle, :block_add_clz)
+    result = ccall(fn_ptr, UInt32, (Ptr{Cvoid}, UInt32), bc.fctx_handle, val)
+
+    if sz < 4
+        correction = 32 - 8 * sz
+        correction_id = emit_constant(bc, Int32(correction))
+        sub_ptr = Libdl.dlsym(bc.lib_handle, :block_add_isub)
+        return ccall(sub_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
+                     bc.fctx_handle, result, correction_id)
+    end
+    return result
+end
+
+# emit_ctz: count-trailing-zeros with sub-word zero-input correction.
+# Cranelift ctz on zero returns the full register width (32 for i32 storage).
+# For sub-word types, we clamp: if result > logical_width, return logical_width.
+function emit_ctz(bc::BuilderCtx, args, ir)
+    val = resolve_operand(bc, args[1], ir)
+    T = get_operand_type(args[1], ir)
+    T = T isa Core.Const ? T.val : T
+    sz = sizeof(T)
+
+    fn_ptr = Libdl.dlsym(bc.lib_handle, :block_add_ctz)
+    result = ccall(fn_ptr, UInt32, (Ptr{Cvoid}, UInt32), bc.fctx_handle, val)
+
+    if sz < 4
+        logw = 8 * sz
+        # If result > logw (zero input → Cranelift returns 32), clamp to logw
+        over_id = emit_constant(bc, Int32(logw))
+        icmp_ptr = Libdl.dlsym(bc.lib_handle, :block_add_icmp)
+        is_over = ccall(icmp_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32, UInt32),
+                       bc.fctx_handle, ICMP_UGT, result, over_id)
+        sel_ptr = Libdl.dlsym(bc.lib_handle, :block_add_select)
+        return ccall(sel_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32, UInt32),
+                    bc.fctx_handle, is_over, over_id, result)
+    end
+    return result
 end
 
 # --- checked-arithmetic overflow pairs (Item 5) ------------------------------
@@ -828,6 +1076,21 @@ function _emit_array_elem_size(bc::BuilderCtx, array_val, ir)
 end
 
 function emit_invoke(bc::BuilderCtx, invoke_target, f, args, ir, stmt_idx)
+    # Check for self-recursive call: if the invoke target's MethodInstance
+    # matches the function we're currently compiling, emit a call to our
+    # self-import (declared via builder_declare_self_function).
+    if invoke_target isa Core.CodeInstance
+        callee_mi = invoke_target.def  # CodeInstance → MethodInstance
+    elseif invoke_target isa Core.MethodInstance
+        callee_mi = invoke_target
+    else
+        error("Unknown invoke target type: $(typeof(invoke_target))")
+    end
+    if bc.current_mi !== nothing && callee_mi == bc.current_mi
+        # Self-recursive call — resolve args and emit call to self-import
+        return emit_call_import(bc, bc.current_func_name, args, ir)
+    end
+
     # invoke_target can be CodeInstance or MethodInstance
     if invoke_target isa Core.CodeInstance
         method = invoke_target.def.def     # CodeInstance → MethodInstance → Method
@@ -926,6 +1189,21 @@ function emit_invoke(bc::BuilderCtx, invoke_target, f, args, ir, stmt_idx)
         end
     end
 
+    # isnothing(x) → tagged null pointer check (icmp_eq val, nothing_tag)
+    # In union fields Union{Nothing, T}, nothing is represented as a tagged value,
+    # not a raw null pointer (0x0).
+    if fn_name == :isnothing && length(args) >= 1
+        val = resolve_operand(bc, args[1], ir)
+        nothing_tag = get_nothing_tag()
+        zero = emit_constant(bc, Int64(nothing_tag))
+        fn_ptr = Libdl.dlsym(bc.lib_handle, :block_add_icmp)
+        result = ccall(fn_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32, UInt32),
+                       bc.fctx_handle, ICMP_EQ, val, zero)
+        ext_ptr = Libdl.dlsym(bc.lib_handle, :block_add_uextend)
+        return ccall(ext_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
+                     bc.fctx_handle, result, TYPE_I32)
+    end
+
     # Unknown invoke — emit sentinel (e.g. bounds-error path, unreachable)
     iconst_ptr = Libdl.dlsym(bc.lib_handle, :block_add_iconst)
     return ccall(iconst_ptr, UInt32, (Ptr{Cvoid}, Int64, UInt32),
@@ -989,6 +1267,10 @@ function emit_globalref(bc::BuilderCtx, f::Core.GlobalRef, args, ir, stmt_idx)
     if fn == :sle_int || fn == :<= ; return emit_icmp(bc, ICMP_SLE, args, ir) end
     if fn == :ult_int ; return emit_icmp(bc, ICMP_ULT, args, ir) end
     if fn == :ule_int ; return emit_icmp(bc, ICMP_ULE, args, ir) end
+    if fn == :sgt_int ; return emit_icmp(bc, ICMP_SGT, args, ir) end
+    if fn == :sge_int ; return emit_icmp(bc, ICMP_SGE, args, ir) end
+    if fn == :ugt_int ; return emit_icmp(bc, ICMP_UGT, args, ir) end
+    if fn == :uge_int ; return emit_icmp(bc, ICMP_UGE, args, ir) end
 
     # === Integer bitwise (may also be used as not_int) ===
     if fn == :not_int ; return emit_not_int(bc, args, ir) end
@@ -997,11 +1279,12 @@ function emit_globalref(bc::BuilderCtx, f::Core.GlobalRef, args, ir, stmt_idx)
     if fn == :xor_int ; return emit_binop(bc, :block_add_bxor, args, ir) end
     if fn == :shl_int ; return emit_binop(bc, :block_add_ishl, args, ir) end
     if fn == :add_ptr && length(args) >= 2 ; return emit_binop(bc, :block_add_iadd, args, ir) end
+    if fn == :sub_ptr && length(args) >= 2 ; return emit_binop(bc, :block_add_isub, args, ir) end
     if fn == :lshr_int ; return emit_binop(bc, :block_add_ushr, args, ir) end
     if fn == :ashr_int ; return emit_binop(bc, :block_add_sshr, args, ir) end
     # Bit-count / byte-swap (full-width correct; sub-word needs renormalization)
-    if fn == :ctlz_int ; return emit_unop(bc, :block_add_clz, args, ir) end
-    if fn == :cttz_int ; return emit_unop(bc, :block_add_ctz, args, ir) end
+    if fn == :ctlz_int ; return emit_clz(bc, args, ir) end
+    if fn == :cttz_int ; return emit_ctz(bc, args, ir) end
     if fn == :ctpop_int ; return emit_unop(bc, :block_add_popcnt, args, ir) end
     if fn == :bswap_int ; return emit_unop(bc, :block_add_bswap, args, ir) end
     if fn == :flipsign_int ; return emit_flipsign_int(bc, args, ir) end
@@ -1026,6 +1309,8 @@ function emit_globalref(bc::BuilderCtx, f::Core.GlobalRef, args, ir, stmt_idx)
     if fn == :ne_float ; return emit_fcmp(bc, FCMP_NE, args, ir) end
     if fn == :lt_float ; return emit_fcmp(bc, FCMP_LT, args, ir) end
     if fn == :le_float ; return emit_fcmp(bc, FCMP_LE, args, ir) end
+    if fn == :gt_float ; return emit_fcmp(bc, FCMP_GT, args, ir) end
+    if fn == :ge_float ; return emit_fcmp(bc, FCMP_GE, args, ir) end
 
     # === Conversions ===
     if fn == :zext_int ; return emit_convert(bc, :block_add_uextend, args, ir) end
@@ -1127,6 +1412,14 @@ function emit_globalref(bc::BuilderCtx, f::Core.GlobalRef, args, ir, stmt_idx)
         ccall(trap_ptr, Cvoid, (Ptr{Cvoid},), bc.fctx_handle)
         return nothing
     end
+    # Dead-error-path sentinels: these Core globals appear in bounds-error /
+    # method-error paths that never execute on correct inputs. Emit trap so
+    # they become loud failures if reached, not silent undefined symbols.
+    if fn == :throw_methoderror || fn == :throw_inexacterror || fn == :throw_undef_if_null || fn == :isdefined
+        trap_ptr = Libdl.dlsym(bc.lib_handle, :block_add_trap)
+        ccall(trap_ptr, Cvoid, (Ptr{Cvoid},), bc.fctx_handle)
+        return nothing
+    end
 
     error("Unsupported GlobalRef: $(mod).$(fn)")
 end
@@ -1192,8 +1485,22 @@ function emit_tuple_index_from_ssa(bc::BuilderCtx, obj, idx, ir)
     # n==1: emit_core_tuple passed the element through (no allocation); obj IS it.
     n == 1 && return resolve_operand(bc, obj, ir)
 
-    # select() needs matching operand Cranelift types; array literals are
-    # homogeneous. Heterogeneous dynamic indexing is unsupported (loud failure).
+    # Constant index: load just the requested field. Heterogeneous types are fine
+    # because we only touch one field, so no select() type-matching is needed.
+    k = idx isa Core.QuoteNode ? idx.value : idx
+    if k isa Integer
+        (1 ≤ k ≤ n) || throw(CompileError("tuple index $k out of range (1:$n)"))
+        ptr_id = resolve_operand(bc, obj, ir)
+        off = Int32(fieldoffset(T, k))
+        ct = cranelift_type(elem_types[k])
+        load_ptr = Libdl.dlsym(bc.lib_handle, :block_add_load)
+        return ccall(load_ptr, UInt32, (Ptr{Cvoid}, UInt32, Int32, UInt32),
+                     bc.fctx_handle, ptr_id, off, ct)
+    end
+
+    # Dynamic index: select() needs matching Cranelift types for all arms.
+    # Heterogeneous element types cannot be selected (no control-flow-free way
+    # to choose between e.g. I64 and a PTR without constructing a tagged union).
     first_ct = cranelift_type(elem_types[1])
     all(i -> cranelift_type(elem_types[i]) == first_ct, 2:n) ||
         throw(CompileError("heterogeneous dynamic tuple indexing not supported ($T)"))
@@ -1206,14 +1513,6 @@ function emit_tuple_index_from_ssa(bc::BuilderCtx, obj, idx, ir)
         ct = cranelift_type(elem_types[i])
         push!(elem_ids, ccall(load_ptr, UInt32, (Ptr{Cvoid}, UInt32, Int32, UInt32),
                               bc.fctx_handle, ptr_id, off, ct))
-    end
-
-    # Constant index → single load (also fixes the latent bitstype-path miscompile
-    # where the tuple POINTER was treated as the value).
-    k = idx isa Core.QuoteNode ? idx.value : idx
-    if k isa Integer
-        (1 ≤ k ≤ n) || throw(CompileError("tuple index $k out of range (1:$n)"))
-        return elem_ids[k]
     end
 
     # Dynamic index → right-to-left select chain (mirrors emit_tuple_index).
@@ -1272,6 +1571,11 @@ function emit_struct_getfield(bc::BuilderCtx, args, ir, stmt_idx)
     T = get_operand_type(obj, ir)
     T = T isa Core.Const ? T.val : T
 
+    # getfield on Nothing (dead code after union-splitting): return dummy
+    if T === Nothing
+        return UInt32(0)
+    end
+
     # Case 1: composed offset from ref_tracking (e.g. memref.ptr_or_offset)
     if obj isa Core.SSAValue && haskey(bc.ref_tracking, obj)
         base_id, base_off, parent_T = bc.ref_tracking[obj]
@@ -1299,11 +1603,11 @@ function emit_struct_getfield(bc::BuilderCtx, args, ir, stmt_idx)
         # BEFORE ref_tracking — the ref_tracking dict expects Tuple{UInt32,
         # Int64, DataType} and a Union type causes convert(DataType, Union).
         if field_T isa Union
-            # Union{a, b} — check for Union{Nothing, PointerType}
-            a_T, b_T = field_T.a, field_T.b  # avoids Base.uniontypes allocation
-            other_T = a_T === Nothing ? b_T :
-                      b_T === Nothing ? a_T : nothing
-            if other_T !== nothing && other_T isa DataType && is_ptr_type(other_T)
+            # Load union field as raw pointer if ALL non-Nothing arms are
+            # heap-allocated pointer types. nothing → null (0), else → heap ptr.
+            arms = _union_arms(field_T)
+            non_nothing = filter(!=(Nothing), arms)
+            if !isempty(non_nothing) && all(a -> a isa DataType && is_ptr_type(a), non_nothing)
                 offset = fieldoffset(T, field_sym)
                 load_ptr = Libdl.dlsym(bc.lib_handle, :block_add_load)
                 result = ccall(load_ptr, UInt32, (Ptr{Cvoid}, UInt32, Int32, UInt32),
@@ -1413,11 +1717,7 @@ function emit_pointerref(bc::BuilderCtx, args, ir)
 
     # Compute element address: ptr + (idx - 1) * elem_size
     # idx - 1
-    one_id = if elem_size == 8
-        emit_constant(bc, Int64(1))
-    else
-        emit_constant(bc, Int32(1))
-    end
+    one_id = emit_constant(bc, Int64(1))  # idx is always i64 (pointer/index domain)
     sub_ptr = Libdl.dlsym(bc.lib_handle, :block_add_isub)
     idx_0_id = ccall(sub_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
                      bc.fctx_handle, idx_id, one_id)
@@ -1462,11 +1762,7 @@ function emit_pointerset(bc::BuilderCtx, args, ir)
     elem_size = sizeof(elem_T)
 
     # Compute element address: ptr + (idx - 1) * elem_size
-    one_id = if elem_size == 8
-        emit_constant(bc, Int64(1))
-    else
-        emit_constant(bc, Int32(1))
-    end
+    one_id = emit_constant(bc, Int64(1))  # idx is always i64
     sub_ptr = Libdl.dlsym(bc.lib_handle, :block_add_isub)
     idx_0_id = ccall(sub_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
                      bc.fctx_handle, idx_id, one_id)
@@ -1590,14 +1886,21 @@ function emit_memoryrefset(bc::BuilderCtx, args, ir)
 end
 
 function emit_isa(bc::BuilderCtx, args, ir)
-    # isa(x, Type) — currently only handles isa(x, Nothing) on pointer values.
-    # args[1] = value, args[2] = the type to check against (Nothing / QuoteNode / Const)
+    # isa(x, Type) — handles:
+    #   1. isa(x, Nothing): tagged-sentinel check on pointer values
+    #   2. isa(x, T) where x::Union{Nothing, T}: check value != nothing_tag
+    #   3. isa(x, DataType): load type tag from object header, compare to target's type pointer
+    # args[1] = value, args[2] = the type to check against
     target_type = args[2]
     target_type isa QuoteNode && (target_type = target_type.value)
     target_type isa Core.Const && (target_type = target_type.val)
+
+    val_id = resolve_operand(bc, args[1], ir)
+
     if target_type === Nothing
-        val_id = resolve_operand(bc, args[1], ir)
-        zero_id = emit_constant(bc, Int64(0))
+        # nothing in union fields is tagged, not raw null (0x0).
+        nothing_tag = get_nothing_tag()
+        zero_id = emit_constant(bc, Int64(nothing_tag))
         fn_ptr = Libdl.dlsym(bc.lib_handle, :block_add_icmp)
         result = ccall(fn_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32, UInt32),
                       bc.fctx_handle, ICMP_EQ, val_id, zero_id)
@@ -1606,7 +1909,121 @@ function emit_isa(bc::BuilderCtx, args, ir)
         return ccall(ext_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
                     bc.fctx_handle, result, TYPE_I32)
     end
+
+    # Case 2: isa(x, T) where the SSA value's IR type is Union{Nothing, T}.
+    # In this case, the only non-nothing arm IS T, so value != nothing_tag suffices.
+    val_arg = args[1]
+    if val_arg isa Core.SSAValue
+        ssatype = ir.stmts[val_arg.id][:type]
+        if ssatype isa Core.Union
+            utypes = Base.uniontypes(ssatype)
+            if length(utypes) == 2 && Nothing in utypes && target_type in utypes
+                # x is Union{Nothing, T}; isa(x, T) ⟺ x != nothing_tag
+                nothing_tag = get_nothing_tag()
+                tag_id = emit_constant(bc, Int64(nothing_tag))
+                fn_ptr = Libdl.dlsym(bc.lib_handle, :block_add_icmp)
+                result = ccall(fn_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32, UInt32),
+                              bc.fctx_handle, ICMP_NE, val_id, tag_id)
+                ext_ptr = Libdl.dlsym(bc.lib_handle, :block_add_uextend)
+                return ccall(ext_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
+                            bc.fctx_handle, result, TYPE_I32)
+            end
+        end
+    end
+
+    # Case 3: isa(x, T) for union types without Nothing where T is a heap-allocated arm.
+    # Since all arms are heap types, there are no sentinels — all values are valid
+    # pointers. We can safely load the type tag from the object header at offset 0
+    # and compare it to pointer_from_objref(T).
+    if val_arg isa Core.SSAValue
+        ssatype = ir.stmts[val_arg.id][:type]
+        if ssatype isa Core.Union
+            utypes = Base.uniontypes(ssatype)
+            # Only for unions WITHOUT Nothing (Case 2 already handles that)
+            if !(Nothing in utypes) && target_type in utypes && target_type isa DataType
+                T = target_type
+                type_ptr = pointer_from_objref(T)
+                type_ptr_id = emit_constant(bc, Int64(reinterpret(UInt64, type_ptr)))
+                # Load jl_datatype_t* tag from object header at offset 0
+                load_ptr = Libdl.dlsym(bc.lib_handle, :block_add_load)
+                loaded_tag = ccall(load_ptr, UInt32, (Ptr{Cvoid}, UInt32, Int32, UInt32),
+                                 bc.fctx_handle, val_id, Int32(0), TYPE_I64)
+                # Compare loaded tag to the target type's pointer
+                icmp_ptr = Libdl.dlsym(bc.lib_handle, :block_add_icmp)
+                result = ccall(icmp_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32, UInt32),
+                             bc.fctx_handle, ICMP_EQ, loaded_tag, type_ptr_id)
+                ext_ptr = Libdl.dlsym(bc.lib_handle, :block_add_uextend)
+                return ccall(ext_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
+                            bc.fctx_handle, result, TYPE_I32)
+            end
+        end
+    end
+
     throw(CompileError("unsupported isa target: $target_type"))
+end
+
+function emit_select(bc::BuilderCtx, args, ir)
+    # ifelse(cond, a, b) → Cranelift select(cond, a, b)
+    cond_id = resolve_operand(bc, args[1], ir)
+    true_id = resolve_operand(bc, args[2], ir)
+    false_id = resolve_operand(bc, args[3], ir)
+    sel_ptr = Libdl.dlsym(bc.lib_handle, :block_add_select)
+    return ccall(sel_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32, UInt32),
+                bc.fctx_handle, cond_id, true_id, false_id)
+end
+
+# Handle :foreigncall expressions — C function calls from Julia's IR lowering.
+# Simple builtins are inlined; complex ones emit runtime imports.
+function emit_foreigncall(bc::BuilderCtx, e::Expr, ir, stmt_idx)
+    call_name = e.args[1]  # (:jl_value_ptr,) as QuoteNode, Expr(:tuple), or bare Symbol
+    fn_name = call_name isa QuoteNode ? call_name.value :
+              (call_name isa Expr && call_name.head == :tuple) ? call_name.args[1] :
+              call_name isa Tuple ? call_name[1] : call_name
+    # Unwrap QuoteNode again (may be nested: Expr(:tuple, QuoteNode(:sym)))
+    fn_name = fn_name isa QuoteNode ? fn_name.value : fn_name
+    rettype = e.args[2]    # Return type
+    arg_types = e.args[3]   # svec of argument types
+    nargs = length(arg_types)
+    cc_args = length(e.args) >= 6 ? e.args[6:end] : []  # actual argument values after name, ret, types, nreq, cc
+
+    # Inline simple builtins that don't need C calls
+    if fn_name == :jl_value_ptr
+        # pointer_from_objref(x) — x is already a heap pointer in our world
+        return resolve_operand(bc, cc_args[1], ir)
+    elseif fn_name == :jl_string_ptr
+        # String data pointer = string_obj_ptr + 8 (skip the i64 length header)
+        str_id = resolve_operand(bc, cc_args[1], ir)
+        off_id = emit_constant(bc, Int64(8))
+        iadd_ptr = Libdl.dlsym(bc.lib_handle, :block_add_iadd)
+        return ccall(iadd_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
+                    bc.fctx_handle, str_id, off_id)
+    elseif fn_name == :jl_set_errno
+        # Ignore errno (we don't track it)
+        return nothing
+    elseif fn_name == :jl_errno
+        # Return 0 (no errno tracking)
+        return emit_constant(bc, Int32(0))
+    elseif fn_name == :jl_strtod_c
+        # strtod(ptr, endptr) — C standard library function
+        # Declare as import once per builder context
+        import_name = "strtod"
+        if !(import_name in bc.imported_foreign)
+            push!(bc.imported_foreign, import_name)
+            declare_ptr = Libdl.dlsym(bc.lib_handle, :builder_declare_import)
+            param_types = [TYPE_I64, TYPE_I64]  # const char*, char**
+            ccall(declare_ptr, Cint,
+                  (Ptr{Cvoid}, Ptr{UInt8}, UInt32, Ptr{UInt32}, Csize_t),
+                  bc.builder_handle, import_name, TYPE_F64, param_types,
+                  length(param_types))
+        end
+        nreq = length(cc_args)
+        @assert nreq >= 2 "strtod_c needs at least 2 args, got $nreq"
+        str_ptr_id = resolve_operand(bc, cc_args[1], ir)
+        endptr_ref_id = resolve_operand(bc, cc_args[2], ir)
+        return emit_call_runtime(bc, import_name, UInt32[str_ptr_id, endptr_ref_id])
+    else
+        error("Unsupported foreigncall: $fn_name")
+    end
 end
 
 function emit_memoryrefunset(bc::BuilderCtx, args, ir)
@@ -1685,6 +2102,13 @@ function emit_call_runtime(bc::BuilderCtx, func_name::String, arg_ids::Vector{UI
                  bc.fctx_handle, bc.builder_handle, func_name, arg_ids, nargs)
 end
 
+# emit_call_import: resolve arguments from IR and emit a call to a declared import
+# (either a runtime import or a self-import for recursion).
+function emit_call_import(bc::BuilderCtx, func_name::String, args, ir)
+    arg_ids = UInt32[resolve_operand(bc, a, ir) for a in args]
+    return emit_call_runtime(bc, func_name, arg_ids)
+end
+
 function emit_memorynew(bc::BuilderCtx, args, ir)
     # Core.memorynew(Memory{T}, n) → allocate raw memory with Julia-compatible layout
     mem_T = args[1]  # Memory{Int64} DataType
@@ -1744,11 +2168,17 @@ function emit_core_tuple(bc::BuilderCtx, args, ir)
     offsets = Int[]
     current_offset = 0
     for ET in elem_types
+        if isghost(ET)
+            push!(offsets, current_offset)  # ghost element: no space, but still addressable
+            continue
+        end
         # Align to natural boundary of the type
-        align = sizeof(ET)
+        # Use pointer width for heap-reference types (typeof does not have sizeof)
+        elem_sz = try sizeof(ET) catch; 8 end
+        align = elem_sz
         current_offset = cld(current_offset, align) * align
         push!(offsets, current_offset)
-        current_offset += sizeof(ET)
+        current_offset += elem_sz
     end
 
     total_size = current_offset
@@ -1770,8 +2200,9 @@ function emit_core_tuple(bc::BuilderCtx, args, ir)
     # Store each element at its calculated offset
     store_ptr = Libdl.dlsym(bc.lib_handle, :block_add_store)
     for (i, arg) in enumerate(args)
-        elem_id = resolve_operand(bc, arg, ir)
         elem_T = elem_types[i]
+        isghost(elem_T) && continue  # ghost elements (e.g. Nothing) take no space
+        elem_id = resolve_operand(bc, arg, ir)
         field_type_enum = cranelift_type(elem_T)
         ccall(store_ptr, Cvoid, (Ptr{Cvoid}, UInt32, Int32, UInt32, UInt32),
               bc.fctx_handle, ptr_id, Int32(offsets[i]), elem_id, field_type_enum)
@@ -1802,10 +2233,18 @@ function emit_new(bc::BuilderCtx, T, field_args, ir, stmt_idx)
     # immutable index objects, not contiguous arrays.
     if T isa DataType && T <: Array
         size_arg = field_args[end]
-        if !(size_arg isa Tuple) || length(size_arg) != 1
-            error("emit_new(array): only 1-d arrays with constant size supported, got size $size_arg")
+        if size_arg isa Tuple && length(size_arg) == 1
+            nel = size_arg[1]
+            nel_id = emit_constant(bc, Int64(nel))
+        elseif size_arg isa Core.SSAValue
+            # Dynamic size: resolve the Tuple{Int64} SSA and load field 1 (Int64)
+            tuple_ptr_id = resolve_operand(bc, size_arg, ir)
+            load_ptr = Libdl.dlsym(bc.lib_handle, :block_add_load)
+            nel_id = ccall(load_ptr, UInt32, (Ptr{Cvoid}, UInt32, Int32, UInt32),
+                         bc.fctx_handle, tuple_ptr_id, Int32(0), TYPE_I64)
+        else
+            error("emit_new(array): only 1-d arrays supported, got size $size_arg")
         end
-        nel = size_arg[1]
         # The first field arg is the MemoryRef SSA value returned by emit_memoryref_from_mem.
         # Its .mem field is the Memory pointer (from __jl_gc_alloc_array_julia via emit_memorynew).
         # Extract it from ref_tracking and pass to __jl_array_new_1d instead of allocating a
@@ -1818,7 +2257,6 @@ function emit_new(bc::BuilderCtx, T, field_args, ir, stmt_idx)
         end
         type_ptr = pointer_from_objref(T)
         type_ptr_id = emit_constant(bc, Int64(reinterpret(UInt64, type_ptr)))
-        nel_id = emit_constant(bc, Int64(nel))
         return emit_call_runtime(bc, "__jl_array_new_1d", UInt32[type_ptr_id, mem_ptr_id, nel_id])
     end
 

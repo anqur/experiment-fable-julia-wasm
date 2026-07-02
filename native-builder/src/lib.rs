@@ -65,6 +65,24 @@ pub extern "C" fn builder_declare_import(
 }
 
 #[no_mangle]
+pub extern "C" fn builder_declare_self_function(
+    ctx: *mut BuilderContext, name: *const c_char,
+    ret_type: u32, param_types: *const u32, num_params: usize,
+) -> c_int {
+    if ctx.is_null() || name.is_null() || (num_params > 0 && param_types.is_null()) {
+        return -1;
+    }
+    unsafe {
+        let nm = CStr::from_ptr(name).to_str().unwrap_or("self_func");
+        let types = std::slice::from_raw_parts(param_types, num_params);
+        match (*ctx).declare_self_function(nm, ret_type, types) {
+            Ok(()) => 0,
+            Err(e) => { eprintln!("[native-builder] {}", e); -1 }
+        }
+    }
+}
+
+#[no_mangle]
 pub extern "C" fn block_add_call(
     fctx: *mut FunctionCtx, ctx: *mut BuilderContext,
     name: *const c_char, args: *const u32, nargs: usize,

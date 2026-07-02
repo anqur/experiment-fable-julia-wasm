@@ -43,7 +43,7 @@ represented as unsigned integers of their width — their operations arrive via
 function scalar_repr(@nospecialize T)
     r = get(_SCALAR_REPRS, T, nothing)
     r !== nothing && return r
-    if T isa DataType && isprimitivetype(T) && !(T <: Ptr)
+    if T isa DataType && !(T <: Tuple) && !(T <: Ptr) && isbitstype(T)
         sz = sizeof(T)
         sz == 1 && return ScalarRepr(I32, 8, false, false)
         sz == 2 && return ScalarRepr(I32, 16, false, false)

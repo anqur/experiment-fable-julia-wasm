@@ -147,7 +147,7 @@ _is_f32(T) = let r = scalar_repr(T); !_is_ptr_type(T) && r !== nothing && r.isfl
             # For immutable non-bitstype structs (e.g. GreenNode), wrap with Ref.
             if isconcretetype(T) && !isbitstype(T) && !Base.ismutabletype(T) &&
                T !== String && !(T <: Tuple)
-                push!(arg_exprs, :(pointer_from_objref(Ref(getfield(args,$i)))))
+                push!(arg_exprs, :(unsafe_load(Ptr{Ptr{Cvoid}}(pointer_from_objref(Ref(getfield(args,$i)))))))
             else
                 push!(arg_exprs, :(pointer_from_objref(getfield(args,$i))))
             end
@@ -166,6 +166,19 @@ _is_f32(T) = let r = scalar_repr(T); !_is_ptr_type(T) && r !== nothing && r.isfl
         return :(ccall(ptr, Cvoid, $sig, $(arg_exprs...)); nothing)
     elseif _is_ptr_type(RT)
         return :(unsafe_pointer_to_objref(ccall(ptr, Ptr{Cvoid}, $sig, $(arg_exprs...))))
+    elseif RT isa Union
+        # Union return types where all non-Nothing arms are pointer types:
+        # return as Ptr{Cvoid} with tagged-nothing check.
+        # nothing in union returns is tagged (not C_NULL, not 0x0).
+        # Example: children(GreenNode) → Union{Nothing, Vector{GreenNode{...}}}
+        arms = _union_arms(RT)
+        non_nothing = filter(!=(Nothing), arms)
+        if !isempty(non_nothing) && all(_is_ptr_type, non_nothing)
+            return :(let p = ccall(ptr, Ptr{Cvoid}, $sig, $(arg_exprs...))
+                      p == Ptr{Cvoid}(get_nothing_tag()) ? nothing : unsafe_pointer_to_objref(p)
+                  end)
+        end
+        error("unsupported Union return type: $RT (arms contain non-pointer types)")
     elseif RT === Float64
         return :(ccall(ptr, Float64, $sig, $(arg_exprs...)))
     elseif RT === Float32
