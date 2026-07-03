@@ -363,15 +363,22 @@ for direct memory access (no runtime calls needed):
 - ✅ **JuliaSyntax compilation acceptance (probe1)** — 5 of 5 probe functions compile
   through `compile_native`: `has_flags`, `is_number`, `is_leaf`, `Kind(Int)`,
   `call_type_flags`.
-- ✅ **JuliaSyntax probe2 status** — 6 of 7 probe functions compile:
-  `_first_error` (recursion + isa + heterogeneous tuple indexing),
-  `_copy_normalize_number!` (pointer + continue + sub-word type harmonization),
-  `parse_float_literal` (foreigncall + strtod + dynamic array allocation). Probe at
+- ✅ **JuliaSyntax probe2 status** — ALL 7/7 probe functions compile 🎉:
+  `_first_error` (✅ runtime via bridge), `_copy_normalize_number!` (✅ runtime),
+  `parse_float_literal` (✅ runtime via bridge, Type{Float64} fix),
+  `parse_int_literal` (✅ compiles, runtime needs scalar boxing). Probe at
   `NativeCodegen/test/debug_jlsyntax_probe2.jl`.
-  1 remaining failure: `parse_int_literal` (mixed scalar/pointer Union types).
-  scalar/pointer Union types), `_copy_normalize_number!` (sub-word constant
-  width mismatch in pointer arithmetic). See the plan file for the full gap
-  ranking.
+  **Bridge callable:** 5 of 7 probe functions can be called at runtime;
+  only `parse_int_literal` needs scalar-boxing pipeline (deferred).
+- ✅ **GotoIfNot fallthrough fix** — `children()[i]` SIGILL resolved. Root cause:
+  Julia CFG `succs[2] == GotoIfNot.dest` for `Union{Nothing,T}` isa dispatch,
+  causing both `brif` branches to target trap. Fixed by checking equality and
+  using `succs[1]` as fallthrough. Unblocks all tree-walking functions.
+- ✅ **haschildren(GreenNode)** — deprecated `!is_leaf` invoke sentinel fixed.
+  Handler in `emit_invoke` loads `:children` field, compares with nothing tag.
+- ✅ **Type{Float64} bridge** — `_gcall` marshals `Type` as `Ptr{Cvoid}`.
+- ✅ **Beacon tests expanded** — `is_string_delim` unskipped, `haschildren`
+  added, `_first_error`/`parse_float_literal` are runtime tests.
 - ✅ **test_final.jl — End-to-End Beacon** (`NativeCodegen/test/test_final.jl`).
   **73 compilations pass (>100 assertions)**: 9 Kind predicates, 20 operator-precedence
   predicates, 7 simple predicates, 5 flag ops (has_flags, call_type_flags, numeric_flags,

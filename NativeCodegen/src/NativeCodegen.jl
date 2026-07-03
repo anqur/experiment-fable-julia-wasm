@@ -141,7 +141,12 @@ _is_f32(T) = let r = scalar_repr(T); !_is_ptr_type(T) && r !== nothing && r.isfl
     arg_exprs = Expr[]
     for i in eachindex(AT.parameters)
         T = AT.parameters[i]
-        if _is_ptr_type(T)
+        if T <: Type
+            # Type values (e.g. Type{Float64}, Type{Int64}) are singleton DataTypes.
+            # Pass as Ptr{Cvoid} via pointer_from_objref.
+            push!(ccall_types, Ptr{Cvoid})
+            push!(arg_exprs, :(pointer_from_objref(getfield(args,$i))))
+        elseif _is_ptr_type(T)
             push!(ccall_types, Ptr{Cvoid})
             # pointer_from_objref works on mutable structs, String, and Tuple.
             # For immutable non-bitstype structs (e.g. GreenNode), wrap with Ref.

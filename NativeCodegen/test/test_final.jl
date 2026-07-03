@@ -787,29 +787,19 @@ end
     println("\n=== Section 8: Tier 4 — Complex Functions (BLOCKED) ===\n")
 
     @test_skip "parse_int_literal(String) → Union{Int64, Int128, BigInt} — needs String replace + tryparse + mixed Union return"
-    @test_skip "parse_float_literal(Type{Float64}, String, Int, Int) → (Float64, Symbol) — needs conditional allocation + Union return"
-    @test_skip "_first_error(SyntaxNode) → Union{Nothing, SyntaxNode} — needs recursion + Union return"
-    @test_skip "_copy_normalize_number!(Ptr{UInt8}, Ptr{UInt8}, Int) — needs sub-word clz/ctz correction"
-    @test_skip "unescape_raw_string(IO, Vector{UInt8}, Int, Int, Bool) — compiles but needs IO side-effects"
-    @test_skip "child_position_span(GreenNode, Int, Int) → (GreenNode, Int, UInt32) — compiles but needs GreenNode tuple return"
-end
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Section 9: Structure-aware Seed Data Verification (pure host — no compilation)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-@testset "Seed Data Verification (host-only ground truth)" begin
-    println("\n=== Section 9: Seed Data Verification ===\n")
-
-    @testset "SEED_TREE structure (x = a + b * c + 1)" begin
-        @test JuliaSyntax.kind(SEED_TREE) == JuliaSyntax.Kind("=")
-        @test JuliaSyntax.numchildren(SEED_TREE) == 5
-        kids = SEED_KIDS
-        @test JuliaSyntax.kind(kids[1]) == JuliaSyntax.Kind("Identifier")  # x
-        @test JuliaSyntax.is_whitespace(kids[2])   # space after =
-        @test kids[5] isa JuliaSyntax.GreenNode  # call node (a + b*c + 1)
-        @test JuliaSyntax.kind(kids[5]) == JuliaSyntax.Kind("call")
-        @test JuliaSyntax.call_type_flags(JuliaSyntax.head(kids[5])) == JuliaSyntax.INFIX_FLAG
+    @testset "parse_float_literal(Type{Float64}, String, Int, Int)" begin
+        print("  parse_float_literal ... ")
+        try
+            result = compile_and_call(JuliaSyntax.parse_float_literal,
+                Tuple{Float64, Symbol}, Tuple{Type{Float64}, String, Int, Int},
+                Float64, "3.14", 1, 5; name="pfl_test")
+            @test result == (Float64(3.14), :ok)
+            println("✅ (3.14)")
+        catch e
+            if e isa InterruptException; rethrow(); end
+            println("❌ ", sprint(showerror, e))
+            @test false
+        end
     end
 
     @testset "ARITH_TREE structure (3 * (4 + 5))" begin

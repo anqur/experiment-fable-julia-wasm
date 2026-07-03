@@ -64,17 +64,23 @@ function cranelift_type(T)
     end
     # Abstract types that are always heap pointers (e.g. AbstractString, Exception)
     isabstracttype(T) && return TYPE_PTR
-    # Union types: classify by arms. All-pointer → TYPE_PTR; all-same-scalar → that.
+    # Union types: classify by arms. All-pointer → TYPE_PTR; all-same-scalar → that;
+    # mixed (pointer+scalar) → TYPE_PTR (scalars are boxed into heap objects at phi edges).
     if T isa Union
         arms = _union_arms(T)
-        pointer_arms = filter(a -> a !== Nothing && is_ptr_type(a), arms)
-        if length(pointer_arms) == length(filter(!=(Nothing), arms))
+        arms_nonvoid = filter(!=(Nothing), arms)
+        pointer_arms = filter(a -> a !== Nothing && is_ptr_type(a), arms_nonvoid)
+        if length(pointer_arms) == length(arms_nonvoid)
             return TYPE_PTR  # all non-Nothing arms are heap pointers
         end
         # Check if all arms have the same Cranelift type
         arm_types = try cranelift_type.(arms) catch _; [] end
         if length(arm_types) == length(arms) && all(==(arm_types[1]), arm_types)
             return arm_types[1]
+        end
+        # Mixed pointer+scalar union: return as pointer (scalars boxed at phi)
+        if !isempty(pointer_arms)
+            return TYPE_PTR
         end
     end
     throw(CompileError("unsupported type $T"))
@@ -452,7 +458,13 @@ function emit_instruction(bc::BuilderCtx, e, ir, stmt_idx::Int)
         fallthrough_bi = nothing
         if current_bi !== nothing && length(ir.cfg.blocks[current_bi].succs) >= 2
             succs = ir.cfg.blocks[current_bi].succs
-            fallthrough_bi = succs[2]
+            # succs[1] is typically the explicit dest, succs[2] the fallthrough.
+            # But sometimes dest_bi == succs[2] — in that case use succs[1] instead.
+            if succs[2] == dest_bi
+                fallthrough_bi = succs[1]
+            else
+                fallthrough_bi = succs[2]
+            end
         end
         if fallthrough_bi === nothing
             fallthrough_name = dest_name
@@ -588,10 +600,20 @@ function resolve_operand(bc::BuilderCtx, val, ir)
         # Raw pointer constant — emit as i64
         return emit_constant(bc, Int64(reinterpret(UInt64, val)))
     elseif Base.isprimitivetype(typeof(val))
-        # Primitive type (e.g. JuliaSyntax.Kind is `primitive type Kind 16 end`) —
-        # reinterpret to integer bits and emit as constant.
-        raw = reinterpret(UInt16, val)
-        return emit_constant(bc, Int32(raw))
+        # Primitive type (e.g. Kind(16-bit), Char(32-bit), Int128(128-bit))
+        sz = sizeof(val)
+        if sz == 2
+            raw = reinterpret(UInt16, val)
+            return emit_constant(bc, Int32(raw))
+        elseif sz == 4
+            raw = reinterpret(UInt32, val)
+            return emit_constant(bc, Int32(raw))
+        elseif sz == 8
+            raw = reinterpret(UInt64, val)
+            return emit_constant(bc, Int64(raw))
+        else
+            return emit_constant(bc, Int64(0))
+        end
     else
         error("Unsupported operand type: $(typeof(val))")
     end
@@ -1204,10 +1226,36 @@ function emit_invoke(bc::BuilderCtx, invoke_target, f, args, ir, stmt_idx)
                      bc.fctx_handle, result, TYPE_I32)
     end
 
-    # Unknown invoke — emit sentinel (e.g. bounds-error path, unreachable)
+    # haschildren(x) → children(x) !== nothing (deprecated alias for !is_leaf)
+    if fn_name == :haschildren && length(args) >= 1
+        val = resolve_operand(bc, args[1], ir)
+        T = get_operand_type(args[1], ir)
+        T = T isa Core.Const ? T.val : T
+        offset = fieldoffset(T, :children)
+        load_ptr = Libdl.dlsym(bc.lib_handle, :block_add_load)
+        children_ptr = ccall(load_ptr, UInt32, (Ptr{Cvoid}, UInt32, Int32, UInt32),
+                             bc.fctx_handle, val, Int32(offset), TYPE_PTR)
+        nothing_tag = get_nothing_tag()
+        tag_id = emit_constant(bc, Int64(nothing_tag))
+        icmp_ptr = Libdl.dlsym(bc.lib_handle, :block_add_icmp)
+        result = ccall(icmp_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32, UInt32),
+                       bc.fctx_handle, ICMP_NE, children_ptr, tag_id)
+        ext_ptr = Libdl.dlsym(bc.lib_handle, :block_add_uextend)
+        return ccall(ext_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
+                     bc.fctx_handle, result, TYPE_I32)
+    end
+
+    # Unknown invoke — emit sentinel with inferred return type's width
+    local sentinel_ty
+    try
+        inferred = ir.stmts[stmt_idx][:type]
+        sentinel_ty = cranelift_type(inferred)
+    catch _
+        sentinel_ty = TYPE_I64
+    end
     iconst_ptr = Libdl.dlsym(bc.lib_handle, :block_add_iconst)
     return ccall(iconst_ptr, UInt32, (Ptr{Cvoid}, Int64, UInt32),
-                 bc.fctx_handle, Int64(0), TYPE_I32)
+                 bc.fctx_handle, Int64(0), sentinel_ty)
 end
 
 function emit_string_ncodeunits(bc, args, ir)
