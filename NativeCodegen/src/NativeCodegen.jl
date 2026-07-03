@@ -146,6 +146,10 @@ _is_f32(T) = let r = scalar_repr(T); !_is_ptr_type(T) && r !== nothing && r.isfl
             # Pass as Ptr{Cvoid} via pointer_from_objref.
             push!(ccall_types, Ptr{Cvoid})
             push!(arg_exprs, :(pointer_from_objref(getfield(args,$i))))
+        elseif T <: Ptr
+            # Raw pointer types (Ptr{UInt8}, etc.) — pass directly
+            push!(ccall_types, Ptr{Cvoid})
+            push!(arg_exprs, :(Ptr{Cvoid}(getfield(args,$i))))
         elseif _is_ptr_type(T)
             push!(ccall_types, Ptr{Cvoid})
             # pointer_from_objref works on mutable structs, String, and Tuple.

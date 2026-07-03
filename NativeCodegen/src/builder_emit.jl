@@ -1482,6 +1482,10 @@ function get_operand_type(val, ir)
     elseif val isa Core.Const
         # For constants, get the type of the contained value
         return typeof(val.val)
+    elseif val isa Core.GlobalRef
+        # Module-level constant: resolve to actual type, not GlobalRef
+        resolved = getglobal(val.mod, val.name)
+        return typeof(resolved)
     else
         return typeof(val)
     end
@@ -1789,11 +1793,21 @@ function emit_pointerref(bc::BuilderCtx, args, ir)
     elem_addr_id = ccall(iadd_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
                           bc.fctx_handle, ptr_id, byte_off_id)
 
-    # Load element at elem_addr + 0
+    # Load element at elem_addr + 0.
+    # Sub-word types (I8/I16): use actual memory width, then uextend to I32 register.
     elem_type_enum = cranelift_type(elem_T)
     load_ptr = Libdl.dlsym(bc.lib_handle, :block_add_load)
-    return ccall(load_ptr, UInt32, (Ptr{Cvoid}, UInt32, Int32, UInt32),
-                 bc.fctx_handle, elem_addr_id, Int32(0), elem_type_enum)
+    if elem_size < 4
+        mem_type = elem_size == 1 ? TYPE_I8 : TYPE_I16
+        raw_id = ccall(load_ptr, UInt32, (Ptr{Cvoid}, UInt32, Int32, UInt32),
+                       bc.fctx_handle, elem_addr_id, Int32(0), mem_type)
+        ext_ptr = Libdl.dlsym(bc.lib_handle, :block_add_uextend)
+        return ccall(ext_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
+                     bc.fctx_handle, raw_id, TYPE_I32)
+    else
+        return ccall(load_ptr, UInt32, (Ptr{Cvoid}, UInt32, Int32, UInt32),
+                     bc.fctx_handle, elem_addr_id, Int32(0), elem_type_enum)
+    end
 end
 
 function emit_pointerset(bc::BuilderCtx, args, ir)
