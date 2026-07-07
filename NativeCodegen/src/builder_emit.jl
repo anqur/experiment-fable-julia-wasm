@@ -1245,6 +1245,33 @@ function emit_invoke(bc::BuilderCtx, invoke_target, f, args, ir, stmt_idx)
                      bc.fctx_handle, result, TYPE_I32)
     end
 
+    # untokenize(Kind) → Union{String, Nothing} — resolve at compile time
+    if fn_name == :untokenize && length(args) >= 1
+        op = args[1]
+        local kind_val, str
+        if op isa Core.SSAValue
+            kind_val = try
+                stmt = ir.stmts[op.id][:stmt]
+                if stmt isa Expr && stmt.head == :call
+                    f = stmt.args[1]
+                    if f isa Core.GlobalRef && f.name === :Kind && length(stmt.args) >= 2
+                        arg2 = stmt.args[2]; arg2 isa Core.Const && getglobal(f.mod, :Kind)(arg2.val)
+                    else nothing end
+                else nothing end
+            catch _; nothing end
+        elseif op isa Core.Const; kind_val = op.val
+        end
+        if kind_val !== nothing
+            str = getglobal(f.mod, :untokenize)(kind_val)
+            if str === nothing
+                return emit_constant(bc, Int64(get_nothing_tag()))
+            end
+            iconst_ptr = Libdl.dlsym(bc.lib_handle, :block_add_iconst)
+            return ccall(iconst_ptr, UInt32, (Ptr{Cvoid}, Int64, UInt32),
+                         bc.fctx_handle, Int64(reinterpret(UInt64, pointer_from_objref(str))), TYPE_PTR)
+        end
+    end
+
     # Unknown invoke — emit sentinel with inferred return type's width
     local sentinel_ty
     try

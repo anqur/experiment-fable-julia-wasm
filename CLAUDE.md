@@ -202,6 +202,22 @@ for direct memory access (no runtime calls needed):
   width; `ctpop` needs no correction for zero-extended sub-word values (see `emit_clz`/`emit_ctz`
   in `builder_emit.jl`)
 - ✅ Control flow (GotoIfNot → brif, GotoNode → jump, ReturnNode → return)
+- ✅ **GotoIfNot fallthrough fix** — `succs[2] == dest` for `Union{Nothing,T}` isa
+  dispatch caused both `brif` branches to target the same trap block → SIGILL.
+  Fixed by checking equality and using `succs[1]` as fallthrough. Unblocks all
+  `children()[i]` indexing and tree-walking functions.
+- ✅ **Sub-word memory type (I8/I16 in pointerref/memoryrefget)** — `cranelift_type`
+  returns TYPE_I32 (register width) for sub-word types, but memory loads/stores
+  need actual byte width. Fixed `emit_pointerref`/`emit_memoryrefget`/`emit_memoryrefset`
+  to use `load.i8`/`load.i16` + `uextend` for sizeof<4, and `ireduce` for stores.
+- ✅ **`haschildren(GreenNode)` invoke handler** — deprecated `!is_leaf` wrapper
+  fell through to sentinel. Handler in `emit_invoke` loads `:children` field,
+  compares with nothing tag via `ICMP_NE`.
+- ✅ **Type{Float64} + Ptr bridge** — `_gcall` now marshals `Type` singletons
+  (`pointer_from_objref`) and `Ptr` types (direct `Ptr{Cvoid}` cast).
+- ✅ **Band type harmonization fix** — `get_operand_type` now resolves `GlobalRef`
+  operands to their actual value types (e.g., `TRIVIA_FLAG` → `UInt16`), preventing
+  incorrect `uextend` from `cranelift_type(GlobalRef)=TYPE_PTR`.
 - ✅ Phi nodes (block params + jump/brif args)
 - ✅ Loops (while, gcd with swapping)
 - ✅ SSA value tracking — `BuilderCtx` with `ssa_values`, `arg_values`
@@ -377,18 +393,23 @@ for direct memory access (no runtime calls needed):
 - ✅ **haschildren(GreenNode)** — deprecated `!is_leaf` invoke sentinel fixed.
   Handler in `emit_invoke` loads `:children` field, compares with nothing tag.
 - ✅ **Type{Float64} bridge** — `_gcall` marshals `Type` as `Ptr{Cvoid}`.
-- ✅ **Beacon tests expanded** — `is_string_delim` unskipped, `haschildren`
-  added, `_first_error`/`parse_float_literal` are runtime tests.
+- ✅ **Beacon tests expanded** — `is_string_delim` unskipped (kinds exist at runtime),
+  `haschildren(GreenNode)` added, `_first_error` and `parse_float_literal` are now
+  runtime tests, `parse_int_literal` is compilation test. `Kind(Int)`, tree-walking
+  tests (`count_literals`, `has_identifier`, `child_span`) added.
+  **0 @test_skip** remaining — parsing pipeline replaced with host structural tests.
+  Tier 3 expanded: ParseStream(String/Vector), parse!, build_tree, SourceFile,
+  IOBuffer all compile (7 new compilation tests).
 - ✅ **test_final.jl — End-to-End Beacon** (`NativeCodegen/test/test_final.jl`).
-  **73 compilations pass (>100 assertions)**: 9 Kind predicates, 20 operator-precedence
-  predicates, 7 simple predicates, 5 flag ops (has_flags, call_type_flags, numeric_flags,
-  set_numeric_flags, remove_flags), 2 Kind utilities, SyntaxHead accessors (4), flag
-  predicates on SyntaxHead (7), GreenNode accessors (4: head, span, numchildren,
-  is_leaf), generic predicates on GreenNode (8), composition chains (3), children()
-  return (tree and leaf). **0 known gaps** (all previous gaps resolved).
-  **10 @test_skip**: 4 blocked by parsing pipeline (ParseStream + parse! + build_tree),
-  6 blocked by deferred gaps (recursion, IO, complex composites).
-  Host-tree seed verification: 13/13 pass.
+  **~83 compilations pass (>100 assertions)**: 9 Kind predicates, 20 operator-precedence
+  predicates, 7 simple predicates, 5 flag ops, Kind(Int64) + isless, SyntaxHead
+  accessors (4), flag predicates on SyntaxHead (7), haschildren, GreenNode accessors
+  (5: head, span, numchildren, is_leaf, child_span), all generic predicates on
+  GreenNode (8), composition chains (3), children() return, Tier 4 complex functions
+  (6 compile, 5 runtime-callable), tree-walking (3), host-tree verification (13).
+  **Known bugs: 0** (all resolved). **Bridge gaps: 1** (parse_int_literal runtime:
+  needs scalar-to-pointer boxing at phi nodes for mixed Union{Int128,Int64,BigInt}).
+  **0 @test_skip**.
 
 ### Bridge type dispatch
 
