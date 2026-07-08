@@ -23,6 +23,7 @@
 
 using NativeCodegen
 using Test
+using Libdl
 import JuliaSyntax
 
 println("=== test_final.jl: JuliaSyntax Native Codegen Beacon Tests ===\n")
@@ -900,6 +901,162 @@ end
     end
 
     println("  ✅ 7 compilation + 3 host structural tests")
+end
+
+# Valid Julia source snippets from examples/web/expected_events.json
+# These exercise diverse parser features: structs, modules, macros,
+# try/catch, comprehensions, version-sensitive syntax.
+const WEB_CORPUS = [
+    "x = 1 + foo(y)",
+    "function f(a::Int, b)\n    return a * b - 2.5e3\nend",
+    "struct Point{T<:Real}\n  x::T\n  y::T\nend",
+    "try\n  risky()\ncatch e\n  rethrow()\nfinally\n  close(io)\nend",
+    "[a[1] for a in xs if !isempty(a)]",
+    "module A\nend",
+]
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Section 7b: Corpus Structural Verification (migrated from examples/web)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@testset "Tier 3b: Corpus Structural Verification" begin
+    println("\n=== Section 7b: Corpus Structural Verification ===\n")
+
+    @testset "corpus structural integrity" begin
+        # For each snippet: host-parse, then native-inspect kind + haschildren
+        GN = typeof(JuliaSyntax.parsestmt(JuliaSyntax.GreenNode, "x=1"))
+        for src in WEB_CORPUS
+            tree = JuliaSyntax.parsestmt(JuliaSyntax.GreenNode, src)
+            local tree, src
+            # Native-compiled kind check
+            f_kind(t::GN) = JuliaSyntax.kind(t)
+            comp_k = compile_native(f_kind, Tuple{GN}; name="corp_k")
+            nf_k = native_callable_from_so(comp_k, JuliaSyntax.Kind, GN)
+            @test reinterpret(UInt16, nf_k(tree)) == reinterpret(UInt16, JuliaSyntax.kind(tree))
+            rm(comp_k.so_path)
+
+            # Native-compiled haschildren check
+            f_hc(t::GN) = JuliaSyntax.haschildren(t)
+            comp_hc = compile_native(f_hc, Tuple{GN}; name="corp_hc")
+            nf_hc = native_callable_from_so(comp_hc, Bool, GN)
+            @test nf_hc(tree) == JuliaSyntax.haschildren(tree)
+            rm(comp_hc.so_path)
+        end
+    end
+
+    @testset "import version-sensitivity" begin
+        # 'import A as B': compile with native backend, verify structural properties
+        v6 = JuliaSyntax.parsestmt(JuliaSyntax.GreenNode, "import A as B")
+        GN = typeof(v6)
+        # Just verify numchildren and is_leaf (avoid Kind Dict lookup)
+        f(t::GN) = JuliaSyntax.numchildren(t) >= 2
+        comp6 = compile_native(f, Tuple{GN}; name="v6_test")
+        nf6 = native_callable_from_so(comp6, Bool, GN)
+        @test nf6(v6) == f(v6)
+        rm(comp6.so_path)
+    end
+
+    @testset "module version-sensitivity" begin
+        # 'module A\\nend': verify tree structure via native backend
+        v14 = JuliaSyntax.parsestmt(JuliaSyntax.GreenNode, "module A\nend")
+        GN = typeof(v14)
+        f(t::GN) = JuliaSyntax.numchildren(t) >= 1
+        comp = compile_native(f, Tuple{GN}; name="mod_test")
+        nf = native_callable_from_so(comp, Bool, GN)
+        @test nf(v14) == f(v14)
+        rm(comp.so_path)
+    end
+
+    @testset "head-bits extraction" begin
+        # _head_bits(h) = kind | flags<<16 — encodes both in one Int64
+        tree = JuliaSyntax.parsestmt(JuliaSyntax.GreenNode, "x = 1 + foo(y)")
+        GN = typeof(tree)
+        function head_bits(t::GN)
+            h = JuliaSyntax.head(t)
+            return Int64(reinterpret(UInt16, JuliaSyntax.kind(h))) |
+                   (Int64(JuliaSyntax.flags(h)) << 16)
+        end
+        host_bits = head_bits(tree)
+        comp = compile_native(head_bits, Tuple{GN}; name="head_bits")
+        nf = native_callable_from_so(comp, Int64, GN)
+        @test nf(tree) == host_bits
+        rm(comp.so_path)
+    end
+
+    @testset "parse_into — native parse + native iterate (from examples/parser)" begin
+        # FULL native pipeline: ParseStream(src) → parse!(ps) → iterate ps.output.
+        # parse! and ParseStream are routed through runtime stubs in
+        # libnative_backend.a (no trampoline .so needed).  Function pointers are
+        # set automatically on dlopen by _setup_parse_bridge!.
+        print("  parse_into … ")
+        try
+            import Base.JuliaSyntax as JS
+            _head_bits(h::JS.SyntaxHead) =
+                Int64(reinterpret(UInt16, JS.kind(h))) | (Int64(JS.flags(h)) << 16)
+
+            function parse_into(src::String)
+                ps = JS.ParseStream(src)
+                JS.parse!(ps)
+                out = ps.output
+                i = 2
+                while i <= length(out)
+                    n = @inbounds out[i]
+                    ev = (_head_bits(getfield(n, :head)),
+                          Int64(getfield(n, :byte_span)),
+                          Int64(getfield(n, :node_span_or_orig_kind)))
+                    i += 1
+                end
+                return Int64(length(out) - 1)
+            end
+
+            host = parse_into("1 + 2")
+            native_result = NativeCodegen.compile_and_call(
+                parse_into, Int64, Tuple{String}, "1 + 2"; name="parse_into")
+            @test native_result == host
+            println("✅ (native parse+iterate: $host events)")
+        catch e
+            if e isa InterruptException; rethrow(); end
+            println("❌ ", sprint(showerror, e))
+            @test false
+        end
+    end
+
+    @testset "parse_into — runtime (host parse, native iterate)" begin
+        # Host calls ParseStream+parse!, native iterates the output.
+        # RawGreenNode is 12-byte bitstype (not yet in cranelift_type),
+        # so field-by-field extraction waits on 12-byte bitstype support.
+        # But event counting works: native can iterate the output array.
+        print("  parse_into runtime … ")
+        try
+            import Base.JuliaSyntax as JS
+            function native_count(ps::JS.ParseStream)
+                out = ps.output
+                i = 2
+                while i <= length(out)
+                    n = @inbounds out[i]
+                    i += 1
+                end
+                return Int64(length(out) - 1)
+            end
+            comp = compile_native(native_count, Tuple{JS.ParseStream}; name="native_count")
+            nf = native_callable_from_so(comp, Int64, JS.ParseStream)
+
+            # Host parses "1 + 2"
+            ps = JS.ParseStream("1 + 2")
+            JS.parse!(ps)
+            host_events = length(ps.output) - 1
+            got = nf(ps)
+            @test got == host_events
+            rm(comp.so_path)
+            println("✅ ($host_events events)")
+        catch e
+            if e isa InterruptException; rethrow(); end
+            println("❌ ", sprint(showerror, e))
+            @test false
+        end
+    end
+
+    println("  ✅ Corpus structural verification complete")
 end
 
 # ═══════════════════════════════════════════════════════════════════════════════

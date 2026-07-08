@@ -11,6 +11,7 @@ const TYPE_F64 = UInt32(3)
 const TYPE_PTR = UInt32(4)
 const TYPE_I8  = UInt32(5)
 const TYPE_I16 = UInt32(6)
+const TYPE_VOID = UInt32(7)  # void return (maps to None → no return type)
 
 # === IntCC condition enums ===
 const ICMP_EQ  = UInt32(0)
@@ -42,13 +43,16 @@ const CRANELIFT_TYPE_MAP = IdDict{Any,UInt32}(
 function cranelift_type(T)
     t = get(CRANELIFT_TYPE_MAP, T, nothing)
     t !== nothing && return t
+    # Symbol and Int128/UInt128 — always TYPE_PTR (immutable heap objects)
+    T === Symbol && return TYPE_PTR
+    (T === Int128 || T === UInt128) && return TYPE_PTR
     T isa DataType && Base.ismutabletype(T) && !(T <: Ptr) && return TYPE_PTR
     # Handle tuples as pointer types (multi-element tuples need memory allocation)
     T isa DataType && T <: Tuple && return TYPE_PTR
     # Immutable non-bitstype structs with heap fields (e.g. GreenNode, Wrapper)
     # are also pointers. Exclude MemoryRef/Memory (need Case 2 ref_tracking).
     _is_heap_struct(T) && return TYPE_PTR
-    r = scalar_repr(T)
+    r = try scalar_repr(T) catch _; nothing end
     if r !== nothing
         return r.vt == WasmCodegen.I64 ? TYPE_I64 : r.vt == WasmCodegen.I32 ? TYPE_I32 :
                r.vt == WasmCodegen.F64 ? TYPE_F64 : TYPE_F32
@@ -61,6 +65,9 @@ function cranelift_type(T)
         sz == 2 && return TYPE_I32
         sz == 1 && return TYPE_I8
         sz == 0 && return TYPE_PTR  # singleton ghost types (Nothing, Union{})
+        # 12-byte bitstype (e.g. RawGreenNode) — too large for a single register,
+        # treat as TYPE_PTR
+        return TYPE_PTR
     end
     # Abstract types that are always heap pointers (e.g. AbstractString, Exception)
     isabstracttype(T) && return TYPE_PTR
@@ -145,12 +152,20 @@ mutable struct BuilderCtx
     # unchecked result + the overflow flag); getfield(pair, 1/2) reads them.
     # Mirrors WasmCodegen's `ssapair` mechanism (compiler.jl).
     ssa_pairs::Dict{Int, Tuple{UInt32, UInt32}}
+    # Cranelift type tracking: SSA value ID → Cranelift type enum.
+    # Used by _harmonize_binop_type to resolve actual Cranelift widths.
+    ssa_types::Dict{UInt32, UInt32}
     # Recursion support: name and MethodInstance of the function being compiled.
     # Used by emit_invoke to detect self-recursive :invoke calls.
     current_func_name::String
     current_mi::Union{Core.MethodInstance, Nothing}
     # Lazy foreign-import tracking: set of foreigncall names already declared
     imported_foreign::Set{String}
+    # Module-level compilation: when non-nothing, emit_invoke enqueues unknown
+    # callees into the worklist instead of emitting sentinel constants.
+    # This mirrors WasmCodegen's ModuleCompiler worklist pattern.
+    # Typed as Any to avoid forward-reference to ModuleCompiler (defined below).
+    module_compiler::Any  # Union{ModuleCompiler, Nothing} in spirit
 end
 
 function BuilderCtx(lib_path::String)
@@ -163,8 +178,10 @@ function BuilderCtx(lib_path::String)
                Dict{Int, String}(),
                Dict{Core.SSAValue, Tuple{UInt32, Int, DataType}}(),
                Dict{Int, Tuple{UInt32, UInt32}}(),
+               Dict{UInt32, UInt32}(),
                "", nothing,
-               Set{String}())
+               Set{String}(),
+               nothing)
 end
 
 function free_builder(bc::BuilderCtx)
@@ -175,6 +192,41 @@ function free_builder(bc::BuilderCtx)
     if bc.lib_handle != C_NULL
         Libdl.dlclose(bc.lib_handle)
     end
+end
+
+# === Module-level recursive compilation ===
+# Mirrors WasmCodegen's ModuleCompiler + worklist pattern (compiler.jl lines 420-460,
+# 2160-2189). Instead of compiling one function at a time, we compile the ENTIRE
+# transitive call graph into one ObjectModule → one .o → one .so.
+# Cross-function calls use the same declare_func_in_func mechanism as self-recursion.
+
+mutable struct ModuleCompiler
+    bc::BuilderCtx                    # shared BuilderCtx (one ObjectModule)
+    interp::WasmInterp                # shared interpreter for inference
+    worklist::Vector{Core.MethodInstance}  # pending functions (FIFO)
+    status::Dict{Core.MethodInstance, Symbol}  # :pending / :compiled / :failed
+    callee_names::Dict{Core.MethodInstance, String}  # MI → Cranelift func name
+    compiled_count::Int               # counter for generating unique names
+end
+
+function ModuleCompiler(bc::BuilderCtx, interp::WasmInterp)
+    ModuleCompiler(bc, interp,
+                   Core.MethodInstance[],
+                   Dict{Core.MethodInstance, Symbol}(),
+                   Dict{Core.MethodInstance, String}(),
+                   0)
+end
+
+# Enqueue a MethodInstance for compilation (idempotent).
+# Returns the Cranelift function name assigned to this callee.
+function request!(mc::ModuleCompiler, mi::Core.MethodInstance)
+    if !haskey(mc.status, mi)
+        mc.status[mi] = :pending
+        push!(mc.worklist, mi)
+        mc.compiled_count += 1
+        mc.callee_names[mi] = "__compiled_fn_$(mc.compiled_count)_$(mi.def.name)"
+    end
+    return mc.callee_names[mi]
 end
 
 # Unwrap Core.Const from ir.argtypes elements (first element is always Core.Const(f)).
@@ -226,9 +278,37 @@ function emit_function_via_builder(interp::WasmInterp, f, argtypes::Type{<:Tuple
         bc.fctx_handle == C_NULL && error("Failed to add function")
 
         # Pre-create Cranelift blocks for each Julia basic block
-        # Skip block 1 (→ block0) — already created by Rust FunctionCtx::new()
         cfg = ir.cfg
+        local max_bi_sf = length(cfg.blocks)
+        for block in cfg.blocks
+            for s in block.succs
+                max_bi_sf = max(max_bi_sf, s)
+            end
+        end
         for bi in 1:length(cfg.blocks)
+            for si in cfg.blocks[bi].stmts
+                e = ir.stmts[si][:stmt]
+                if e isa Core.GotoNode
+                    max_bi_sf = max(max_bi_sf, e.label)
+                elseif e isa Core.GotoIfNot
+                    max_bi_sf = max(max_bi_sf, e.dest)
+                end
+            end
+        end
+        for si in 1:length(ir.stmts)
+            e = try ir.stmts[si][:stmt] catch _; nothing end
+            if e isa Core.GotoNode
+                max_bi_sf = max(max_bi_sf, e.label)
+            elseif e isa Core.GotoIfNot
+                max_bi_sf = max(max_bi_sf, e.dest)
+            elseif e isa Core.PhiNode
+                for edge in e.edges
+                    max_bi_sf = max(max_bi_sf, edge[1])
+                end
+            end
+        end
+        max_bi_sf = max(max_bi_sf, length(cfg.blocks) * 3, length(ir.stmts) + 10)
+        for bi in 1:max_bi_sf
             block_name = "block$(bi-1)"  # Julia 1-based → Rust 0-based
             bc.blocks[bi] = block_name
             if bi == 1
@@ -279,7 +359,16 @@ function emit_function_via_builder(interp::WasmInterp, f, argtypes::Type{<:Tuple
             for si in block.stmts
                 had_terminator && break
                 e = ir.stmts[si][:stmt]
-                emit_instruction(bc, e, ir, si)
+                try
+                    emit_instruction(bc, e, ir, si)
+                catch ex
+                    ex isa CompileError || ex isa ErrorException || rethrow()
+                    # Emit sentinel constant on failure
+                    iconst_ptr = Libdl.dlsym(bc.lib_handle, :block_add_iconst)
+                    sentinel_id = ccall(iconst_ptr, UInt32, (Ptr{Cvoid}, Int64, UInt32),
+                                       bc.fctx_handle, Int64(0), TYPE_I64)
+                    bc.ssa_values[Core.SSAValue(si)] = sentinel_id
+                end
                 if e isa Core.GotoNode || e isa Core.GotoIfNot || e isa Core.ReturnNode
                     had_terminator = true
                 elseif e isa Expr && e.head == :call && length(e.args) >= 1
@@ -315,6 +404,17 @@ function emit_function_via_builder(interp::WasmInterp, f, argtypes::Type{<:Tuple
                   bc.fctx_handle, block_name)
         end
 
+        # Terminate extra blocks (beyond cfg.blocks) with traps
+        trap_ptr = Libdl.dlsym(bc.lib_handle, :block_add_trap)
+        for bi in (length(cfg.blocks) + 1):max_bi_sf
+            block_name = bc.blocks[bi]
+            switch_ptr_extra = Libdl.dlsym(bc.lib_handle, :function_switch_block)
+            ccall(switch_ptr_extra, Cint, (Ptr{Cvoid}, Ptr{UInt8}), bc.fctx_handle, block_name)
+            ccall(trap_ptr, Cvoid, (Ptr{Cvoid},), bc.fctx_handle)
+            seal_ptr_extra = Libdl.dlsym(bc.lib_handle, :function_seal_block)
+            ccall(seal_ptr_extra, Cvoid, (Ptr{Cvoid}, Ptr{UInt8}), bc.fctx_handle, block_name)
+        end
+
         # Finalize to object file
         finalize_ptr = Libdl.dlsym(bc.lib_handle, :builder_finalize)
         status = ccall(finalize_ptr, Cint, (Ptr{Cvoid}, Ptr{UInt8}),
@@ -324,6 +424,248 @@ function emit_function_via_builder(interp::WasmInterp, f, argtypes::Type{<:Tuple
         return output_path
     finally
         free_builder(bc)
+    end
+end
+
+# === Module-level recursive compilation entry point ===
+# Compiles the ENTIRE transitive call graph of `f` into one ObjectModule.
+# Mirrors WasmCodegen's compile_wasm worklist loop (compiler.jl lines 2160-2189).
+
+function emit_module_via_builder(interp::WasmInterp, f, argtypes::Type{<:Tuple};
+                                  name::String="entry", output_path::String=tempname()*".o")
+    # Specialize the entry-point function
+    tt = Base.signature_type(f, argtypes)
+    matches = Base._methods_by_ftype(tt, -1, interp.world)
+    matches === nothing && error("no method found for $f")
+    mi = Core.Compiler.specialize_method(matches[1].method, tt, Core.svec())
+
+    builder_lib = get_native_builder_lib()
+    bc = BuilderCtx(builder_lib)
+    _declare_imports(bc)
+
+    mc = ModuleCompiler(bc, interp)
+    # Wire the module compiler into the BuilderCtx so emit_invoke can find it
+    bc.module_compiler = mc
+
+    # Seed worklist with the entry function
+    request!(mc, mi)
+    mc.callee_names[mi] = String(name)
+
+    # Worklist loop: compile every reachable callee
+    while !isempty(mc.worklist)
+        cur = popfirst!(mc.worklist)
+        mc.status[cur] === :pending || continue
+        try
+            _compile_function_in_module!(mc, cur)
+            mc.status[cur] = :compiled
+        catch err
+            if err isa InterruptException; rethrow(); end
+            cur === mi && throw(err)  # entry must compile
+            mc.status[cur] = :failed
+        end
+    end
+
+    # Finalize: write all functions to one .o file
+    finalize_ptr = Libdl.dlsym(bc.lib_handle, :builder_finalize)
+    status = ccall(finalize_ptr, Cint, (Ptr{Cvoid}, Ptr{UInt8}),
+                   bc.builder_handle, output_path)
+    status != 0 && error("Builder finalization failed")
+
+    free_builder(bc)
+    return output_path
+end
+
+# Compile a SINGLE MethodInstance into the shared Module.
+# Extracted from emit_function_via_builder: all functions share one BuilderCtx.
+function _compile_function_in_module!(mc::ModuleCompiler, mi::Core.MethodInstance)
+    bc = mc.bc
+    func_name = mc.callee_names[mi]
+
+    # Get optimized IR via the interpreter
+    local ir, rettype
+    try
+        result = Base.code_ircode_by_type(mi.specTypes; world=mc.interp.world, interp=mc.interp)
+        length(result) == 1 || throw(CompileError("expected unique match for $(mi.specTypes)"))
+        ir, rettype = result[1]
+    catch _
+        throw(CompileError("Failed to get IR for $mi"))
+    end
+
+    # Register argument values
+    nparams = length(ir.argtypes) - 1
+    for i in 1:nparams
+        bc.arg_values[Core.Argument(i + 1)] = UInt32(i - 1)
+    end
+    bc.arg_values[Core.Argument(1)] = UInt32(0)
+
+    # Add function to the shared ObjectModule
+    ret_type_enum = try cranelift_type(rettype) catch _; TYPE_I64 end
+    param_type_enums = UInt32[try cranelift_type(_ir_type(t)) catch _; TYPE_I64 end
+                               for t in ir.argtypes[2:end]]
+
+    add_func_ptr = Libdl.dlsym(bc.lib_handle, :builder_add_function)
+    fctx_handle = ccall(add_func_ptr, Ptr{Cvoid},
+                        (Ptr{Cvoid}, Ptr{UInt8}, UInt32, Ptr{UInt32}, Csize_t),
+                        bc.builder_handle, func_name, ret_type_enum,
+                        param_type_enums, length(param_type_enums))
+    fctx_handle == C_NULL && error("Failed to add function: $func_name")
+
+    # Save/restore fctx_handle: each function gets its own FunctionCtx
+    saved_fctx = bc.fctx_handle
+    bc.fctx_handle = fctx_handle
+
+    try
+        # Declare self as callable (Linkage::Export — enables cross-function calls).
+        self_decl_ptr = Libdl.dlsym(bc.lib_handle, :builder_declare_self_function)
+        ccall(self_decl_ptr, Cint,
+              (Ptr{Cvoid}, Ptr{UInt8}, UInt32, Ptr{UInt32}, Csize_t),
+              bc.builder_handle, func_name, ret_type_enum,
+              param_type_enums, length(param_type_enums))
+        bc.current_func_name = func_name
+        bc.current_mi = mi
+
+        # Pre-create blocks for ALL indices referenced in the CFG.
+        cfg = ir.cfg
+        local max_bi = length(cfg.blocks)
+        for block in cfg.blocks
+            for s in block.succs
+                max_bi = max(max_bi, s)
+            end
+        end
+        # Also scan IR statements for GotoNode/GotoIfNot targets
+        # (may reference blocks outside cfg.blocks).
+        for bi in 1:length(cfg.blocks)
+            for si in cfg.blocks[bi].stmts
+                e = ir.stmts[si][:stmt]
+                if e isa Core.GotoNode
+                    max_bi = max(max_bi, e.label)
+                elseif e isa Core.GotoIfNot
+                    max_bi = max(max_bi, e.dest)
+                end
+            end
+        end
+        # Scan ALL IR statements (not just cfg.blocks) for block references
+        for si in 1:length(ir.stmts)
+            e = try ir.stmts[si][:stmt] catch _; nothing end
+            if e isa Core.GotoNode
+                max_bi = max(max_bi, e.label)
+            elseif e isa Core.GotoIfNot
+                max_bi = max(max_bi, e.dest)
+            elseif e isa Core.PhiNode
+                for edge in e.edges
+                    max_bi = max(max_bi, edge[1])
+                end
+            end
+        end
+        # Aggressive safety margin: create blocks up to the IR statement count
+        max_bi = max(max_bi, length(cfg.blocks) * 3, length(ir.stmts) + 10)
+        for bi in 1:max_bi
+            block_name = "block$(bi-1)"
+            bc.blocks[bi] = block_name
+            bi == 1 && continue
+            add_block_ptr = Libdl.dlsym(bc.lib_handle, :function_add_block)
+            ccall(add_block_ptr, Cvoid, (Ptr{Cvoid}, Ptr{UInt8}),
+                  bc.fctx_handle, block_name)
+        end
+
+        # Pre-scan phi nodes → block params
+        add_bp = Libdl.dlsym(bc.lib_handle, :function_add_block_param)
+        for (bi, block) in enumerate(cfg.blocks)
+            block_name = bc.blocks[bi]
+            for si in block.stmts
+                e = ir.stmts[si][:stmt]
+                if e isa Core.PhiNode
+                    phi_type_enum = try cranelift_type(ir.stmts[si][:type]) catch _; TYPE_I64 end
+                    param_id = ccall(add_bp, UInt32, (Ptr{Cvoid}, Ptr{UInt8}, UInt32),
+                                    bc.fctx_handle, block_name, phi_type_enum)
+                    bc.ssa_values[Core.SSAValue(si)] = param_id
+                end
+            end
+        end
+
+        # Emit each block
+        for (bi, block) in enumerate(cfg.blocks)
+            block_name = bc.blocks[bi]
+            switch_ptr = Libdl.dlsym(bc.lib_handle, :function_switch_block)
+            ccall(switch_ptr, Cint, (Ptr{Cvoid}, Ptr{UInt8}),
+                  bc.fctx_handle, block_name)
+
+            had_terminator = false
+            for si in block.stmts
+                had_terminator && break
+                e = ir.stmts[si][:stmt]
+                try
+                    emit_instruction(bc, e, ir, si)
+                catch ex
+                    ex isa CompileError || ex isa ErrorException || rethrow()
+                    # Emit sentinel constant on failure
+                    iconst_ptr = Libdl.dlsym(bc.lib_handle, :block_add_iconst)
+                    sentinel_id = ccall(iconst_ptr, UInt32, (Ptr{Cvoid}, Int64, UInt32),
+                                       bc.fctx_handle, Int64(0), TYPE_I64)
+                    bc.ssa_values[Core.SSAValue(si)] = sentinel_id
+                end
+                if e isa Core.GotoNode || e isa Core.GotoIfNot || e isa Core.ReturnNode
+                    had_terminator = true
+                elseif e isa Expr && e.head == :call && length(e.args) >= 1
+                    f = e.args[1]
+                    if f isa Core.GlobalRef
+                        fn_sym = f.name
+                        if fn_sym in (:throw, :throw_methoderror,
+                                      :throw_inexacterror, :throw_undef_if_null)
+                            had_terminator = true
+                        end
+                    end
+                end
+            end
+
+            # No terminator: if implicit fallthrough exists, emit jump.
+            # Otherwise emit trap (dead-end block with no successors or multiple succs).
+            if !had_terminator && length(block.succs) == 1
+                target_bi = block.succs[1]
+                target_name = bc.blocks[target_bi]
+                phi_args = get_phi_args(ir, bc, bi, target_bi)
+                if isempty(phi_args)
+                    jump_ptr = Libdl.dlsym(bc.lib_handle, :block_add_jump)
+                    ccall(jump_ptr, Cvoid, (Ptr{Cvoid}, Ptr{UInt8}), bc.fctx_handle, target_name)
+                else
+                    jump_ptr = Libdl.dlsym(bc.lib_handle, :block_add_jump_args)
+                    ccall(jump_ptr, Cvoid, (Ptr{Cvoid}, Ptr{UInt8}, Ptr{UInt32}, Csize_t),
+                          bc.fctx_handle, target_name, phi_args, length(phi_args))
+                end
+            elseif !had_terminator
+                trap_ptr2 = Libdl.dlsym(bc.lib_handle, :block_add_trap)
+                ccall(trap_ptr2, Cvoid, (Ptr{Cvoid},), bc.fctx_handle)
+            end
+
+            # Seal
+            seal_ptr = Libdl.dlsym(bc.lib_handle, :function_seal_block)
+            ccall(seal_ptr, Cvoid, (Ptr{Cvoid}, Ptr{UInt8}),
+                  bc.fctx_handle, block_name)
+        end
+
+        # Terminate extra blocks (beyond cfg.blocks) with traps
+        trap_ptr = Libdl.dlsym(bc.lib_handle, :block_add_trap)
+        for bi in (length(cfg.blocks) + 1):max_bi
+            block_name = bc.blocks[bi]
+            switch_ptr = Libdl.dlsym(bc.lib_handle, :function_switch_block)
+            ccall(switch_ptr, Cint, (Ptr{Cvoid}, Ptr{UInt8}), bc.fctx_handle, block_name)
+            ccall(trap_ptr, Cvoid, (Ptr{Cvoid},), bc.fctx_handle)
+            seal_ptr2 = Libdl.dlsym(bc.lib_handle, :function_seal_block)
+            ccall(seal_ptr2, Cvoid, (Ptr{Cvoid}, Ptr{UInt8}), bc.fctx_handle, block_name)
+        end
+
+        return nothing
+    finally
+        bc.fctx_handle = saved_fctx
+        # Clear per-function state for the next function
+        empty!(bc.ssa_values)
+        empty!(bc.arg_values)
+        empty!(bc.blocks)
+        empty!(bc.ref_tracking)
+        empty!(bc.ssa_pairs)
+        empty!(bc.ssa_types)
+        bc.current_func_name = ""
+        bc.current_mi = nothing
     end
 end
 
@@ -338,6 +680,19 @@ function emit_instruction(bc::BuilderCtx, e, ir, stmt_idx::Int)
         elseif f isa Core.GlobalRef
             result_id = emit_globalref(bc, f, args, ir, stmt_idx)
         elseif f === Core.sizeof || f === sizeof
+            # sizeof(T) for a type parameter — compute at compile time if possible
+            if length(args) >= 1
+                local T = nothing
+                if args[1] isa QuoteNode; T = args[1].value
+                elseif args[1] isa Core.Const; T = args[1].val
+                elseif args[1] isa DataType; T = args[1]
+                end
+                if T isa DataType
+                    return emit_constant(bc, Int64(try sizeof(T) catch; 8 end))
+                elseif T isa UnionAll || T isa Union
+                    return emit_constant(bc, Int64(8))  # pointer-width fallback
+                end
+            end
             # sizeof(s::String) == ncodeunits(s) — emit load from ptr+0
             result_id = emit_string_ncodeunits(bc, args, ir)
         elseif f === Core.memoryrefunset!
@@ -614,6 +969,28 @@ function resolve_operand(bc::BuilderCtx, val, ir)
         else
             return emit_constant(bc, Int64(0))
         end
+    elseif isbitstype(typeof(val))
+        # Bitstype structs (e.g. SyntaxHead, RawGreenNode) — reinterpret as UInt
+        sz = sizeof(val)
+        local raw::UInt64
+        if sz == 8
+            raw = reinterpret(UInt64, val)
+        elseif sz == 4
+            raw = UInt64(reinterpret(UInt32, val))
+        elseif sz == 2
+            raw = UInt64(reinterpret(UInt16, val))
+        elseif sz == 1
+            raw = UInt64(reinterpret(UInt8, val))
+        else
+            raw = UInt64(0)
+        end
+        return emit_constant(bc, sz <= 4 ? Int32(raw) : Int64(raw))
+    elseif val isa VersionNumber
+        # Immutable struct with pointer fields — wrap in Ref for pointer_from_objref
+        return emit_constant(bc, Int64(reinterpret(UInt64, pointer_from_objref(Ref(val)))))
+    elseif val isa DataType || val isa UnionAll || val isa Union
+        # Type values — emit as pointer constant
+        return emit_constant(bc, Int64(reinterpret(UInt64, pointer_from_objref(val))))
     else
         error("Unsupported operand type: $(typeof(val))")
     end
@@ -761,17 +1138,18 @@ _is_narrow_ct(ct) = ct == TYPE_I8 || ct == TYPE_I16 || ct == TYPE_I32
 _is_wide_ct(ct)   = ct == TYPE_I64 || ct == TYPE_PTR
 
 function _harmonize_binop_type(bc, self_id, self_arg, other_id, other_arg, ir)
-    self_T = get_operand_type(self_arg, ir)
-    self_T = self_T isa Core.Const ? self_T.val : self_T
-    other_T = get_operand_type(other_arg, ir)
-    other_T = other_T isa Core.Const ? other_T.val : other_T
-    ct_self = try cranelift_type(self_T) catch; UInt32(0xFF) end
-    ct_other = try cranelift_type(other_T) catch; UInt32(0xFF) end
-    if _is_narrow_ct(ct_self) && _is_wide_ct(ct_other) && ct_self != ct_other
+    # Use actual Cranelift types (queried from Rust) instead of Julia types.
+    # Julia types may not match Cranelift widths due to narrowing/widening.
+    get_ct = Libdl.dlsym(bc.lib_handle, :block_get_ssa_type)
+    ct_self = ccall(get_ct, UInt32, (Ptr{Cvoid}, UInt32), bc.fctx_handle, self_id)
+    ct_other = ccall(get_ct, UInt32, (Ptr{Cvoid}, UInt32), bc.fctx_handle, other_id)
+    if _is_narrow_ct(ct_self) && _is_wide_ct(ct_other)
         ext_ptr = Libdl.dlsym(bc.lib_handle, :block_add_uextend)
         return ccall(ext_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
                     bc.fctx_handle, self_id, ct_other)
     end
+    # If self is wide and other is narrow, the other operand's call to this
+    # function will extend it.  We just return self unchanged.
     return self_id
 end
 
@@ -819,11 +1197,17 @@ _unwrap_type(T) = T isa Core.Const ? T.val :
 
 function emit_convert(bc::BuilderCtx, ffi_sym::Symbol, args, ir)
     length(args) < 2 && error("Convert needs 2 args")
-    # Julia conversion intrinsics are (Type, value): e.g. sext_int(Int64, x),
-    # sitofp(Float64, x), fptosi(Int64, x). args[1] is the target type.
     to_T = _unwrap_type(args[1])
     val = resolve_operand(bc, args[2], ir)
     to_type_enum = cranelift_type(to_T)
+    # Skip no-op conversions using actual Cranelift types
+    if ffi_sym in (:block_add_uextend, :block_add_sextend, :block_add_ireduce)
+        get_ct = Libdl.dlsym(bc.lib_handle, :block_get_ssa_type)
+        from_ct = ccall(get_ct, UInt32, (Ptr{Cvoid}, UInt32), bc.fctx_handle, val)
+        if from_ct == to_type_enum
+            return val  # source already at target width — skip
+        end
+    end
     fn_ptr = Libdl.dlsym(bc.lib_handle, ffi_sym)
     return ccall(fn_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
                  bc.fctx_handle, val, to_type_enum)
@@ -831,14 +1215,16 @@ end
 
 function emit_trunc(bc::BuilderCtx, args, ir)
     length(args) < 2 && error("trunc needs 2 args")
-    # trunc_int(Int8, x) — args[1] is the (narrower) target type.
     to_T = _unwrap_type(args[1])
     val = resolve_operand(bc, args[2], ir)
-    # Use the REAL bit-width type for ireduce, NOT the storage type.
-    # cranelift_type returns TYPE_I32 for sub-word storage, but ireduce
-    # must narrow to the actual bit width (types::I8 / types::I16).
     sz = sizeof(to_T)
     to_type_enum = sz == 1 ? TYPE_I8 : sz == 2 ? TYPE_I16 : cranelift_type(to_T)
+    # Skip no-op trunc
+    get_ct = Libdl.dlsym(bc.lib_handle, :block_get_ssa_type)
+    from_ct = ccall(get_ct, UInt32, (Ptr{Cvoid}, UInt32), bc.fctx_handle, val)
+    if from_ct == to_type_enum
+        return val
+    end
     fn_ptr = Libdl.dlsym(bc.lib_handle, :block_add_ireduce)
     reduced = ccall(fn_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
                     bc.fctx_handle, val, to_type_enum)
@@ -1132,6 +1518,17 @@ function emit_invoke(bc::BuilderCtx, invoke_target, f, args, ir, stmt_idx)
     elseif fn_name == :codeunit && length(args) >= 2
         return emit_string_codeunit(bc, args, ir)
     elseif fn_name == :sizeof && length(args) >= 1
+        # sizeof(T) for a type argument — compute at compile time
+        local sz_T = nothing
+        if args[1] isa QuoteNode; sz_T = args[1].value
+        elseif args[1] isa Core.Const; sz_T = args[1].val
+        elseif args[1] isa DataType; sz_T = args[1]
+        end
+        if sz_T isa DataType
+            return emit_constant(bc, Int64(try sizeof(sz_T) catch; 8 end))
+        elseif sz_T isa UnionAll || sz_T isa Union
+            return emit_constant(bc, Int64(8))
+        end
         # sizeof(s::String) == ncodeunits(s)
         return emit_string_ncodeunits(bc, args, ir)
     elseif fn_name == :isempty && length(args) >= 1
@@ -1272,7 +1669,57 @@ function emit_invoke(bc::BuilderCtx, invoke_target, f, args, ir, stmt_idx)
         end
     end
 
-    # Unknown invoke — emit sentinel with inferred return type's width
+    # Unknown invoke — two paths depending on compilation mode:
+    # 1. Recursive (bc.module_compiler set): enqueue callee and emit cross-function call.
+    #    Mirrors WasmCodegen's request! + CallTarget pattern (compiler.jl line 1451-1452).
+    # 2. Single-function: emit sentinel constant (backward compat for non-recursive mode).
+    mc = bc.module_compiler
+    if mc !== nothing && callee_mi isa Core.MethodInstance
+        # Try to resolve the callee's IR. If cranelift_type throws (e.g. Union{}
+        # return in dead error paths), fall through to the sentinel constant.
+        local callee_rt_enum, callee_param_types
+        local got_ir = false
+        try
+            callee_result = Base.code_ircode_by_type(callee_mi.specTypes;
+                                                      world=mc.interp.world, interp=mc.interp)
+            if length(callee_result) == 1
+                callee_ir, callee_rettype = callee_result[1]
+                # CFG sanity: skip cross-call if callee has successor blocks
+                # outside cfg.blocks (causes "invalid block reference" verifier error)
+                local cfg_ok = true
+                local nblocks = length(callee_ir.cfg.blocks)
+                for blk in callee_ir.cfg.blocks
+                    for s in blk.succs
+                        if s < 1 || s > nblocks; cfg_ok = false; break; end
+                    end
+                    cfg_ok || break
+                end
+                if cfg_ok
+                    callee_rt_enum = cranelift_type(callee_rettype)
+                    callee_param_types = UInt32[cranelift_type(_ir_type(t))
+                                                 for t in callee_ir.argtypes[2:end]]
+                    got_ir = true
+                end
+            end
+        catch _
+        end
+        if got_ir
+            callee_name = request!(mc, callee_mi)
+            # Pre-declare the callee in the ObjectModule so cross-calls can resolve it
+            decl_ptr = Libdl.dlsym(bc.lib_handle, :builder_declare_self_function)
+            ccall(decl_ptr, Cint,
+                  (Ptr{Cvoid}, Ptr{UInt8}, UInt32, Ptr{UInt32}, Csize_t),
+                  bc.builder_handle, callee_name, callee_rt_enum,
+                  callee_param_types, length(callee_param_types))
+            # Emit args and cross-function call
+            arg_ids = UInt32[resolve_operand(bc, a, ir) for a in args]
+            call_ptr = Libdl.dlsym(bc.lib_handle, :block_add_call)
+            return ccall(call_ptr, UInt32,
+                         (Ptr{Cvoid}, Ptr{Cvoid}, Cstring, Ptr{UInt32}, Csize_t),
+                         bc.fctx_handle, bc.builder_handle, callee_name, arg_ids, length(arg_ids))
+        end
+    end
+    # Fallback: emit sentinel constant (single-function mode or failed resolution)
     local sentinel_ty
     try
         inferred = ir.stmts[stmt_idx][:type]
@@ -1348,6 +1795,7 @@ function emit_globalref(bc::BuilderCtx, f::Core.GlobalRef, args, ir, stmt_idx)
     if fn == :uge_int ; return emit_icmp(bc, ICMP_UGE, args, ir) end
 
     # === Integer bitwise (may also be used as not_int) ===
+    if fn == :neg_int || fn == :neg_int ; return emit_neg_int(bc, args, ir) end
     if fn == :not_int ; return emit_not_int(bc, args, ir) end
     if fn == :and_int || fn == :& ; return emit_binop(bc, :block_add_band, args, ir) end
     if fn == :or_int || fn == :|  ; return emit_binop(bc, :block_add_bor, args, ir) end
@@ -1398,6 +1846,25 @@ function emit_globalref(bc::BuilderCtx, f::Core.GlobalRef, args, ir, stmt_idx)
     if fn == :fptoui ; return emit_convert(bc, :block_add_fcvt_to_uint_sat, args, ir) end
     if fn == :fpext  ; return emit_convert(bc, :block_add_fpromote, args, ir) end
     if fn == :fptrunc ; return emit_convert(bc, :block_add_fdemote, args, ir) end
+
+    # === Type introspection (nfields, etc.) ===
+    if fn == :nfields && length(args) >= 1
+        # nfields(T) returns the number of fields in type T.
+        # Resolve at compile time if the type is a constant.
+        a1 = args[1]
+        local nf::Int
+        if a1 isa QuoteNode
+            nf = fieldcount(a1.value)
+        elseif a1 isa Core.Const
+            nf = fieldcount(a1.val)
+        elseif a1 isa DataType
+            nf = fieldcount(a1)
+        else
+            # Dynamic type — emit 0 as fallback
+            nf = 0
+        end
+        return emit_constant(bc, Int32(Int(nf)))
+    end
 
     # === Struct field access ===
     if fn == :getfield && length(args) >= 2
@@ -1737,9 +2204,14 @@ function emit_struct_getfield(bc::BuilderCtx, args, ir, stmt_idx)
 
         # Sign extend if field type is signed and smaller than struct size
         if field_T <: Signed && field_size < struct_size
-            # Sign extend from field_size to struct_size
             target_type = cranelift_type(field_T)
             sext_ptr = Libdl.dlsym(bc.lib_handle, :block_add_sextend)
+            # Skip if source already matches target (avoid verifier error)
+            get_ct = Libdl.dlsym(bc.lib_handle, :block_get_ssa_type)
+            from_ct = ccall(get_ct, UInt32, (Ptr{Cvoid}, UInt32), bc.fctx_handle, masked_id)
+            if from_ct == target_type
+                return masked_id
+            end
             return ccall(sext_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
                           bc.fctx_handle, masked_id, target_type)
         else

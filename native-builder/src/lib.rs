@@ -10,7 +10,7 @@ mod builder;
 mod linker;
 mod runtime;
 
-use builder::{BuilderContext, FunctionCtx, map_icmp_cond, map_fcmp_cond};
+use builder::{BuilderContext, FunctionCtx, map_icmp_cond, map_fcmp_cond, TYPE_I64};
 
 // Thread-safe builder registry
 struct Bp(*mut BuilderContext); unsafe impl Send for Bp {}
@@ -209,6 +209,11 @@ ffi_unop!(block_add_bswap, emit_bswap);
             Err(e) => { eprintln!("[native-builder] finalize error: {}", e); -1 },
         }
     }
+}
+
+#[no_mangle] pub extern "C" fn block_get_ssa_type(fctx: *mut FunctionCtx, id: u32) -> u32 {
+    if fctx.is_null() { return TYPE_I64 as u32; }
+    unsafe { (*fctx).get_ssa_type(id) }
 }
 
 #[no_mangle] pub extern "C" fn link_object_to_so(uo: *const c_char, rl: *const c_char, so: *const c_char) -> c_int {

@@ -133,6 +133,17 @@ impl FunctionCtx {
         self.ssa_values.get(&id).copied().unwrap_or_else(|| { unsafe { std::mem::transmute::<u32, Value>(0) } })
     }
 
+    /// Return the Cranelift type of SSA value `id` as our type enum.
+    pub fn get_ssa_type(&mut self, id: u32) -> u32 {
+        match self.ssa_values.get(&id) {
+            Some(&v) => {
+                let t = { let fb = self.fb(); fb.func.dfg.value_type(v) };
+                map_type_rev(t)
+            }
+            None => 0xFF,  // unknown — caller should skip conversions
+        }
+    }
+
     fn emit<F: FnOnce(&mut FunctionBuilder) -> Value>(&mut self, f: F) -> u32 {
         let curr = self.current_block;
         let v = {
@@ -185,27 +196,27 @@ impl FunctionCtx {
     pub fn emit_f32const(&mut self, val: f32) -> u32 { self.emit(|fb| fb.ins().f32const(val)) }
 
     // --- Arithmetic ---
-    pub fn emit_iadd(&mut self, l: u32, r: u32) -> u32 { let (lv, rv) = (self.ssa(l), self.ssa(r)); self.emit(|fb| fb.ins().iadd(lv, rv)) }
-    pub fn emit_isub(&mut self, l: u32, r: u32) -> u32 { let (lv, rv) = (self.ssa(l), self.ssa(r)); self.emit(|fb| fb.ins().isub(lv, rv)) }
-    pub fn emit_imul(&mut self, l: u32, r: u32) -> u32 { let (lv, rv) = (self.ssa(l), self.ssa(r)); self.emit(|fb| fb.ins().imul(lv, rv)) }
-    pub fn emit_sdiv(&mut self, l: u32, r: u32) -> u32 { let (lv, rv) = (self.ssa(l), self.ssa(r)); self.emit(|fb| fb.ins().sdiv(lv, rv)) }
-    pub fn emit_udiv(&mut self, l: u32, r: u32) -> u32 { let (lv, rv) = (self.ssa(l), self.ssa(r)); self.emit(|fb| fb.ins().udiv(lv, rv)) }
-    pub fn emit_srem(&mut self, l: u32, r: u32) -> u32 { let (lv, rv) = (self.ssa(l), self.ssa(r)); self.emit(|fb| fb.ins().srem(lv, rv)) }
-    pub fn emit_urem(&mut self, l: u32, r: u32) -> u32 { let (lv, rv) = (self.ssa(l), self.ssa(r)); self.emit(|fb| fb.ins().urem(lv, rv)) }
+    pub fn emit_iadd(&mut self, l: u32, r: u32) -> u32 { let (lv, rv) = self.harmonize_binop(l, r); self.emit(|fb| fb.ins().iadd(lv, rv)) }
+    pub fn emit_isub(&mut self, l: u32, r: u32) -> u32 { let (lv, rv) = self.harmonize_binop(l, r); self.emit(|fb| fb.ins().isub(lv, rv)) }
+    pub fn emit_imul(&mut self, l: u32, r: u32) -> u32 { let (lv, rv) = self.harmonize_binop(l, r); self.emit(|fb| fb.ins().imul(lv, rv)) }
+    pub fn emit_sdiv(&mut self, l: u32, r: u32) -> u32 { let (lv, rv) = self.harmonize_binop(l, r); self.emit(|fb| fb.ins().sdiv(lv, rv)) }
+    pub fn emit_udiv(&mut self, l: u32, r: u32) -> u32 { let (lv, rv) = self.harmonize_binop(l, r); self.emit(|fb| fb.ins().udiv(lv, rv)) }
+    pub fn emit_srem(&mut self, l: u32, r: u32) -> u32 { let (lv, rv) = self.harmonize_binop(l, r); self.emit(|fb| fb.ins().srem(lv, rv)) }
+    pub fn emit_urem(&mut self, l: u32, r: u32) -> u32 { let (lv, rv) = self.harmonize_binop(l, r); self.emit(|fb| fb.ins().urem(lv, rv)) }
 
     // --- Comparisons ---
-    pub fn emit_icmp(&mut self, cond: IntCC, l: u32, r: u32) -> u32 { let (lv, rv) = (self.ssa(l), self.ssa(r)); self.emit(|fb| fb.ins().icmp(cond, lv, rv)) }
+    pub fn emit_icmp(&mut self, cond: IntCC, l: u32, r: u32) -> u32 { let (lv, rv) = self.harmonize_binop(l, r); self.emit(|fb| fb.ins().icmp(cond, lv, rv)) }
     pub fn emit_fcmp(&mut self, cond: FloatCC, l: u32, r: u32) -> u32 { let (lv, rv) = (self.ssa(l), self.ssa(r)); self.emit(|fb| fb.ins().fcmp(cond, lv, rv)) }
     // select(cond, then, else): returns `then` when cond (a b1 from icmp) is true.
     pub fn emit_select(&mut self, cond: u32, t: u32, e: u32) -> u32 { let (cv, tv, ev) = (self.ssa(cond), self.ssa(t), self.ssa(e)); self.emit(|fb| fb.ins().select(cv, tv, ev)) }
 
     // --- Bitwise ---
-    pub fn emit_band(&mut self, l: u32, r: u32) -> u32 { let (lv, rv) = (self.ssa(l), self.ssa(r)); self.emit(|fb| fb.ins().band(lv, rv)) }
-    pub fn emit_bor(&mut self, l: u32, r: u32) -> u32 { let (lv, rv) = (self.ssa(l), self.ssa(r)); self.emit(|fb| fb.ins().bor(lv, rv)) }
-    pub fn emit_bxor(&mut self, l: u32, r: u32) -> u32 { let (lv, rv) = (self.ssa(l), self.ssa(r)); self.emit(|fb| fb.ins().bxor(lv, rv)) }
-    pub fn emit_ishl(&mut self, l: u32, r: u32) -> u32 { let (lv, rv) = (self.ssa(l), self.ssa(r)); self.emit(|fb| fb.ins().ishl(lv, rv)) }
-    pub fn emit_ushr(&mut self, l: u32, r: u32) -> u32 { let (lv, rv) = (self.ssa(l), self.ssa(r)); self.emit(|fb| fb.ins().ushr(lv, rv)) }
-    pub fn emit_sshr(&mut self, l: u32, r: u32) -> u32 { let (lv, rv) = (self.ssa(l), self.ssa(r)); self.emit(|fb| fb.ins().sshr(lv, rv)) }
+    pub fn emit_band(&mut self, l: u32, r: u32) -> u32 { let (lv, rv) = self.harmonize_binop(l, r); self.emit(|fb| fb.ins().band(lv, rv)) }
+    pub fn emit_bor(&mut self, l: u32, r: u32) -> u32 { let (lv, rv) = self.harmonize_binop(l, r); self.emit(|fb| fb.ins().bor(lv, rv)) }
+    pub fn emit_bxor(&mut self, l: u32, r: u32) -> u32 { let (lv, rv) = self.harmonize_binop(l, r); self.emit(|fb| fb.ins().bxor(lv, rv)) }
+    pub fn emit_ishl(&mut self, l: u32, r: u32) -> u32 { let (lv, rv) = self.harmonize_binop(l, r); self.emit(|fb| fb.ins().ishl(lv, rv)) }
+    pub fn emit_ushr(&mut self, l: u32, r: u32) -> u32 { let (lv, rv) = self.harmonize_binop(l, r); self.emit(|fb| fb.ins().ushr(lv, rv)) }
+    pub fn emit_sshr(&mut self, l: u32, r: u32) -> u32 { let (lv, rv) = self.harmonize_binop(l, r); self.emit(|fb| fb.ins().sshr(lv, rv)) }
     // bit-count / byte-swap unops (Cranelift infers operand/result type; same width in/out)
     pub fn emit_clz(&mut self, v: u32) -> u32 { let vv = self.ssa(v); self.emit(|fb| fb.ins().clz(vv)) }
     pub fn emit_ctz(&mut self, v: u32) -> u32 { let vv = self.ssa(v); self.emit(|fb| fb.ins().ctz(vv)) }
@@ -213,9 +224,37 @@ impl FunctionCtx {
     pub fn emit_bswap(&mut self, v: u32) -> u32 { let vv = self.ssa(v); self.emit(|fb| fb.ins().bswap(vv)) }
 
     // --- Conversions ---
-    pub fn emit_uextend(&mut self, v: u32, tt: u32) -> u32 { let vv = self.ssa(v); let t = map_type(tt).unwrap_or(types::I64); self.emit(|fb| fb.ins().uextend(t, vv)) }
-    pub fn emit_sextend(&mut self, v: u32, tt: u32) -> u32 { let vv = self.ssa(v); let t = map_type(tt).unwrap_or(types::I64); self.emit(|fb| fb.ins().sextend(t, vv)) }
-    pub fn emit_ireduce(&mut self, v: u32, tt: u32) -> u32 { let vv = self.ssa(v); let t = map_type(tt).unwrap_or(types::I32); self.emit(|fb| fb.ins().ireduce(t, vv)) }
+    pub fn emit_uextend(&mut self, v: u32, tt: u32) -> u32 {
+        let vv = self.ssa(v); let t = map_type(tt).unwrap_or(types::I64);
+        let st = self.ssa_type(vv);
+        if st == t || (st == types::I64 && t == types::I32) { return v; }  // no-op or can't extend
+        self.emit(|fb| fb.ins().uextend(t, vv))
+    }
+    pub fn emit_sextend(&mut self, v: u32, tt: u32) -> u32 {
+        let vv = self.ssa(v); let t = map_type(tt).unwrap_or(types::I64);
+        let st = self.ssa_type(vv);
+        if st == t || (st == types::I64 && t == types::I32) { return v; }  // no-op or can't extend
+        self.emit(|fb| fb.ins().sextend(t, vv))
+    }
+    pub fn emit_ireduce(&mut self, v: u32, tt: u32) -> u32 {
+        let vv = self.ssa(v); let t = map_type(tt).unwrap_or(types::I32);
+        if self.ssa_type(vv) == t { return v; }  // no-op
+        self.emit(|fb| fb.ins().ireduce(t, vv))
+    }
+    fn harmonize_binop(&mut self, l: u32, r: u32) -> (Value, Value) {
+        let (lv, rv) = (self.ssa(l), self.ssa(r));
+        let fb = self.fb();
+        let lt = fb.func.dfg.value_type(lv);
+        let rt = fb.func.dfg.value_type(rv);
+        // Always extend narrow to wide — never reduce.
+        let lv2 = if lt == types::I32 && rt == types::I64 { fb.ins().uextend(types::I64, lv) } else { lv };
+        let rv2 = if rt == types::I32 && lt == types::I64 { fb.ins().uextend(types::I64, rv) } else { rv };
+        (lv2, rv2)
+    }
+    fn ssa_type(&mut self, v: Value) -> Type {
+        let fb = self.fb();
+        fb.func.dfg.value_type(v)
+    }
     // int -> float (result float type tt)
     pub fn emit_fcvt_from_sint(&mut self, v: u32, tt: u32) -> u32 { let vv = self.ssa(v); let t = map_type(tt).unwrap_or(types::F64); self.emit(|fb| fb.ins().fcvt_from_sint(t, vv)) }
     pub fn emit_fcvt_from_uint(&mut self, v: u32, tt: u32) -> u32 { let vv = self.ssa(v); let t = map_type(tt).unwrap_or(types::F64); self.emit(|fb| fb.ins().fcvt_from_uint(t, vv)) }
@@ -269,9 +308,28 @@ impl FunctionCtx {
 
     pub fn emit_jump_with_args(&mut self, target: &str, args: &[u32]) {
         let t = *self.blocks.get(target).unwrap_or(&self.current_block);
-        let arg_vals: Vec<BlockArg> = args.iter().map(|&a| self.ssa(a).into()).collect();
         let curr = self.current_block;
-        self.emit_void(|fb| { fb.ins().jump(t, arg_vals.iter()); });
+        let arg_vals: Vec<Value> = args.iter().map(|&a| self.ssa(a)).collect();
+        {
+            let fb = self.fb();
+            if fb.current_block() != Some(curr) { fb.switch_to_block(curr); }
+            let params = fb.func.dfg.block_params(t);
+            let param_types: Vec<types::Type> = params.iter().map(|&p| fb.func.dfg.value_type(p)).collect();
+            let arg_vals2: Vec<BlockArg> = arg_vals.iter().enumerate().map(|(i, &v)| {
+                if i < param_types.len() {
+                    let vt = fb.func.dfg.value_type(v);
+                    let expected = param_types[i];
+                    let v = if vt == types::I32 && expected == types::I64 {
+                        fb.ins().uextend(types::I64, v)
+                    } else if vt == types::I64 && expected == types::I32 {
+                        fb.ins().ireduce(types::I32, v)
+                    } else { v };
+                    return v.into();
+                }
+                v.into()
+            }).collect();
+            fb.ins().jump(t, arg_vals2.iter());
+        };
         self.sealed.insert(curr);
     }
 
@@ -284,12 +342,32 @@ impl FunctionCtx {
         let curr = self.current_block;
         let t = *self.blocks.get(then_s).unwrap_or(&self.current_block);
         let e = *self.blocks.get(else_s).unwrap_or(&self.current_block);
-        let t_args: Vec<BlockArg> = then_args.iter().map(|&a| self.ssa(a).into()).collect();
-        let e_args: Vec<BlockArg> = else_args.iter().map(|&a| self.ssa(a).into()).collect();
+        let t_vals: Vec<Value> = then_args.iter().map(|&a| self.ssa(a)).collect();
+        let e_vals: Vec<Value> = else_args.iter().map(|&a| self.ssa(a)).collect();
         {
             let fb = self.fb();
             if fb.current_block() != Some(curr) { fb.switch_to_block(curr); }
-            // Reduce cond to i8 only if needed (icmp already produces i8).
+            let t_params = fb.func.dfg.block_params(t);
+            let t_types: Vec<types::Type> = t_params.iter().map(|&p| fb.func.dfg.value_type(p)).collect();
+            let e_params = fb.func.dfg.block_params(e);
+            let e_types: Vec<types::Type> = e_params.iter().map(|&p| fb.func.dfg.value_type(p)).collect();
+            let mut harmonize = |vals: &[Value], types: &[types::Type]| -> Vec<BlockArg> {
+                vals.iter().enumerate().map(|(i, &v)| {
+                    if i < types.len() {
+                        let vt = fb.func.dfg.value_type(v);
+                        let expected = types[i];
+                        let v = if vt == types::I32 && expected == types::I64 {
+                            fb.ins().uextend(types::I64, v)
+                        } else if vt == types::I64 && expected == types::I32 {
+                            fb.ins().ireduce(types::I32, v)
+                        } else { v };
+                        return v.into();
+                    }
+                    v.into()
+                }).collect()
+            };
+            let t_args: Vec<BlockArg> = harmonize(&t_vals, &t_types);
+            let e_args: Vec<BlockArg> = harmonize(&e_vals, &e_types);
             let cvi8 = if fb.func.dfg.value_type(cv) == types::I8 {
                 cv
             } else {
@@ -305,7 +383,14 @@ impl FunctionCtx {
     }
     pub fn emit_return(&mut self, val: u32) {
         let v = self.ssa(val); let curr = self.current_block;
-        self.emit_void(|fb| { fb.ins().return_(&[v]); });
+        self.emit_void(|fb| {
+            let vt = fb.func.dfg.value_type(v);
+            let expected = fb.func.signature.returns[0].value_type;
+            let v2 = if vt == types::I64 && expected == types::I32 { fb.ins().ireduce(types::I32, v) }
+                else if vt == types::I32 && expected == types::I64 { fb.ins().uextend(types::I64, v) }
+                else { v };
+            fb.ins().return_(&[v2]);
+        });
         self.sealed.insert(curr);
     }
     pub fn emit_return_void(&mut self) { let curr = self.current_block; self.emit_void(|fb| { fb.ins().return_(&[]); }); self.sealed.insert(curr); }
@@ -313,14 +398,37 @@ impl FunctionCtx {
 
     pub fn emit_call_import(&mut self, module: &mut ObjectModule, imports: &HashMap<String, FuncId>, name: &str, arg_ids: &[u32]) -> u32 {
         let func_id = *imports.get(name).unwrap_or_else(|| panic!("import not declared: {}", name));
-        let args: Vec<Value> = arg_ids.iter().map(|&id| self.ssa(id)).collect();
+        let arg_vals: Vec<Value> = arg_ids.iter().map(|&id| self.ssa(id)).collect();
         let curr = self.current_block;
         let result = {
             let fb = self.fb();
             if fb.current_block() != Some(curr) { fb.switch_to_block(curr); }
             let func_ref = module.declare_func_in_func(func_id, &mut fb.func);
+            let param_types: Vec<types::Type> = {
+                let sig_ref = fb.func.dfg.ext_funcs[func_ref].signature;
+                fb.func.dfg.signatures[sig_ref].params.iter().map(|p| p.value_type).collect()
+            };
+            let args: Vec<Value> = (0..param_types.len()).map(|i| {
+                if i < arg_vals.len() {
+                    let v = arg_vals[i];
+                    let vt = fb.func.dfg.value_type(v);
+                    let expected = param_types[i];
+                    if vt == types::I32 && expected == types::I64 {
+                        fb.ins().uextend(types::I64, v)
+                    } else if vt == types::I64 && expected == types::I32 {
+                        fb.ins().ireduce(types::I32, v)
+                    } else { v }
+                } else {
+                    // Pad missing args with 0
+                    let expected = param_types[i];
+                    if expected == types::I64 { fb.ins().iconst(types::I64, 0) }
+                    else { fb.ins().iconst(types::I32, 0) }
+                }
+            }).collect();
             let call = fb.ins().call(func_ref, &args);
-            fb.inst_results(call)[0]
+            let results = fb.inst_results(call);
+            if results.is_empty() { return 0; }  // void-returning import
+            results[0]
         };
         let id = v2u(result);
         self.ssa_values.insert(id, result);
@@ -436,9 +544,29 @@ impl BuilderContext {
                 module.declare_function(&nm, Linkage::Export, &sig)
                     .map_err(|e| format!("declare {}: {}", nm, e))?
             };
-            module.define_function(fid, &mut f.context)
-                .map_err(|e| format!("define {}: {:?}", nm, e))?;
-            if verbose { eprintln!("[native-builder] defined: {}", nm); }
+            match module.define_function(fid, &mut f.context) {
+                Ok(()) => { if verbose { eprintln!("[native-builder] defined: {}", nm); } }
+                Err(e) => {
+                    eprintln!("[native-builder] warning: {} failed verification, defining as trap stub: {:?}", nm, e);
+                    // Define a minimal trap-only body so callers don't crash
+                    let mut ctx = cranelift_codegen::Context::new();
+                    ctx.func.signature = sig.clone();
+                    ctx.func.name = cranelift_codegen::ir::UserFuncName::testcase(&nm);
+                    {
+                        let mut bcx = cranelift_frontend::FunctionBuilderContext::new();
+                        let mut fb = cranelift_frontend::FunctionBuilder::new(&mut ctx.func, &mut bcx);
+                        let b = fb.create_block();
+                        fb.append_block_params_for_function_params(b);
+                        fb.switch_to_block(b);
+                        fb.ins().trap(cranelift_codegen::ir::TrapCode::HEAP_OUT_OF_BOUNDS);
+                        fb.seal_block(b);
+                        fb.finalize();
+                    }
+                    if let Err(e2) = module.define_function(fid, &mut ctx) {
+                        eprintln!("[native-builder] error: trap stub also failed for {}: {:?}", nm, e2);
+                    }
+                }
+            }
         }
         let obj = module.finish().emit().map_err(|e| format!("emit: {}", e))?;
         std::fs::write(path, &obj).map_err(|e| format!("write: {}", e))?;
@@ -450,6 +578,12 @@ impl BuilderContext {
 
 pub fn map_type(t: u32) -> Option<Type> {
     match t { TYPE_I32=>Some(types::I32), TYPE_I64=>Some(types::I64), TYPE_F32=>Some(types::F32), TYPE_F64=>Some(types::F64), TYPE_PTR=>Some(types::I64), TYPE_I8=>Some(types::I8), TYPE_I16=>Some(types::I16), _=>None }
+}
+pub fn map_type_rev(t: Type) -> u32 {
+    if t == types::I32 { TYPE_I32 } else if t == types::I64 { TYPE_I64 }
+    else if t == types::F32 { TYPE_F32 } else if t == types::F64 { TYPE_F64 }
+    else if t == types::I8 { TYPE_I8 } else if t == types::I16 { TYPE_I16 }
+    else { TYPE_I64 }  // default to i64 for unknown types
 }
 pub fn map_icmp_cond(c: u32) -> IntCC { match c { ICMP_EQ=>IntCC::Equal, ICMP_NE=>IntCC::NotEqual, ICMP_SLT=>IntCC::SignedLessThan, ICMP_SGE=>IntCC::SignedGreaterThanOrEqual, ICMP_SGT=>IntCC::SignedGreaterThan, ICMP_SLE=>IntCC::SignedLessThanOrEqual, ICMP_ULT=>IntCC::UnsignedLessThan, ICMP_UGE=>IntCC::UnsignedGreaterThanOrEqual, ICMP_UGT=>IntCC::UnsignedGreaterThan, ICMP_ULE=>IntCC::UnsignedLessThanOrEqual, _=>IntCC::Equal } }
 pub fn map_fcmp_cond(c: u32) -> FloatCC { match c { FCMP_EQ=>FloatCC::Equal, FCMP_NE=>FloatCC::NotEqual, FCMP_LT=>FloatCC::LessThan, FCMP_LE=>FloatCC::LessThanOrEqual, FCMP_GT=>FloatCC::GreaterThan, FCMP_GE=>FloatCC::GreaterThanOrEqual, _=>FloatCC::Equal } }

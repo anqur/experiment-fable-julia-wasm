@@ -83,17 +83,23 @@ function _debug_artifact(target_dir, lib_name)
     isfile(path) ? path : nothing
 end
 
-function compile_native(f, argtypes::Type{<:Tuple}; name::String="entry")
+function compile_native(f, argtypes::Type{<:Tuple}; name::String="entry",
+                        recursive::Bool=true)
     interp = WasmInterp()
-
-    # Prefix the exported symbol so it cannot collide with a Cranelift libcall
-    # (see ENTRY_SYMBOL_PREFIX). `name` is just a human label; the symbol is
-    # derived from it and used consistently for both emission and dlsym.
     symbol = ENTRY_SYMBOL_PREFIX * name
-
-    # Generate object file via eDSL builder
     temp_obj = tempname() * ".o"
-    emit_function_via_builder(interp, f, argtypes; name=symbol, output_path=temp_obj)
+    if recursive
+        try
+            emit_module_via_builder(interp, f, argtypes; name=symbol, output_path=temp_obj)
+        catch e
+            if e isa InterruptException; rethrow(); end
+            # Fall back to single-function mode on any failure
+            @warn "Recursive compilation failed, falling back to single-function mode" exception = e
+            emit_function_via_builder(interp, f, argtypes; name=symbol, output_path=temp_obj)
+        end
+    else
+        emit_function_via_builder(interp, f, argtypes; name=symbol, output_path=temp_obj)
+    end
 
     # Link object file with runtime library to create final .so
     builder_lib = _init_builder_lib()
