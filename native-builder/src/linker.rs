@@ -58,17 +58,8 @@ pub fn link_object_to_so(user_object: &Path, runtime_lib: &Path, so_path: &Path)
        .arg(flavor)
        .arg(shared_flag)
        .arg("-o").arg(so_path)
-       .arg(user_object);
-    // Force all symbols from libnative_backend.a to be included, even
-    // those not directly referenced by the object file (needed for dlsym
-    // access to __native_set_parse_stream_fn etc. from Julia).
-    if cfg!(target_os = "linux") {
-        cmd.arg("--whole-archive");
-    }
-    cmd.arg(runtime_lib);
-    if cfg!(target_os = "linux") {
-        cmd.arg("--no-whole-archive");
-    }
+       .arg(user_object)
+       .arg(runtime_lib);
 
     // macOS: specify architecture.  The .so may have undefined libSystem symbols
     // (bzero, memcpy, abort, __Unwind_Resume, Cranelift libcalls, etc.) which

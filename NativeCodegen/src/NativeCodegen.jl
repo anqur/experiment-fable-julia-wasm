@@ -83,23 +83,11 @@ function _debug_artifact(target_dir, lib_name)
     isfile(path) ? path : nothing
 end
 
-function compile_native(f, argtypes::Type{<:Tuple}; name::String="entry",
-                        recursive::Bool=true)
+function compile_native(f, argtypes::Type{<:Tuple}; name::String="entry")
     interp = WasmInterp()
     symbol = ENTRY_SYMBOL_PREFIX * name
     temp_obj = tempname() * ".o"
-    if recursive
-        try
-            emit_module_via_builder(interp, f, argtypes; name=symbol, output_path=temp_obj)
-        catch e
-            if e isa InterruptException; rethrow(); end
-            # Fall back to single-function mode on any failure
-            @warn "Recursive compilation failed, falling back to single-function mode" exception = e
-            emit_function_via_builder(interp, f, argtypes; name=symbol, output_path=temp_obj)
-        end
-    else
-        emit_function_via_builder(interp, f, argtypes; name=symbol, output_path=temp_obj)
-    end
+    emit_module_via_builder(interp, f, argtypes; name=symbol, output_path=temp_obj)
 
     # Link object file with runtime library to create final .so
     builder_lib = _init_builder_lib()

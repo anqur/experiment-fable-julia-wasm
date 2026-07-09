@@ -194,7 +194,7 @@ function free_builder(bc::BuilderCtx)
     end
 end
 
-# === Module-level recursive compilation ===
+
 # Mirrors WasmCodegen's ModuleCompiler + worklist pattern (compiler.jl lines 420-460,
 # 2160-2189). Instead of compiling one function at a time, we compile the ENTIRE
 # transitive call graph into one ObjectModule → one .o → one .so.
@@ -235,197 +235,6 @@ _ir_type(t::Type) = t
 
 # === Main entry point ===
 
-function emit_function_via_builder(interp::WasmInterp, f, argtypes::Type{<:Tuple};
-                                   name::String="entry", output_path::String=tempname()*".o")
-    tt = Base.signature_type(f, argtypes)
-    matches = Base._methods_by_ftype(tt, -1, interp.world)
-    matches === nothing && error("no method found for $f")
-    mi = Core.Compiler.specialize_method(matches[1].method, tt, Core.svec())
-    result = Base.code_ircode_by_type(mi.specTypes; world=interp.world, interp=interp)
-    length(result) == 1 || throw(CompileError("expected unique match"))
-    ir, rettype = result[1]
-
-    builder_lib = get_native_builder_lib()
-    bc = BuilderCtx(builder_lib)
-
-    try
-        # Declare runtime imports (GC allocation, string ops, etc.)
-        _declare_imports(bc)
-
-        # Register argument values: Julia Argument(1)=function, Argument(2)=first param, ...
-        # Map to 0-based: Argument(2) → 0, Argument(3) → 1, etc.
-        # Use ir.argtypes (not mi.specTypes) because varargs functions have
-        # trailing args packed into a Tuple in the IR but expanded in specTypes.
-        nparams = length(ir.argtypes) - 1  # first is the function itself
-        for i in 1:nparams
-            bc.arg_values[Core.Argument(i + 1)] = UInt32(i - 1)  # first param → 0
-        end
-        # Also map Argument(1) to a sentinel (shouldn't be referenced but just in case)
-        bc.arg_values[Core.Argument(1)] = UInt32(0)
-
-        # Add function to builder
-        ret_type_enum = cranelift_type(rettype)
-        # Use ir.argtypes for param types — mi.specTypes expands varargs, but the
-        # IR packs trailing args into a Tuple that must be passed as TYPE_PTR.
-        param_type_enums = UInt32[cranelift_type(_ir_type(t)) for t in ir.argtypes[2:end]]
-
-        add_func_ptr = Libdl.dlsym(bc.lib_handle, :builder_add_function)
-        bc.fctx_handle = ccall(add_func_ptr, Ptr{Cvoid},
-                                (Ptr{Cvoid}, Ptr{UInt8}, UInt32, Ptr{UInt32}, Csize_t),
-                                bc.builder_handle, name, ret_type_enum,
-                                param_type_enums, length(param_type_enums))
-
-        bc.fctx_handle == C_NULL && error("Failed to add function")
-
-        # Pre-create Cranelift blocks for each Julia basic block
-        cfg = ir.cfg
-        local max_bi_sf = length(cfg.blocks)
-        for block in cfg.blocks
-            for s in block.succs
-                max_bi_sf = max(max_bi_sf, s)
-            end
-        end
-        for bi in 1:length(cfg.blocks)
-            for si in cfg.blocks[bi].stmts
-                e = ir.stmts[si][:stmt]
-                if e isa Core.GotoNode
-                    max_bi_sf = max(max_bi_sf, e.label)
-                elseif e isa Core.GotoIfNot
-                    max_bi_sf = max(max_bi_sf, e.dest)
-                end
-            end
-        end
-        for si in 1:length(ir.stmts)
-            e = try ir.stmts[si][:stmt] catch _; nothing end
-            if e isa Core.GotoNode
-                max_bi_sf = max(max_bi_sf, e.label)
-            elseif e isa Core.GotoIfNot
-                max_bi_sf = max(max_bi_sf, e.dest)
-            elseif e isa Core.PhiNode
-                for edge in e.edges
-                    max_bi_sf = max(max_bi_sf, edge[1])
-                end
-            end
-        end
-        max_bi_sf = max(max_bi_sf, length(cfg.blocks) * 3, length(ir.stmts) + 10)
-        for bi in 1:max_bi_sf
-            block_name = "block$(bi-1)"  # Julia 1-based → Rust 0-based
-            bc.blocks[bi] = block_name
-            if bi == 1
-                # Entry block already exists with function params
-                continue
-            end
-            add_block_ptr = Libdl.dlsym(bc.lib_handle, :function_add_block)
-            ccall(add_block_ptr, Cvoid, (Ptr{Cvoid}, Ptr{UInt8}),
-                  bc.fctx_handle, block_name)
-        end
-
-        # Declare self as callable (enables recursive self-calls).
-        # Uses Linkage::Export so the function can be called from within the module
-        # (via block_add_call) AND as an external entry point after finalization.
-        self_decl_ptr = Libdl.dlsym(bc.lib_handle, :builder_declare_self_function)
-        ccall(self_decl_ptr, Cint,
-              (Ptr{Cvoid}, Ptr{UInt8}, UInt32, Ptr{UInt32}, Csize_t),
-              bc.builder_handle, name, ret_type_enum,
-              param_type_enums, length(param_type_enums))
-        bc.current_func_name = String(name)
-        bc.current_mi = mi
-
-        # Pre-scan for phi nodes: create Cranelift block params
-        add_bp = Libdl.dlsym(bc.lib_handle, :function_add_block_param)
-        for (bi, block) in enumerate(cfg.blocks)
-            block_name = bc.blocks[bi]
-            for si in block.stmts
-                e = ir.stmts[si][:stmt]
-                if e isa Core.PhiNode
-                    phi_type_enum = cranelift_type(ir.stmts[si][:type])
-                    param_id = ccall(add_bp, UInt32, (Ptr{Cvoid}, Ptr{UInt8}, UInt32),
-                                    bc.fctx_handle, block_name, phi_type_enum)
-                    bc.ssa_values[Core.SSAValue(si)] = param_id
-                end
-            end
-        end
-
-        # Process each block
-        for (bi, block) in enumerate(cfg.blocks)
-            block_name = bc.blocks[bi]
-            # Switch to this block
-            switch_ptr = Libdl.dlsym(bc.lib_handle, :function_switch_block)
-            ccall(switch_ptr, Cint, (Ptr{Cvoid}, Ptr{UInt8}),
-                  bc.fctx_handle, block_name)
-
-            # Process statements
-            had_terminator = false
-            for si in block.stmts
-                had_terminator && break
-                e = ir.stmts[si][:stmt]
-                try
-                    emit_instruction(bc, e, ir, si)
-                catch ex
-                    ex isa CompileError || ex isa ErrorException || rethrow()
-                    # Emit sentinel constant on failure
-                    iconst_ptr = Libdl.dlsym(bc.lib_handle, :block_add_iconst)
-                    sentinel_id = ccall(iconst_ptr, UInt32, (Ptr{Cvoid}, Int64, UInt32),
-                                       bc.fctx_handle, Int64(0), TYPE_I64)
-                    bc.ssa_values[Core.SSAValue(si)] = sentinel_id
-                end
-                if e isa Core.GotoNode || e isa Core.GotoIfNot || e isa Core.ReturnNode
-                    had_terminator = true
-                elseif e isa Expr && e.head == :call && length(e.args) >= 1
-                    f = e.args[1]
-                    if f isa Core.GlobalRef
-                        fn_sym = f.name
-                        if fn_sym == :throw || fn_sym == :throw_methoderror ||
-                           fn_sym == :throw_inexacterror || fn_sym == :throw_undef_if_null
-                            had_terminator = true
-                        end
-                    end
-                end
-            end
-
-            # Implicit jump: block has successors but no explicit terminator
-            if !had_terminator && length(block.succs) == 1
-                target_bi = block.succs[1]
-                target_name = bc.blocks[target_bi]
-                phi_args = get_phi_args(ir, bc, bi, target_bi)
-                if isempty(phi_args)
-                    jump_ptr = Libdl.dlsym(bc.lib_handle, :block_add_jump)
-                    ccall(jump_ptr, Cvoid, (Ptr{Cvoid}, Ptr{UInt8}), bc.fctx_handle, target_name)
-                else
-                    jump_ptr = Libdl.dlsym(bc.lib_handle, :block_add_jump_args)
-                    ccall(jump_ptr, Cvoid, (Ptr{Cvoid}, Ptr{UInt8}, Ptr{UInt32}, Csize_t),
-                          bc.fctx_handle, target_name, phi_args, length(phi_args))
-                end
-            end
-
-            # Seal the block
-            seal_ptr = Libdl.dlsym(bc.lib_handle, :function_seal_block)
-            ccall(seal_ptr, Cvoid, (Ptr{Cvoid}, Ptr{UInt8}),
-                  bc.fctx_handle, block_name)
-        end
-
-        # Terminate extra blocks (beyond cfg.blocks) with traps
-        trap_ptr = Libdl.dlsym(bc.lib_handle, :block_add_trap)
-        for bi in (length(cfg.blocks) + 1):max_bi_sf
-            block_name = bc.blocks[bi]
-            switch_ptr_extra = Libdl.dlsym(bc.lib_handle, :function_switch_block)
-            ccall(switch_ptr_extra, Cint, (Ptr{Cvoid}, Ptr{UInt8}), bc.fctx_handle, block_name)
-            ccall(trap_ptr, Cvoid, (Ptr{Cvoid},), bc.fctx_handle)
-            seal_ptr_extra = Libdl.dlsym(bc.lib_handle, :function_seal_block)
-            ccall(seal_ptr_extra, Cvoid, (Ptr{Cvoid}, Ptr{UInt8}), bc.fctx_handle, block_name)
-        end
-
-        # Finalize to object file
-        finalize_ptr = Libdl.dlsym(bc.lib_handle, :builder_finalize)
-        status = ccall(finalize_ptr, Cint, (Ptr{Cvoid}, Ptr{UInt8}),
-                       bc.builder_handle, output_path)
-        status != 0 && error("Builder finalization failed")
-
-        return output_path
-    finally
-        free_builder(bc)
-    end
-end
 
 # === Module-level recursive compilation entry point ===
 # Compiles the ENTIRE transitive call graph of `f` into one ObjectModule.
@@ -476,7 +285,7 @@ function emit_module_via_builder(interp::WasmInterp, f, argtypes::Type{<:Tuple};
 end
 
 # Compile a SINGLE MethodInstance into the shared Module.
-# Extracted from emit_function_via_builder: all functions share one BuilderCtx.
+# All functions share one BuilderCtx.
 function _compile_function_in_module!(mc::ModuleCompiler, mi::Core.MethodInstance)
     bc = mc.bc
     func_name = mc.callee_names[mi]
@@ -524,42 +333,11 @@ function _compile_function_in_module!(mc::ModuleCompiler, mi::Core.MethodInstanc
         bc.current_func_name = func_name
         bc.current_mi = mi
 
-        # Pre-create blocks for ALL indices referenced in the CFG.
+        # Create at least N+1 blocks to cover all possible references.
+        # Each IR statement index doubles as a potential block target.
         cfg = ir.cfg
-        local max_bi = length(cfg.blocks)
-        for block in cfg.blocks
-            for s in block.succs
-                max_bi = max(max_bi, s)
-            end
-        end
-        # Also scan IR statements for GotoNode/GotoIfNot targets
-        # (may reference blocks outside cfg.blocks).
-        for bi in 1:length(cfg.blocks)
-            for si in cfg.blocks[bi].stmts
-                e = ir.stmts[si][:stmt]
-                if e isa Core.GotoNode
-                    max_bi = max(max_bi, e.label)
-                elseif e isa Core.GotoIfNot
-                    max_bi = max(max_bi, e.dest)
-                end
-            end
-        end
-        # Scan ALL IR statements (not just cfg.blocks) for block references
-        for si in 1:length(ir.stmts)
-            e = try ir.stmts[si][:stmt] catch _; nothing end
-            if e isa Core.GotoNode
-                max_bi = max(max_bi, e.label)
-            elseif e isa Core.GotoIfNot
-                max_bi = max(max_bi, e.dest)
-            elseif e isa Core.PhiNode
-                for edge in e.edges
-                    max_bi = max(max_bi, edge[1])
-                end
-            end
-        end
-        # Aggressive safety margin: create blocks up to the IR statement count
-        max_bi = max(max_bi, length(cfg.blocks) * 3, length(ir.stmts) + 10)
-        for bi in 1:max_bi
+        local nblocks = 2048
+        for bi in 1:nblocks
             block_name = "block$(bi-1)"
             bc.blocks[bi] = block_name
             bi == 1 && continue
@@ -641,17 +419,6 @@ function _compile_function_in_module!(mc::ModuleCompiler, mi::Core.MethodInstanc
             seal_ptr = Libdl.dlsym(bc.lib_handle, :function_seal_block)
             ccall(seal_ptr, Cvoid, (Ptr{Cvoid}, Ptr{UInt8}),
                   bc.fctx_handle, block_name)
-        end
-
-        # Terminate extra blocks (beyond cfg.blocks) with traps
-        trap_ptr = Libdl.dlsym(bc.lib_handle, :block_add_trap)
-        for bi in (length(cfg.blocks) + 1):max_bi
-            block_name = bc.blocks[bi]
-            switch_ptr = Libdl.dlsym(bc.lib_handle, :function_switch_block)
-            ccall(switch_ptr, Cint, (Ptr{Cvoid}, Ptr{UInt8}), bc.fctx_handle, block_name)
-            ccall(trap_ptr, Cvoid, (Ptr{Cvoid},), bc.fctx_handle)
-            seal_ptr2 = Libdl.dlsym(bc.lib_handle, :function_seal_block)
-            ccall(seal_ptr2, Cvoid, (Ptr{Cvoid}, Ptr{UInt8}), bc.fctx_handle, block_name)
         end
 
         return nothing
@@ -1672,7 +1439,7 @@ function emit_invoke(bc::BuilderCtx, invoke_target, f, args, ir, stmt_idx)
     # Unknown invoke — two paths depending on compilation mode:
     # 1. Recursive (bc.module_compiler set): enqueue callee and emit cross-function call.
     #    Mirrors WasmCodegen's request! + CallTarget pattern (compiler.jl line 1451-1452).
-    # 2. Single-function: emit sentinel constant (backward compat for non-recursive mode).
+    # 2. Fallback: emit sentinel constant.
     mc = bc.module_compiler
     if mc !== nothing && callee_mi isa Core.MethodInstance
         # Try to resolve the callee's IR. If cranelift_type throws (e.g. Union{}

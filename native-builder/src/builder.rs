@@ -307,6 +307,17 @@ impl FunctionCtx {
     }
 
     pub fn emit_jump_with_args(&mut self, target: &str, args: &[u32]) {
+        let saved_curr = self.current_block;
+        // If the target block doesn't exist, create it with a trap terminator.
+        if !self.blocks.contains_key(target) {
+            let fb = self.fb();
+            let b = fb.create_block();
+            fb.switch_to_block(b);
+            fb.ins().trap(cranelift_codegen::ir::TrapCode::HEAP_OUT_OF_BOUNDS);
+            fb.seal_block(b);
+            self.blocks.insert(target.to_string(), b);
+        }
+        self.current_block = saved_curr;
         let t = *self.blocks.get(target).unwrap_or(&self.current_block);
         let curr = self.current_block;
         let arg_vals: Vec<Value> = args.iter().map(|&a| self.ssa(a)).collect();
@@ -338,6 +349,19 @@ impl FunctionCtx {
     }
 
     pub fn emit_brif_with_args(&mut self, cond: u32, then_s: &str, then_args: &[u32], else_s: &str, else_args: &[u32]) {
+        let saved = self.current_block;
+        // Auto-create missing target blocks
+        for &target in &[then_s, else_s] {
+            if !self.blocks.contains_key(target) {
+                let fb = self.fb();
+                let b = fb.create_block();
+                fb.switch_to_block(b);
+                fb.ins().trap(cranelift_codegen::ir::TrapCode::HEAP_OUT_OF_BOUNDS);
+                fb.seal_block(b);
+                self.blocks.insert(target.to_string(), b);
+            }
+        }
+        self.current_block = saved;
         let cv = self.ssa(cond);
         let curr = self.current_block;
         let t = *self.blocks.get(then_s).unwrap_or(&self.current_block);

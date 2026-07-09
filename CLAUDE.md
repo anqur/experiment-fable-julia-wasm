@@ -53,6 +53,20 @@ first.
 - **Rust `cargo test` is not wired yet.** Verify Rust changes via `cargo build`
   then run Julia-side tests.
 
+### Absolute rules (DO NOT VIOLATE)
+
+- **NO STUBS, BRIDGES, OR HOST IMPLEMENTATIONS.** Do not add import handlers,
+  `@cfunction` wrappers, trampoline `.so` files, `libnative_backend.a` stubs,
+  or any other mechanism that short-circuits the recursive pipeline.
+  Everything must compile through the native codegen pipeline: IRCode → Cranelift
+  IR → ObjectModule → .o → .so. Runtime must use only compiled native code.
+- **NO IMPORT BRIDGE FOR parse! / ParseStream.** These must compile through
+  the recursive sentinel + worklist, same as any other `:invoke` callee.
+- **MARK FAILED TESTS AS COMMENTED.** Tests that cannot pass due to incomplete
+  compilation must be commented out (not `@test_skip`, not `try-catch` with
+  "KNOWN GAP"). Comment with `# TODO:` and the root cause. This keeps the test
+  suite honest — every active `@test` must actually pass.
+
 ## Build & test (native target)
 
 **Use the dev profile (`cargo build`) for local development** — it keeps
@@ -401,15 +415,48 @@ for direct memory access (no runtime calls needed):
   Tier 3 expanded: ParseStream(String/Vector), parse!, build_tree, SourceFile,
   IOBuffer all compile (7 new compilation tests).
 - ✅ **test_final.jl — End-to-End Beacon** (`NativeCodegen/test/test_final.jl`).
-  **~83 compilations pass (>100 assertions)**: 9 Kind predicates, 20 operator-precedence
-  predicates, 7 simple predicates, 5 flag ops, Kind(Int64) + isless, SyntaxHead
-  accessors (4), flag predicates on SyntaxHead (7), haschildren, GreenNode accessors
-  (5: head, span, numchildren, is_leaf, child_span), all generic predicates on
-  GreenNode (8), composition chains (3), children() return, Tier 4 complex functions
-  (6 compile, 5 runtime-callable), tree-walking (3), host-tree verification (13).
-  **Known bugs: 0** (all resolved). **Bridge gaps: 1** (parse_int_literal runtime:
-  needs scalar-to-pointer boxing at phi nodes for mixed Union{Int128,Int64,BigInt}).
-  **0 @test_skip**.
+  **84 compilations pass**: Kind predicates, operator-precedence predicates, simple
+  predicates, flag ops, Kind(Int64) + isless, SyntaxHead accessors, flag predicates
+  on SyntaxHead, haschildren, GreenNode accessors, generic predicates, composition
+  chains, children() return, tree-walking, host-tree verification.
+  **Parse pipeline:** `ParseStream`, `parse!`, `build_tree`, `SourceFile`, `IOBuffer`
+  all compile. `parse_into` runtime test: **BLOCKED** (# TODO: recursive pipeline
+  cannot yet compile parse! — see recursive pipeline status below).
+  **0 stubs, 0 bridges, 0 @test_skip.** Failed tests are commented out with `# TODO:`.
+
+### Recursive pipeline status (2026-07-08)
+
+**Architecture:** Single path — all `:invoke` callees go through the recursive
+sentinel → worklist → cross-function `call`. No import handlers, no host bridge,
+no trampoline. `emit_function_via_builder` deleted. `recursive` flag removed.
+`compile_native` calls `emit_module_via_builder` exclusively.
+
+**Rust-side fixes (7 error classes resolved):**
+- `sextend.i64`/`uextend.i64`/`ireduce.i64` no-op guards (skip when source==target)
+- Binop I32↔I64 operand harmonization (`harmonize_binop` covers all binops + icmp)
+- Jump/brif arg type harmonization (match block param types)
+- Call import arg type + count harmonization (extend + pad missing args)
+- Return type harmonization (match function signature)
+- Auto-create missing blocks on jump/brif targets (with trap terminators)
+
+**Compilation results (parse_into → parse! call graph, 45 callees):**
+- 37 functions compile cleanly (no verifier errors, no warnings)
+- 8 functions fail Cranelift verifier: `Lexer` (invalid block ref block1),
+  `parse_float_literal` (invalid block ref block50), `print_to_string`
+  (invalid block ref block6), `_sort!`×2 (block without terminator),
+  `_buffer_lookahead_tokens` (block without terminator), `next_token`
+  (invalid block ref block5), `lex_string_chunk` (block without terminator)
+- Failed functions get trap stubs → runtime trap if called
+
+**Runtime:** `parse_into("1 + 2")` traps because `Lexer` is called during
+parsing and the trap stub fires. Parse pipeline COMPILES but does not RUN.
+
+**Next work items:**
+1. Fix "invalid block reference" errors (4 functions) — block management in
+   Cranelift DFG
+2. Fix "block does not end in a terminator" errors (4 functions) — dead-end
+   blocks in cfg.blocks without fallthrough
+3. Once all 45 callees compile, verify `parse_into` runtime
 
 ### Bridge type dispatch
 
