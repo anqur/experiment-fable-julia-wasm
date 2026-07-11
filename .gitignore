@@ -6,3 +6,4 @@ Manifest.toml
 LocalPreferences.toml
 JSRuntime/test/jsstr_manifest.json
 target/
+.claude/settings.local.json

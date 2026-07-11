@@ -424,39 +424,100 @@ for direct memory access (no runtime calls needed):
   cannot yet compile parse! — see recursive pipeline status below).
   **0 stubs, 0 bridges, 0 @test_skip.** Failed tests are commented out with `# TODO:`.
 
-### Recursive pipeline status (2026-07-08)
+### Recursive pipeline status (2026-07-11)
 
 **Architecture:** Single path — all `:invoke` callees go through the recursive
 sentinel → worklist → cross-function `call`. No import handlers, no host bridge,
 no trampoline. `emit_function_via_builder` deleted. `recursive` flag removed.
 `compile_native` calls `emit_module_via_builder` exclusively.
 
-**Rust-side fixes (7 error classes resolved):**
-- `sextend.i64`/`uextend.i64`/`ireduce.i64` no-op guards (skip when source==target)
-- Binop I32↔I64 operand harmonization (`harmonize_binop` covers all binops + icmp)
-- Jump/brif arg type harmonization (match block param types)
-- Call import arg type + count harmonization (extend + pad missing args)
-- Return type harmonization (match function signature)
-- Auto-create missing blocks on jump/brif targets (with trap terminators)
+**ROOT-CAUSE REFRAME (supersedes the 2026-07-08 "fix block management" plan).**
+The "invalid block reference blockN" and "block does not end in a terminator"
+verifier errors are **symptoms, not root bugs**. They are caused by per-statement
+`emit_instruction` throwing an exception the block loop's catch won't swallow —
+the catch (in `_compile_function_in_module!`) only tolerates `CompileError`/
+`ErrorException`; everything else (`InexactError`, `BoundsError`, `UndefRefError`)
+is rethrown. A rethrow aborts the block loop → the whole function → the worklist
+marks it `:failed`; the partially-emitted body then fails verification because
+forward-reference targets and un-terminated blocks dangle. **Fix the throw and
+the verifier error disappears.**
 
-**Compilation results (parse_into → parse! call graph, 45 callees):**
-- 37 functions compile cleanly (no verifier errors, no warnings)
-- 8 functions fail Cranelift verifier: `Lexer` (invalid block ref block1),
-  `parse_float_literal` (invalid block ref block50), `print_to_string`
-  (invalid block ref block6), `_sort!`×2 (block without terminator),
-  `_buffer_lookahead_tokens` (block without terminator), `next_token`
-  (invalid block ref block5), `lex_string_chunk` (block without terminator)
-- Failed functions get trap stubs → runtime trap if called
+Three confirmed facts that govern this:
+1. **cranelift-frontend 0.133 `create_block()` does NOT insert the block into the
+   layout** (only `func.dfg.make_block()`). A block enters the layout lazily, the
+   first time an instruction is emitted into it (`FuncInstBuilder::build` →
+   `ensure_inserted_block` → `layout.append_block`). The codegen pre-allocates
+   2048 blocks by name ("block0".."block2047") in `_compile_function_in_module!`;
+   these are DFG-only until emitted into. So `function_switch_block` returning
+   true does NOT mean the block is laid out.
+2. **`Core.GotoNode.label` and `Core.GotoIfNot.dest` are 1-based BLOCK indices**
+   (nightly/1.14-DEV), NOT statement indices — verified semantically (every
+   label/dest is a member of its block's `cfg.blocks[bi].succs`). The original
+   `target_bi = e.label; bc.blocks[target_bi]` is CORRECT; do not "fix" it to
+   `find_block_for_stmt`. (`bc.blocks[bi] = "block$(bi-1)"` maps Julia block
+   index → Cranelift block name.)
+3. **Diagnostic recipe:** temporarily widen the emit-loop catch to log
+   `typeof(ex): $(ex)` (and the IR stmt) before rethrowing, gated by an env var,
+   to find each throw source. The gated `NATIVE_BUILDER_DUMP_DIR=<dir>` env var
+   (handled in `native-builder/src/builder.rs::finalize`) writes each function's
+   full Cranelift IR to `<dir>/<name>.cranelift`, capturing failing functions
+   too (dump is taken before `define_function`).
 
-**Runtime:** `parse_into("1 + 2")` traps because `Lexer` is called during
-parsing and the trap stub fires. Parse pipeline COMPILES but does not RUN.
+**FIXED (2026-07-11, in working tree, no regressions to `test_edsl_approach.jl`):**
+- constant emission threw `InexactError` whenever an integer/bitstype/primitive
+  constant had its high bit set (negative or large unsigned) — `Int64(val)` /
+  `Int32(raw)` are *checked* conversions. Replaced with bit-preserving `reinterpret`
+  in `emit_constant`'s Integer branch and the `isbitstype` / `isprimitivetype`
+  branches of `resolve_operand` (`builder_emit.jl`).
+- `emit_struct_getfield` Case 3 (bitstype shift/mask field extraction) now gated
+  on `sizeof(T) <= 8` — larger bitstypes (NamedTuple sizeof=16, RawToken
+  sizeof=32) are `TYPE_PTR` heap pointers, not register values, and must take the
+  Case 4 memory-load path. Previously the `mask=(UInt64(1)<<field_size)-1`
+  computation wrapped for full-width 64-bit fields → `Int64(mask)` threw
+  `InexactError`. (Mask emission also made bit-preserving via `reinterpret`.)
+- `get_phi_args` now `isassigned(e.values, j)`-guards PhiNode slot reads — Julia
+  leaves `values[j]` `#undef` on unreachable predecessor edges; reading it threw
+  `UndefRefError`.
+- `emit_struct_getfield` throws `CompileError` (caught → sentinel) for
+  non-concrete / Vararg-tail `Tuple` types instead of letting `fieldoffset`
+  throw `BoundsError`.
+- The emit-loop catch now emits a **correctly-typed** zero sentinel via
+  `_undef_placeholder(bc, ir.stmts[si][:type])` (was an unconditional `iconst.i64`,
+  which poisoned Float32/64 SSAs → downstream `fabs.i64`/`fcmp.i64` verifier
+  errors). Added a `:jl_strtof_c` foreigncall handler (Float32 `strtof`) mirroring
+  `:jl_strtod_c`.
+
+**Result: ALL ~50 callees in the `parse_into → parse!` call graph now compile
+cleanly** (0 Cranelift verifier failures, down from 8 then 7). Full
+`test_edsl_approach.jl` suite still passes.
+
+**Runtime (the current frontier):** `parse_into("1 + 2")` still segfaults at
+runtime in `#ParseStream#18` (`__compiled_fn_2`), which COMPILES but
+miscompiles — a runtime miscompilation (likely struct/array allocation or
+field-access bug in the `ParseStream(::String)` constructor), NOT a trap stub.
+This is the next thing to fix.
+
+**Diagnostic env vars (keep using these):**
+- `NCG_TRACE_RETHROW=1` — log every rethrown emit exception with its IR stmt
+  (in the emit-loop catch, `builder_emit.jl`).
+- `NATIVE_BUILDER_DUMP_DIR=<dir>` — write each function's full Cranelift IR to
+  `<dir>/<name>.cranelift` (in `native-builder/src/builder.rs::finalize`, before
+  `define_function` — captures failing fns too).
 
 **Next work items:**
-1. Fix "invalid block reference" errors (4 functions) — block management in
-   Cranelift DFG
-2. Fix "block does not end in a terminator" errors (4 functions) — dead-end
-   blocks in cfg.blocks without fallthrough
-3. Once all 45 callees compile, verify `parse_into` runtime
+1. **P1 — runtime miscompilation in `#ParseStream#18`.** Differential-test the
+   compiled `ParseStream(::String)` constructor against the host: dump its
+   Cranelift IR (`NATIVE_BUILDER_DUMP_DIR`), compare field stores/loads and the
+   allocated struct layout against `pointer_from_objref`-derived expectations
+   (CLAUDE.md "Key Julia object layouts"). Suspects: `:new` allocation of the
+   ParseStream struct, Vector/Memory field initialization, or a getfield on a
+   freshly-allocated field returning garbage.
+2. **P1 (defense-in-depth) — harden the emit loop** so a future rethrow can't
+   cascade into a misleading verifier error: on rethrow, emit a `trap`
+   terminator for that block and `continue` instead of aborting the whole fn.
+3. Beyond ParseStream: once `parse_into` runs past construction, expect more
+   runtime miscompilations to surface in `parse!`/`Lexer`/`next_token` — same
+   differential-testing approach.
 
 ### Bridge type dispatch
 

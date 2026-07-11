@@ -560,6 +560,17 @@ impl BuilderContext {
             let nm = f.func_name.clone();
             let sig = f.signature.clone();
             if verbose { eprintln!("[native-builder] declaring: {}", nm); }
+            // Diagnostic dump: if NATIVE_BUILDER_DUMP_DIR is set, write each
+            // function's Cranelift IR (Display) to <dir>/<escaped-name>.cranelift.
+            // Captures failing functions too (dumped before define_function).
+            if let Ok(dir) = std::env::var("NATIVE_BUILDER_DUMP_DIR") {
+                let escaped: String = nm.chars().map(|c| match c {
+                    'A'..='Z'|'a'..='z'|'0'..='9'|'_' => c,
+                    _ => '_',
+                }).collect();
+                let p = std::path::Path::new(&dir).join(format!("{}.cranelift", escaped));
+                let _ = std::fs::write(p, format!("{}", f.context.func.display()));
+            }
             // Reuse pre-declared FuncId (from declare_self_function) to avoid
             // duplicate Linkage::Export declaration for recursive functions.
             let fid = if let Some(&fid) = self.self_imports.get(&nm) {

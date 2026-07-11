@@ -375,12 +375,24 @@ function _compile_function_in_module!(mc::ModuleCompiler, mi::Core.MethodInstanc
                 try
                     emit_instruction(bc, e, ir, si)
                 catch ex
-                    ex isa CompileError || ex isa ErrorException || rethrow()
-                    # Emit sentinel constant on failure
-                    iconst_ptr = Libdl.dlsym(bc.lib_handle, :block_add_iconst)
-                    sentinel_id = ccall(iconst_ptr, UInt32, (Ptr{Cvoid}, Int64, UInt32),
-                                       bc.fctx_handle, Int64(0), TYPE_I64)
-                    bc.ssa_values[Core.SSAValue(si)] = sentinel_id
+                    if !(ex isa CompileError || ex isa ErrorException)
+                        # Rethrown exceptions abort the whole function's emission,
+                        # which cascades into misleading "invalid block reference" /
+                        # "no terminator" verifier errors (see CLAUDE.md). Log them
+                        # when NCG_TRACE_RETHROW is set so the throw source is visible.
+                        if haskey(ENV, "NCG_TRACE_RETHROW")
+                            println(stderr, "[rethrow] $func_name bi=$bi si=$si stmt=$(typeof(e)) head=$(e isa Expr ? e.head : (e isa Core.GotoNode ? :GotoNode : e isa Core.GotoIfNot ? :GotoIfNot : e isa Core.ReturnNode ? :Return : "-")) EXC=$(typeof(ex)): $(ex)")
+                            println(stderr, "[rethrow-stmt] $(repr(e))")
+                        end
+                        rethrow()
+                    end
+                    # Emit a correctly-typed zero sentinel on failure.
+                    # The SSA's declared type (ir.stmts[si][:type]) determines the
+                    # Cranelift value type — a Float32/64 SSA MUST get f32const/
+                    # f64const, otherwise downstream float ops (fabs/fcmp) see an
+                    # i64 and fail verification (parse_float_literal's strtof path).
+                    bc.ssa_values[Core.SSAValue(si)] =
+                        _undef_placeholder(bc, ir.stmts[si][:type])
                 end
                 if e isa Core.GotoNode || e isa Core.GotoIfNot || e isa Core.ReturnNode
                     had_terminator = true
@@ -623,7 +635,19 @@ function get_phi_args(ir, bc::BuilderCtx, source_bi::Int, target_bi::Int)
             found = false
             for (j, edge_bi) in enumerate(e.edges)
                 if edge_bi == source_bi
-                    push!(args, resolve_operand(bc, e.values[j], ir))
+                    if isassigned(e.values, j)
+                        push!(args, resolve_operand(bc, e.values[j], ir))
+                    else
+                        # The phi value is unassigned (#undef) on this edge — Julia
+                        # leaves the slot empty when the variable is unreachable
+                        # along that predecessor path (e.g. loop-carried Bool flags
+                        # on dead escape edges). Pass a zero placeholder of the
+                        # phi's type so the jump arg count matches the block param
+                        # count; the value is never used along this path. Without
+                        # this guard, e.values[j] throws UndefRefError, aborting
+                        # the whole function's emission.
+                        push!(args, _undef_placeholder(bc, ir.stmts[si][:type]))
+                    end
                     found = true
                     break
                 end
@@ -722,19 +746,19 @@ function resolve_operand(bc::BuilderCtx, val, ir)
         # Raw pointer constant — emit as i64
         return emit_constant(bc, Int64(reinterpret(UInt64, val)))
     elseif Base.isprimitivetype(typeof(val))
-        # Primitive type (e.g. Kind(16-bit), Char(32-bit), Int128(128-bit))
+        # Primitive type (e.g. Kind(16-bit), Char(32-bit), Int128(128-bit)).
+        # Pass the unsigned bit pattern to emit_constant (which reinterprets to
+        # Int64 bits) — NOT Int32(raw)/Int64(raw), which throw InexactError for
+        # high-bit-set values (e.g. Char > 0x7fffffff, or UInt-primitive maxima).
         sz = sizeof(val)
         if sz == 2
-            raw = reinterpret(UInt16, val)
-            return emit_constant(bc, Int32(raw))
+            return emit_constant(bc, reinterpret(UInt16, val))
         elseif sz == 4
-            raw = reinterpret(UInt32, val)
-            return emit_constant(bc, Int32(raw))
+            return emit_constant(bc, reinterpret(UInt32, val))
         elseif sz == 8
-            raw = reinterpret(UInt64, val)
-            return emit_constant(bc, Int64(raw))
+            return emit_constant(bc, reinterpret(UInt64, val))
         else
-            return emit_constant(bc, Int64(0))
+            return emit_constant(bc, Int64(0))  # Int128 etc. — lossy fallback (rare)
         end
     elseif isbitstype(typeof(val))
         # Bitstype structs (e.g. SyntaxHead, RawGreenNode) — reinterpret as UInt
@@ -751,7 +775,7 @@ function resolve_operand(bc::BuilderCtx, val, ir)
         else
             raw = UInt64(0)
         end
-        return emit_constant(bc, sz <= 4 ? Int32(raw) : Int64(raw))
+        return emit_constant(bc, sz <= 4 ? UInt32(raw) : raw)
     elseif val isa VersionNumber
         # Immutable struct with pointer fields — wrap in Ref for pointer_from_objref
         return emit_constant(bc, Int64(reinterpret(UInt64, pointer_from_objref(Ref(val)))))
@@ -772,9 +796,17 @@ function emit_constant(bc::BuilderCtx, val)
         return ccall(f32_ptr, UInt32, (Ptr{Cvoid}, Float32), bc.fctx_handle, Float32(val))
     elseif val isa Integer
         iconst_ptr = Libdl.dlsym(bc.lib_handle, :block_add_iconst)
-        ty = val isa Int64 || val isa UInt64 ? TYPE_I64 : TYPE_I32
+        sz = sizeof(val)
+        ty = sz <= 4 ? TYPE_I32 : TYPE_I64
+        # Extract the bit pattern via reinterpret (NOT checked Int64(val), which
+        # throws InexactError for negative or >typemax unsigned values). The iconst
+        # FFI takes an Int64 immediate that encodes the raw bits regardless of sign.
+        ubits = sz == 8 ? reinterpret(UInt64, val) :
+                sz == 4 ? UInt64(reinterpret(UInt32, val)) :
+                sz == 2 ? UInt64(reinterpret(UInt16, val)) :
+                           UInt64(reinterpret(UInt8, val))
         return ccall(iconst_ptr, UInt32, (Ptr{Cvoid}, Int64, UInt32),
-                     bc.fctx_handle, Int64(val), ty)
+                     bc.fctx_handle, reinterpret(Int64, ubits), ty)
     else
         error("Unsupported constant type: $(typeof(val))")
     end
@@ -1884,6 +1916,18 @@ function emit_struct_getfield(bc::BuilderCtx, args, ir, stmt_idx)
     T = get_operand_type(obj, ir)
     T = T isa Core.Const ? T.val : T
 
+    # Incomplete (Vararg-tail) or abstract-element Tuple types have no definite
+    # layout — fieldoffset/fieldtype throw BoundsError on them (e.g. varargs
+    # callees like print_to_string(xs...) whose argtype is
+    # Tuple{String, Vararg{Any}}). The concrete-tuple arm above already handled
+    # the fully-specialized case; anything Tuple-typed reaching here is
+    # unsupported. Throw CompileError (tolerated by the catch → sentinel) so the
+    # whole function still emits instead of aborting emission with a raw
+    # BoundsError that cascades into misleading verifier errors.
+    if T isa DataType && T <: Tuple && !isconcretetype(T)
+        throw(CompileError("getfield on non-concrete tuple type $T (Vararg/abstract layout) not yet supported"))
+    end
+
     # getfield on Nothing (dead code after union-splitting): return dummy
     if T === Nothing
         return UInt32(0)
@@ -1935,8 +1979,13 @@ function emit_struct_getfield(bc::BuilderCtx, args, ir, stmt_idx)
         return obj_id
     end
 
-    # Case 3: bitstype struct field — extract from value (not memory load)
-    if T isa DataType && isbitstype(T)
+    # Case 3: bitstype struct field — extract from value (not memory load).
+    # ONLY for sizeof<=8 bitstypes: cranelift_type maps these to a real scalar
+    # register (I64/I32/I8), so the value lives in a register and we extract the
+    # field by shift+mask. Larger bitstypes (NamedTuple sizeof=16, RawToken
+    # sizeof=32, ...) are mapped to TYPE_PTR by cranelift_type — they are passed
+    # as heap pointers and must use the Case 4 memory-load path below.
+    if T isa DataType && isbitstype(T) && sizeof(T) <= 8
         # Bitstype getfield: value is in register, extract field by offset
         offset = fieldoffset(T, field_sym)
         if offset == 0
@@ -1954,14 +2003,18 @@ function emit_struct_getfield(bc::BuilderCtx, args, ir, stmt_idx)
         shifted_id = ccall(shift_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
                           bc.fctx_handle, obj_id, offset_id)
 
-        # Create mask to extract only the field bits
+        # Create mask to extract only the field bits. Use reinterpret (NOT
+        # checked Int64(mask)/Int32(mask)) — for a full-width field (field_size
+        # == 64), `(UInt64(1)<<64)-1` wraps to 0xffffffffffffffff, whose high
+        # bit set makes Int64(...) throw InexactError. emit_constant reinterprets
+        # the bits back to Int64 internally, so passing the UInt pattern is safe.
         mask = (UInt64(1) << field_size) - UInt64(1)  # mask for field bits
 
         # Use consistent type for mask based on struct size
         if struct_size <= 32
-            mask_id = emit_constant(bc, Int32(mask & 0xFFFFFFFF))
+            mask_id = emit_constant(bc, reinterpret(Int32, mask & 0xFFFFFFFF % UInt32))
         else
-            mask_id = emit_constant(bc, Int64(mask))
+            mask_id = emit_constant(bc, reinterpret(Int64, mask))
         end
 
         # Apply mask
@@ -2346,6 +2399,25 @@ function emit_foreigncall(bc::BuilderCtx, e::Expr, ir, stmt_idx)
         end
         nreq = length(cc_args)
         @assert nreq >= 2 "strtod_c needs at least 2 args, got $nreq"
+        str_ptr_id = resolve_operand(bc, cc_args[1], ir)
+        endptr_ref_id = resolve_operand(bc, cc_args[2], ir)
+        return emit_call_runtime(bc, import_name, UInt32[str_ptr_id, endptr_ref_id])
+    elseif fn_name == :jl_strtof_c
+        # strtof(ptr, endptr) — C standard library function (Float32 variant).
+        # Mirrors jl_strtod_c above but returns TYPE_F32. Resolves against the
+        # host libm at .so load time (linker uses no -lm, like strtod).
+        import_name = "strtof"
+        if !(import_name in bc.imported_foreign)
+            push!(bc.imported_foreign, import_name)
+            declare_ptr = Libdl.dlsym(bc.lib_handle, :builder_declare_import)
+            param_types = [TYPE_I64, TYPE_I64]  # const char*, char**
+            ccall(declare_ptr, Cint,
+                  (Ptr{Cvoid}, Ptr{UInt8}, UInt32, Ptr{UInt32}, Csize_t),
+                  bc.builder_handle, import_name, TYPE_F32, param_types,
+                  length(param_types))
+        end
+        nreq = length(cc_args)
+        @assert nreq >= 2 "strtof_c needs at least 2 args, got $nreq"
         str_ptr_id = resolve_operand(bc, cc_args[1], ir)
         endptr_ref_id = resolve_operand(bc, cc_args[2], ir)
         return emit_call_runtime(bc, import_name, UInt32[str_ptr_id, endptr_ref_id])
