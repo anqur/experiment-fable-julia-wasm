@@ -93,6 +93,12 @@ function cranelift_type(T)
     throw(CompileError("unsupported type $T"))
 end
 
+# Element byte-size for a Memory/MemoryRef/Ptr element type. `sizeof` THROWS for
+# concrete-but-non-bitstype heap types (Symbol, String, any mutable struct) — they
+# are all pointer-sized (8 bytes) when stored in a Memory/array. Use this anywhere
+# an element type from a Memory{T}/MemoryRef{T}/Ptr{T} needs a byte width.
+_elem_size(T) = T isa DataType && Base.isbitstype(T) ? sizeof(T) : 8
+
 # Predicate: concrete immutable struct with heap fields that should be pointer-typed.
 # Excludes GenericMemoryRef/GenericMemory (Core memory types managed via ref_tracking).
 _is_heap_struct(T) = T isa DataType && isconcretetype(T) && !isbitstype(T) &&
@@ -166,6 +172,11 @@ mutable struct BuilderCtx
     # This mirrors WasmCodegen's ModuleCompiler worklist pattern.
     # Typed as Any to avoid forward-reference to ModuleCompiler (defined below).
     module_compiler::Any  # Union{ModuleCompiler, Nothing} in spirit
+    # Targeted lowering for the generic kwcall sorter's emptiness check:
+    # maps the SSA of a `Core._apply_iterate(iterate, tuple, vec)` whose result
+    # type is a non-concrete (Vararg) Tuple → the underlying Vector value id.
+    # `isa(result, Tuple{})` then lowers to `length(vec) == 0` (load vec+16).
+    vararg_tuple_coll::Dict{Core.SSAValue, UInt32}
 end
 
 function BuilderCtx(lib_path::String)
@@ -181,7 +192,8 @@ function BuilderCtx(lib_path::String)
                Dict{UInt32, UInt32}(),
                "", nothing,
                Set{String}(),
-               nothing)
+               nothing,
+               Dict{Core.SSAValue, UInt32}())
 end
 
 function free_builder(bc::BuilderCtx)
@@ -300,6 +312,13 @@ function _compile_function_in_module!(mc::ModuleCompiler, mi::Core.MethodInstanc
         throw(CompileError("Failed to get IR for $mi"))
     end
 
+    if haskey(ENV, "NCG_DUMP_IR_FUNC") && occursin(ENV["NCG_DUMP_IR_FUNC"], func_name)
+        println(stderr, "[ir-dump] === $func_name specTypes=$(mi.specTypes) argtypes=$(ir.argtypes) nstmts=$(length(ir.stmts)) ===")
+        for si in 1:length(ir.stmts)
+            println(stderr, "[ir $si] type=$(ir.stmts[si][:type]) :: $(repr(ir.stmts[si][:stmt]))")
+        end
+    end
+
     # Register argument values
     nparams = length(ir.argtypes) - 1
     for i in 1:nparams
@@ -369,11 +388,28 @@ function _compile_function_in_module!(mc::ModuleCompiler, mi::Core.MethodInstanc
                   bc.fctx_handle, block_name)
 
             had_terminator = false
+            # terminator_emitted is set TRUE only when a terminator statement
+            # (GotoNode/GotoIfNot/ReturnNode/throw-call) was SUCCESSFULLY emitted.
+            # It is distinct from `had_terminator` (which is set whenever such a
+            # statement is SEEN, even if its emit threw and was caught). The
+            # fallback terminator below keys off `terminator_emitted` so that a
+            # caught throw on a terminator statement still leaves the block with a
+            # REAL terminator — otherwise the next switch_to_block trips Cranelift's
+            # "you have to fill your block before switching" debug assertion.
+            terminator_emitted = false
             for si in block.stmts
                 had_terminator && break
                 e = ir.stmts[si][:stmt]
+                is_term_stmt = e isa Core.GotoNode || e isa Core.GotoIfNot || e isa Core.ReturnNode
+                if !is_term_stmt && e isa Expr && e.head == :call && length(e.args) >= 1 &&
+                   e.args[1] isa Core.GlobalRef &&
+                   e.args[1].name in (:throw, :throw_methoderror,
+                                     :throw_inexacterror, :throw_undef_if_null)
+                    is_term_stmt = true
+                end
                 try
                     emit_instruction(bc, e, ir, si)
+                    is_term_stmt && (terminator_emitted = true)
                 catch ex
                     if !(ex isa CompileError || ex isa ErrorException)
                         # Rethrown exceptions abort the whole function's emission,
@@ -383,8 +419,18 @@ function _compile_function_in_module!(mc::ModuleCompiler, mi::Core.MethodInstanc
                         if haskey(ENV, "NCG_TRACE_RETHROW")
                             println(stderr, "[rethrow] $func_name bi=$bi si=$si stmt=$(typeof(e)) head=$(e isa Expr ? e.head : (e isa Core.GotoNode ? :GotoNode : e isa Core.GotoIfNot ? :GotoIfNot : e isa Core.ReturnNode ? :Return : "-")) EXC=$(typeof(ex)): $(ex)")
                             println(stderr, "[rethrow-stmt] $(repr(e))")
+                            if haskey(ENV, "NCG_TRACE_BT")
+                                foreach(f -> println(stderr, "   ", f), stacktrace(catch_backtrace())[1:min(end,10)])
+                            end
                         end
                         rethrow()
+                    end
+                    # Tolerated throw (CompileError/ErrorException) — emit sentinel.
+                    if haskey(ENV, "NCG_TRACE_SENTINEL")
+                        println(stderr, "[sentinel] $func_name bi=$bi si=$si stmt=$(typeof(e)) head=$(e isa Expr ? e.head : "-") EXC=$(typeof(ex)): $(ex) :: $(repr(e)[1:min(end,160)])")
+                        if haskey(ENV, "NCG_TRACE_BT") && (occursin("bitcast", string(ex)) || ex isa InexactError)
+                            foreach(f -> println(stderr, "   ", f), stacktrace(catch_backtrace())[1:min(end,8)])
+                        end
                     end
                     # Emit a correctly-typed zero sentinel on failure.
                     # The SSA's declared type (ir.stmts[si][:type]) determines the
@@ -394,23 +440,16 @@ function _compile_function_in_module!(mc::ModuleCompiler, mi::Core.MethodInstanc
                     bc.ssa_values[Core.SSAValue(si)] =
                         _undef_placeholder(bc, ir.stmts[si][:type])
                 end
-                if e isa Core.GotoNode || e isa Core.GotoIfNot || e isa Core.ReturnNode
+                if is_term_stmt
                     had_terminator = true
-                elseif e isa Expr && e.head == :call && length(e.args) >= 1
-                    f = e.args[1]
-                    if f isa Core.GlobalRef
-                        fn_sym = f.name
-                        if fn_sym in (:throw, :throw_methoderror,
-                                      :throw_inexacterror, :throw_undef_if_null)
-                            had_terminator = true
-                        end
-                    end
                 end
             end
 
-            # No terminator: if implicit fallthrough exists, emit jump.
+            # No real terminator emitted: if implicit fallthrough exists, emit jump.
             # Otherwise emit trap (dead-end block with no successors or multiple succs).
-            if !had_terminator && length(block.succs) == 1
+            # Keys off `terminator_emitted` (not `had_terminator`) so a terminator
+            # statement whose emit threw still gets a fallback terminator here.
+            if !terminator_emitted && length(block.succs) == 1
                 target_bi = block.succs[1]
                 target_name = bc.blocks[target_bi]
                 phi_args = get_phi_args(ir, bc, bi, target_bi)
@@ -422,7 +461,7 @@ function _compile_function_in_module!(mc::ModuleCompiler, mi::Core.MethodInstanc
                     ccall(jump_ptr, Cvoid, (Ptr{Cvoid}, Ptr{UInt8}, Ptr{UInt32}, Csize_t),
                           bc.fctx_handle, target_name, phi_args, length(phi_args))
                 end
-            elseif !had_terminator
+            elseif !terminator_emitted
                 trap_ptr2 = Libdl.dlsym(bc.lib_handle, :block_add_trap)
                 ccall(trap_ptr2, Cvoid, (Ptr{Cvoid},), bc.fctx_handle)
             end
@@ -443,6 +482,7 @@ function _compile_function_in_module!(mc::ModuleCompiler, mi::Core.MethodInstanc
         empty!(bc.ref_tracking)
         empty!(bc.ssa_pairs)
         empty!(bc.ssa_types)
+        empty!(bc.vararg_tuple_coll)
         bc.current_func_name = ""
         bc.current_mi = nothing
     end
@@ -477,6 +517,38 @@ function emit_instruction(bc::BuilderCtx, e, ir, stmt_idx::Int)
         elseif f === Core.memoryrefunset!
             # memoryrefunset!(ref, ordering, boundscheck) — store zero at ref for GC safety
             result_id = emit_memoryrefunset(bc, args, ir)
+        elseif f === Core.memoryrefnew
+            # memoryrefnew(mem_or_ref, idx, boundscheck) → MemoryRef, OR
+            # memoryrefnew(mem) → MemoryRef from raw Memory (1-arg form).
+            # Dispatched here (not in emit_intrinsic) because Core.memoryrefnew
+            # is a singleton intrinsic of its own type, NOT a Core.IntrinsicFunction
+            # — same situation as Core.memoryrefunset! above. jl_intrinsic_name
+            # returns "invalid" for it, so the fn_sym ladder cannot match.
+            result_id = length(args) >= 2 ? emit_memoryrefnew(bc, args, ir, stmt_idx) :
+                        emit_memoryref_from_mem(bc, args, ir, stmt_idx)
+        elseif f === Core.memoryrefget
+            # memoryrefget(ref, ordering, boundscheck) → T
+            result_id = emit_memoryrefget(bc, args, ir)
+        elseif f === Core.memoryrefset!
+            # memoryrefset!(ref, val, ordering, boundscheck) → T
+            result_id = emit_memoryrefset(bc, args, ir)
+        elseif f === Core.memoryrefoffset
+            # memoryrefoffset(ref) → Int64 (1-based element index). For a fresh
+            # MemoryRef from a Vector's :ref field, byte_offset==0 → result==1.
+            # General: byte_offset / elem_size + 1.
+            memref_val = args[1]
+            tracked = (memref_val isa Core.SSAValue && haskey(bc.ref_tracking, memref_val)) ?
+                      bc.ref_tracking[memref_val] : nothing
+            if tracked !== nothing
+                _, byte_off, memref_T = tracked
+                elem_T = memref_T isa DataType && length(memref_T.parameters) >= 2 ?
+                         memref_T.parameters[2] : Int64
+                elem_index = Int64(byte_off ÷ _elem_size(elem_T)) + Int64(1)
+                result_id = emit_constant(bc, elem_index)
+            else
+                # Untracked / fresh ref: offset is 1 (mirrors the GlobalRef handler).
+                result_id = emit_constant(bc, Int64(1))
+            end
         elseif f === Core.isa
             # isa(x, Type) — type check. Currently only handles isa(x, Nothing)
             # on pointer values (icmp eq ptr_val, 0).
@@ -783,7 +855,12 @@ function resolve_operand(bc::BuilderCtx, val, ir)
         # Type values — emit as pointer constant
         return emit_constant(bc, Int64(reinterpret(UInt64, pointer_from_objref(val))))
     else
-        error("Unsupported operand type: $(typeof(val))")
+        # Any other heap object (module-constant Vector/Array, String, Symbol,
+        # struct instance, …) — emit as its pointer so downstream getfield
+        # (:ref/:size) and field-offset loads work. pointer_from_objref is valid
+        # for every Julia object reaching here (Number/Ptr/primitive/bitstype/
+        # Type/nothing are all handled above).
+        return emit_constant(bc, Int64(reinterpret(UInt64, pointer_from_objref(val))))
     end
 end
 
@@ -801,14 +878,21 @@ function emit_constant(bc::BuilderCtx, val)
         # Extract the bit pattern via reinterpret (NOT checked Int64(val), which
         # throws InexactError for negative or >typemax unsigned values). The iconst
         # FFI takes an Int64 immediate that encodes the raw bits regardless of sign.
-        ubits = sz == 8 ? reinterpret(UInt64, val) :
+        ubits = sz == 16 ? UInt64(reinterpret(UInt128, val) & ((UInt128(1) << 64) - 1)) :  # Int128/UInt128 low 64 bits (UInt128 is checked; mask is not)
+                sz == 8 ? reinterpret(UInt64, val) :
                 sz == 4 ? UInt64(reinterpret(UInt32, val)) :
                 sz == 2 ? UInt64(reinterpret(UInt16, val)) :
                            UInt64(reinterpret(UInt8, val))
         return ccall(iconst_ptr, UInt32, (Ptr{Cvoid}, Int64, UInt32),
                      bc.fctx_handle, reinterpret(Int64, ubits), ty)
     else
-        error("Unsupported constant type: $(typeof(val))")
+        # Any other value (Symbol, String, Vector, struct instance, …) is a heap
+        # object — emit its pointer as an i64 constant.
+        iconst_ptr = Libdl.dlsym(bc.lib_handle, :block_add_iconst)
+        return ccall(iconst_ptr, UInt32, (Ptr{Cvoid}, Int64, UInt32),
+                     bc.fctx_handle,
+                     reinterpret(Int64, reinterpret(UInt64, pointer_from_objref(val))),
+                     TYPE_PTR)
     end
 end
 
@@ -1282,7 +1366,71 @@ function _emit_array_elem_size(bc::BuilderCtx, array_val, ir)
     return emit_constant(bc, Int64(es))
 end
 
+# Bypass a Core.kwcall sorter whose kwargs NamedTuple is a compile-time constant
+# but which has RUNTIME positional args (e.g. peek_token(ps, 1; skip_newlines=true)).
+# Emits a cross-call to func's CORE method (the non-kwarg body) with
+# (positional args…, kwarg values…). Returns the call's result id, or nothing if
+# the core method can't be resolved/compiled. kwargs are in declaration order
+# (literal NamedTuples preserve it), matching the core method's trailing params.
+function _emit_kwcall_core_call(bc::BuilderCtx, func_val, kw_nt, positional, ir)
+    mc = bc.module_compiler
+    # Core method signature tuple: (typeof(func), positional_types..., kwarg_types...)
+    local pos_types
+    try
+        pos_types = Type[let t = get_operand_type(p, ir); t isa Core.Const ? typeof(t.val) : t; end
+                         for p in positional]
+    catch _
+        return nothing
+    end
+    kw_types = Type[typeof(v) for v in values(kw_nt)]
+    core_tt = try; Tuple{typeof(func_val), pos_types..., kw_types...}; catch _; return nothing; end
+    matches = try; Base._methods_by_ftype(core_tt, -1, mc.interp.world); catch _; nothing; end
+    (matches === nothing || isempty(matches)) && return nothing
+    core_mi = try; CC.specialize_method(matches[1].method, core_tt, Core.svec()); catch _; nothing; end
+    core_mi === nothing && return nothing
+    # Resolve the core callee's return/param types + CFG sanity (mirror the
+    # generic cross-call guard — skip if succs fall outside cfg.blocks).
+    local callee_rt_enum, callee_param_types
+    got = false
+    try
+        cr = Base.code_ircode_by_type(core_mi.specTypes; world=mc.interp.world, interp=mc.interp)
+        if length(cr) == 1
+            cir, cret = cr[1]
+            nb = length(cir.cfg.blocks); ok = true
+            for blk in cir.cfg.blocks
+                for s in blk.succs
+                    if s < 1 || s > nb; ok = false; break; end
+                end; ok || break
+            end
+            if ok
+                callee_rt_enum = cranelift_type(cret)
+                callee_param_types = UInt32[cranelift_type(_ir_type(t)) for t in cir.argtypes[2:end]]
+                got = true
+            end
+        end
+    catch _
+    end
+    got || return nothing
+    callee_name = request!(mc, core_mi)
+    decl_ptr = Libdl.dlsym(bc.lib_handle, :builder_declare_self_function)
+    ccall(decl_ptr, Cint, (Ptr{Cvoid}, Ptr{UInt8}, UInt32, Ptr{UInt32}, Csize_t),
+          bc.builder_handle, callee_name, callee_rt_enum,
+          callee_param_types, length(callee_param_types))
+    # Args: runtime positional args, then the constant kwarg values (decl order).
+    arg_ids = UInt32[resolve_operand(bc, p, ir) for p in positional]
+    for v in values(kw_nt)
+        push!(arg_ids, emit_constant(bc, v))
+    end
+    call_ptr = Libdl.dlsym(bc.lib_handle, :block_add_call)
+    return ccall(call_ptr, UInt32, (Ptr{Cvoid}, Ptr{Cvoid}, Cstring, Ptr{UInt32}, Csize_t),
+                 bc.fctx_handle, bc.builder_handle, callee_name, arg_ids, length(arg_ids))
+end
+
 function emit_invoke(bc::BuilderCtx, invoke_target, f, args, ir, stmt_idx)
+    if haskey(ENV, "NCG_TRACE_INVOKE")
+        iskw = (f === Core.kwcall) || (f isa QuoteNode && f.value === Core.kwcall)
+        println(stderr, "[invoke] $(bc.current_func_name) f=$(repr(f)) typeof=$(typeof(f)) iskwcall=$iskw nargs=$(length(args))")
+    end
     # Check for self-recursive call: if the invoke target's MethodInstance
     # matches the function we're currently compiling, emit a call to our
     # self-import (declared via builder_declare_self_function).
@@ -1298,6 +1446,49 @@ function emit_invoke(bc::BuilderCtx, invoke_target, f, args, ir, stmt_idx)
         return emit_call_import(bc, bc.current_func_name, args, ir)
     end
 
+    # Core.kwcall(kwargs_nt, func) — keyword-argument dispatch. Detect by the
+    # CALLEE FUNCTION being Core.kwcall (NOT by method.name — the sorter MI's
+    # method.name is the sorted function's name, e.g. :open_flags). The callee MI
+    # is the generic kwcall sorter (84+ stmts, needs runtime _apply_iterate /
+    # Vararg-tuple support). When the kwargs NamedTuple is a compile-time constant
+    # at the CALLER (literal kwargs like open_flags(; read=true, …)), evaluate the
+    # kwcall in host Julia now and emit the constant result — sidestepping the
+    # sorter entirely (so it is never invoked at runtime and its unsupported body
+    # doesn't matter). args = [kwargs_nt, func]. NOTE: the callee `f` arrives as
+    # a GlobalRef / QuoteNode wrapping Core.kwcall (IR renders it as
+    # `:(Core.kwcall)`), so unwrap before comparing.
+    kw_callee = if f isa QuoteNode; f.value
+                 elseif f isa Core.GlobalRef; getglobal(f.mod, f.name)
+                 elseif f isa Core.Const; f.val
+                 else f end
+    if kw_callee === Core.kwcall && length(args) >= 2
+        kw_nt = _const_value(args[1], ir)
+        func_val = _const_value(args[2], ir)
+        if haskey(ENV, "NCG_TRACE_KW")
+            println(stderr, "[kw] caller=$(bc.current_func_name) args1=$(repr(args[1])) args2=$(repr(args[2])) kw_nt=$(kw_nt isa _NotConst ? "NOTCONST" : typeof(kw_nt)) func=$(func_val isa _NotConst ? "NOTCONST" : func_val)")
+        end
+        if !(kw_nt isa _NotConst) && !(func_val isa _NotConst) && kw_nt isa NamedTuple && func_val isa Function
+            positional = args[3:end]   # runtime positional args (after [kwargs_nt, func])
+            if isempty(positional)
+                # Fully-constant kwcall: eval the whole call in host Julia.
+                result = try; func_val(; kw_nt...); catch _; _NotConst() end
+                if !(result isa _NotConst)
+                    return emit_constant(bc, result)
+                end
+            elseif bc.module_compiler !== nothing
+                # Constant kwargs + RUNTIME positional args (e.g.
+                # peek_token(ps, 1; skip_newlines=true, …)). Bypass the sorter
+                # by calling func's CORE method with (positional…, kwarg_values…).
+                # Literal-kwarg NamedTuples are in declaration order = core param
+                # order, so values(kw_nt) lines up with the trailing params.
+                result_id = _emit_kwcall_core_call(bc, func_val, kw_nt, positional, ir)
+                result_id !== nothing && return result_id
+            end
+        end
+        # else: non-constant kwargs — fall through to compile the sorter (currently
+        # degrades on _apply_iterate; runtime kwarg support is a future feature).
+    end
+
     # invoke_target can be CodeInstance or MethodInstance
     if invoke_target isa Core.CodeInstance
         method = invoke_target.def.def     # CodeInstance → MethodInstance → Method
@@ -1307,6 +1498,14 @@ function emit_invoke(bc::BuilderCtx, invoke_target, f, args, ir, stmt_idx)
         error("Unknown invoke target type: $(typeof(invoke_target))")
     end
     fn_name = method.name
+
+    # Core.kwcall(kwargs_nt, func) — keyword-argument dispatch. The callee MI is
+    # the generic kwcall SORTER (84+ stmts, needs runtime _apply_iterate / Vararg-
+    # tuple support — a future feature). But when the kwargs NamedTuple is a
+    # compile-time constant at the CALLER (the common case: literal kwargs like
+    # open_flags(; read=true, …)), we can evaluate the kwcall in host Julia right
+    # now and emit the constant result — sidestepping the sorter entirely (so the
+    # sorter is never invoked at runtime and its unsupported body doesn't matter).
 
     # String operations — emit loads from known Julia String layout:
     #   ptr = pointer_from_objref(s) points to:
@@ -1392,7 +1591,7 @@ function emit_invoke(bc::BuilderCtx, invoke_target, f, args, ir, stmt_idx)
             src_addr_id = src_tracked[1]
             elem_T = dst_tracked[3] isa DataType && length(dst_tracked[3].parameters) >= 2 ?
                      dst_tracked[3].parameters[2] : Int64
-            elem_size = sizeof(elem_T)
+            elem_size = _elem_size(elem_T)
             n_id = resolve_operand(bc, n_val, ir)
             if elem_size == 1
                 nbytes_id = n_id
@@ -1741,11 +1940,19 @@ function emit_globalref(bc::BuilderCtx, f::Core.GlobalRef, args, ir, stmt_idx)
             _, byte_off, memref_T = tracked
             elem_T = memref_T isa DataType && length(memref_T.parameters) >= 2 ?
                      memref_T.parameters[2] : Int64
-            elem_index = Int64(byte_off ÷ sizeof(elem_T)) + Int64(1)
+            elem_index = Int64(byte_off ÷ _elem_size(elem_T)) + Int64(1)
             return emit_constant(bc, elem_index)
         end
         # Fallback: return constant 1 (valid for all non-sliced arrays)
         return emit_constant(bc, Int64(1))
+    end
+    if fn == :_apply_iterate
+        # Core._apply_iterate(iterate, g, coll) = g(iterate(coll)...) — the kwarg
+        # / varargs splat lowering. When `coll` (args[3]) is a compile-time
+        # constant (e.g. constant kwargs to open_flags(; read=true, …)), evaluate
+        # it at compile time and emit the resulting tuple. Dynamic collections
+        # (runtime-built vectors) are not yet supported → CompileError (tolerated).
+        return emit_apply_iterate(bc, args, ir, stmt_idx)
     end
     if fn == :throw
         # Base.throw(...) — always Union{}-typed (never returns). Emit trap.
@@ -1760,6 +1967,13 @@ function emit_globalref(bc::BuilderCtx, f::Core.GlobalRef, args, ir, stmt_idx)
         trap_ptr = Libdl.dlsym(bc.lib_handle, :block_add_trap)
         ccall(trap_ptr, Cvoid, (Ptr{Cvoid},), bc.fctx_handle)
         return nothing
+    end
+    # No-op / pass-through intrinsics: these don't lower to any Cranelift code
+    # in a single-threaded, non-relocating runtime. Return the value argument.
+    if fn == :compilerbarrier || fn == :typeassert || fn == :_str_sizehint ||
+       fn == :memoryrefget_indices || fn == :not_splat
+        length(args) >= 1 && return resolve_operand(bc, args[1], ir)
+        return emit_constant(bc, Int64(0))
     end
 
     error("Unsupported GlobalRef: $(mod).$(fn)")
@@ -1975,7 +2189,20 @@ function emit_struct_getfield(bc::BuilderCtx, args, ir, stmt_idx)
         # Track composed offset for later getfield sub-accesses
         offset = fieldoffset(T, field_sym)
         bc.ref_tracking[Core.SSAValue(stmt_idx)] = (obj_id, offset, field_T)
-        # Return a sentinel Cranelift value — the real value is in ref_tracking
+        # Store a USABLE pointer in ssa_values (not the parent obj_id) so memrefs
+        # that cross boundaries (callee return, PhiNode, untracked arg) keep
+        # working via the memoryrefget/set/new fallbacks. For a MemoryRef field
+        # (immutable, inline) the leading ptr_or_offset @ +0 IS the element
+        # address — load and return it. (GenericMemory is mutable and loadable,
+        # so it never reaches Case 2 — it goes through Case 4 and its ssa_values
+        # entry is the Memory object pointer; emit_memoryrefnew's fallback loads
+        # Memory.ptr from obj+8.) For any other non-loadable field type, fall
+        # back to obj_id (no usable leading pointer is known).
+        if field_T isa DataType && field_T.name.name === :GenericMemoryRef
+            load_ptr = Libdl.dlsym(bc.lib_handle, :block_add_load)
+            return ccall(load_ptr, UInt32, (Ptr{Cvoid}, UInt32, Int32, UInt32),
+                         bc.fctx_handle, obj_id, Int32(offset), TYPE_I64)
+        end
         return obj_id
     end
 
@@ -2084,7 +2311,7 @@ function emit_pointerref(bc::BuilderCtx, args, ir)
     ptr_type = ptr_type isa Core.Const ? ptr_type.val : ptr_type
     elem_T = ptr_type isa DataType && ptr_type <: Ptr && length(ptr_type.parameters) > 0 ?
              ptr_type.parameters[1] : Int64
-    elem_size = sizeof(elem_T)
+    elem_size = _elem_size(elem_T)
 
     # Compute element address: ptr + (idx - 1) * elem_size
     # idx - 1
@@ -2140,7 +2367,7 @@ function emit_pointerset(bc::BuilderCtx, args, ir)
     ptr_type = ptr_type isa Core.Const ? ptr_type.val : ptr_type
     elem_T = ptr_type isa DataType && ptr_type <: Ptr && length(ptr_type.parameters) > 0 ?
              ptr_type.parameters[1] : Int64
-    elem_size = sizeof(elem_T)
+    elem_size = _elem_size(elem_T)
 
     # Compute element address: ptr + (idx - 1) * elem_size
     one_id = emit_constant(bc, Int64(1))  # idx is always i64
@@ -2178,25 +2405,66 @@ end
 # === MemoryRef managed-memory operators ===
 
 function emit_memoryrefnew(bc::BuilderCtx, args, ir, stmt_idx)
-    # memoryrefnew(memref::MemoryRef{T}, idx::Int, ordered::Bool) → MemoryRef{T}
+    # memoryrefnew(mem::Union{Memory{T},MemoryRef{T}}, idx::Int, ordered::Bool) → MemoryRef{T}
     # Creates a new MemoryRef pointing to element at 1-based index idx.
+    # Two base shapes (see Memory/MemoryRef layouts):
+    #   MemoryRef{T}: ptr_or_offset @ off 0 → IS the element address (base-relative)
+    #   Memory{T}:    COMPILED-alloc layout (gc.rs __jl_gc_alloc_array_julia):
+    #                 length @ off 0, inline element data @ off 8 (like String);
+    #                 element-data addr = base+8 (iadd). Real host Memory has a
+    #                 Ptr :ptr field @ off 8 (gc.rs 207-209) -- not this path.
     memref_val = args[1]
     idx_val = args[2]
 
-    # Get the MemoryRef's base info from ref_tracking
+    # Get the base info from ref_tracking (in-function Case 2 / memoryrefnew chain)
     tracked = (memref_val isa Core.SSAValue && haskey(bc.ref_tracking, memref_val)) ?
               bc.ref_tracking[memref_val] : nothing
-    tracked === nothing && error("memoryrefnew: operand not a tracked MemoryRef")
 
-    base_id, base_off, memref_T = tracked
+    # Derive the operand's Memory/MemoryRef type for the untracked fallback.
+    memref_T = tracked !== nothing ? tracked[3] :
+               (let t = get_operand_type(memref_val, ir)
+                    t isa Core.Const ? t.val : t
+                end)
+    is_memory = memref_T isa DataType && memref_T.name.name === :GenericMemory
     elem_T = memref_T isa DataType && length(memref_T.parameters) >= 2 ?
              memref_T.parameters[2] : Int64  # param 1=ordering, param 2=T
-    elem_size = sizeof(elem_T)
+    elem_size = _elem_size(elem_T)
 
-    # Load data pointer from base + base_off (field ptr_or_offset at offset 0)
     load_ptr = Libdl.dlsym(bc.lib_handle, :block_add_load)
-    data_ptr_id = ccall(load_ptr, UInt32, (Ptr{Cvoid}, UInt32, Int32, UInt32),
-                        bc.fctx_handle, base_id, Int32(base_off), TYPE_I64)
+    if tracked !== nothing
+        base_id, base_off, _ = tracked
+        # MemoryRef: element addr lives at base+off+0 (ptr_or_offset).
+        # Memory:    data ptr lives at base+off+8 (Memory.ptr field).
+        data_field_off = is_memory ? 8 : 0
+        data_ptr_id = ccall(load_ptr, UInt32, (Ptr{Cvoid}, UInt32, Int32, UInt32),
+                            bc.fctx_handle, base_id, Int32(base_off + data_field_off), TYPE_I64)
+    else
+        # Untracked base (cross-boundary: callee return, PhiNode, or Case-4
+        # mutable-field load). The ssa_values entry holds:
+        #   MemoryRef{T} (immutable, never Case-4): the element address directly
+        #     (set by Case 2's leading-pointer load — ptr_or_offset @ +0).
+        #   Memory{T}    (mutable, Case-4 loadable): the Memory OBJECT pointer.
+        #     IMPORTANT: this branch is only correct for Memory objects ALLOCATED
+        #     BY THIS CODEGEN (emit_memorynew -> __jl_gc_alloc_array_julia,
+        #     gc.rs 212-215), whose layout is [type_tag(8)][length@0][inline
+        #     element data@8] -- element data is INLINE at obj+8 (like String).
+        #     The old `load obj+8` read those inline bytes as a fake pointer ->
+        #     SIGBUS on the next deref (the Lexer crash). The element-data
+        #     address is obj+8, COMPUTED BY ADDITION (iadd), not loaded. This
+        #     untracked is_memory branch is reached for compiled-allocated Memory
+        #     (e.g. getfield(io::IOBuffer,:data) where the IOBuffer was built by
+        #     compiled code in JuliaSyntax.parse!). Host-passed Vectors use the
+        #     MemoryRef path (is_memory=false).
+        base_id = resolve_operand(bc, memref_val, ir)
+        if is_memory
+            eight_id = emit_constant(bc, Int64(8))
+            iadd_ptr = Libdl.dlsym(bc.lib_handle, :block_add_iadd)
+            data_ptr_id = ccall(iadd_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
+                                bc.fctx_handle, base_id, eight_id)
+        else
+            data_ptr_id = base_id
+        end
+    end
 
     # Compute element offset: (idx - 1) * elem_size
     idx_id = resolve_operand(bc, idx_val, ir)
@@ -2230,12 +2498,23 @@ function emit_memoryrefget(bc::BuilderCtx, args, ir)
 
     tracked = (memref_val isa Core.SSAValue && haskey(bc.ref_tracking, memref_val)) ?
               bc.ref_tracking[memref_val] : nothing
-    tracked === nothing && error("memoryrefget: operand not a tracked MemoryRef")
 
-    base_id, base_off, memref_T = tracked
-    elem_T = memref_T isa DataType && length(memref_T.parameters) >= 2 ?
+    elem_T, elem_type_enum, base_id, base_off = if tracked !== nothing
+        b_id, b_off, memref_T = tracked
+        eT = memref_T isa DataType && length(memref_T.parameters) >= 2 ?
              memref_T.parameters[2] : Int64  # param 1=ordering, param 2=T
-    elem_type_enum = cranelift_type(elem_T)
+        (eT, cranelift_type(eT), b_id, b_off)
+    else
+        # Untracked (cross-boundary). resolve_operand gives the element address
+        # directly (ssa_values for a MemoryRef holds its element address, set by
+        # Case 2's leading-pointer load or by emit_memoryrefnew). Derive the
+        # element type from the operand's IR type so we load the right width.
+        memref_T = get_operand_type(memref_val, ir)
+        memref_T = memref_T isa Core.Const ? memref_T.val : memref_T
+        eT = memref_T isa DataType && length(memref_T.parameters) >= 2 ?
+             memref_T.parameters[2] : Int64
+        (eT, cranelift_type(eT), resolve_operand(bc, memref_val, ir), 0)
+    end
 
     load_ptr = Libdl.dlsym(bc.lib_handle, :block_add_load)
     return ccall(load_ptr, UInt32, (Ptr{Cvoid}, UInt32, Int32, UInt32),
@@ -2249,12 +2528,20 @@ function emit_memoryrefset(bc::BuilderCtx, args, ir)
 
     tracked = (memref_val isa Core.SSAValue && haskey(bc.ref_tracking, memref_val)) ?
               bc.ref_tracking[memref_val] : nothing
-    tracked === nothing && error("memoryrefset!: operand not a tracked MemoryRef")
 
-    base_id, base_off, memref_T = tracked
-    elem_T = memref_T isa DataType && length(memref_T.parameters) >= 2 ?
-             memref_T.parameters[2] : Int64  # param 1=ordering, param 2=T
-    elem_type_enum = cranelift_type(elem_T)
+    base_id, base_off, elem_type_enum = if tracked !== nothing
+        b_id, b_off, memref_T = tracked
+        eT = memref_T isa DataType && length(memref_T.parameters) >= 2 ?
+             memref_T.parameters[2] : Int64
+        (b_id, b_off, cranelift_type(eT))
+    else
+        # Untracked (cross-boundary). resolve_operand gives the element address.
+        memref_T = get_operand_type(memref_val, ir)
+        memref_T = memref_T isa Core.Const ? memref_T.val : memref_T
+        eT = memref_T isa DataType && length(memref_T.parameters) >= 2 ?
+             memref_T.parameters[2] : Int64
+        (resolve_operand(bc, memref_val, ir), 0, cranelift_type(eT))
+    end
 
     val_id = resolve_operand(bc, val, ir)
 
@@ -2275,6 +2562,26 @@ function emit_isa(bc::BuilderCtx, args, ir)
     target_type = args[2]
     target_type isa QuoteNode && (target_type = target_type.value)
     target_type isa Core.Const && (target_type = target_type.val)
+
+    # Targeted lowering for the generic kwcall sorter: when x is a Vararg-tuple
+    # produced by Core._apply_iterate over a runtime Vector (recorded in
+    # vararg_tuple_coll), `isa(x, Tuple{})` is the "any kwargs set?" check and
+    # lowers to `length(vec) == 0`. A Vector's length lives at offset +16
+    # (:size field, Tuple{Int64}).
+    if target_type === Tuple{} && args[1] isa Core.SSAValue &&
+       haskey(bc.vararg_tuple_coll, args[1])
+        vec_id = bc.vararg_tuple_coll[args[1]]
+        load_ptr = Libdl.dlsym(bc.lib_handle, :block_add_load)
+        len_id = ccall(load_ptr, UInt32, (Ptr{Cvoid}, UInt32, Int32, UInt32),
+                       bc.fctx_handle, vec_id, Int32(16), TYPE_I64)
+        zero_id = emit_constant(bc, Int64(0))
+        icmp_ptr = Libdl.dlsym(bc.lib_handle, :block_add_icmp)
+        result = ccall(icmp_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32, UInt32),
+                       bc.fctx_handle, ICMP_EQ, len_id, zero_id)
+        ext_ptr = Libdl.dlsym(bc.lib_handle, :block_add_uextend)
+        return ccall(ext_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
+                     bc.fctx_handle, result, TYPE_I32)
+    end
 
     val_id = resolve_operand(bc, args[1], ir)
 
@@ -2338,6 +2645,27 @@ function emit_isa(bc::BuilderCtx, args, ir)
                             bc.fctx_handle, result, TYPE_I32)
             end
         end
+    end
+
+    # Case 4: isa(x, T) for a concrete DataType target where x is a heap pointer
+    # (covers isa(x, Tuple{}) — e.g. checking whether a varargs tuple is empty —
+    # and isa(x, SomeConcreteStruct)). Load x's type tag from the object header
+    # (offset 0) and compare to pointer_from_objref(T). Tuples are ALWAYS heap
+    # objects (even Tuple{}, which isbitstype reports as true / sizeof 0), so
+    # include T <: Tuple; exclude scalar bitstypes (Int etc.) which aren't heap ptrs.
+    if target_type isa DataType && isconcretetype(target_type) &&
+       (target_type <: Tuple || !isbitstype(target_type))
+        type_ptr = pointer_from_objref(target_type)
+        type_ptr_id = emit_constant(bc, Int64(reinterpret(UInt64, type_ptr)))
+        load_ptr = Libdl.dlsym(bc.lib_handle, :block_add_load)
+        loaded_tag = ccall(load_ptr, UInt32, (Ptr{Cvoid}, UInt32, Int32, UInt32),
+                         bc.fctx_handle, val_id, Int32(0), TYPE_I64)
+        icmp_ptr = Libdl.dlsym(bc.lib_handle, :block_add_icmp)
+        result = ccall(icmp_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32, UInt32),
+                     bc.fctx_handle, ICMP_EQ, loaded_tag, type_ptr_id)
+        ext_ptr = Libdl.dlsym(bc.lib_handle, :block_add_uextend)
+        return ccall(ext_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
+                    bc.fctx_handle, result, TYPE_I32)
     end
 
     throw(CompileError("unsupported isa target: $target_type"))
@@ -2433,12 +2761,20 @@ function emit_memoryrefunset(bc::BuilderCtx, args, ir)
 
     tracked = (memref_val isa Core.SSAValue && haskey(bc.ref_tracking, memref_val)) ?
               bc.ref_tracking[memref_val] : nothing
-    tracked === nothing && error("memoryrefunset!: operand not a tracked MemoryRef")
 
-    base_id, base_off, memref_T = tracked
-    elem_T = memref_T isa DataType && length(memref_T.parameters) >= 2 ?
+    base_id, base_off, elem_type_enum = if tracked !== nothing
+        b_id, b_off, memref_T = tracked
+        eT = memref_T isa DataType && length(memref_T.parameters) >= 2 ?
              memref_T.parameters[2] : Int64
-    elem_type_enum = cranelift_type(elem_T)
+        (b_id, b_off, cranelift_type(eT))
+    else
+        # Untracked (cross-boundary). resolve_operand gives the element address.
+        memref_T = get_operand_type(memref_val, ir)
+        memref_T = memref_T isa Core.Const ? memref_T.val : memref_T
+        eT = memref_T isa DataType && length(memref_T.parameters) >= 2 ?
+             memref_T.parameters[2] : Int64
+        (resolve_operand(bc, memref_val, ir), 0, cranelift_type(eT))
+    end
 
     zero_id = emit_constant(bc, Int64(0))
     store_ptr = Libdl.dlsym(bc.lib_handle, :block_add_store)
@@ -2516,7 +2852,7 @@ function emit_memorynew(bc::BuilderCtx, args, ir)
 
     elem_T = mem_T isa DataType && length(mem_T.parameters) >= 2 ?
              mem_T.parameters[2] : Int64  # param 1=ordering, param 2=T
-    elem_size = UInt32(sizeof(elem_T))
+    elem_size = UInt32(_elem_size(elem_T))
 
     n_id = resolve_operand(bc, n, ir)
     # __jl_gc_alloc_array_julia expects i32 — reduce from i64
@@ -2611,6 +2947,70 @@ function emit_core_tuple(bc::BuilderCtx, args, ir)
     return ptr_id
 end
 
+# Sentinel for "_const_value could not resolve this to a compile-time constant".
+struct _NotConst end
+
+# Resolve an IR operand to its compile-time Julia value, or _NotConst() if it is
+# not a known constant. Used by emit_apply_iterate to constant-fold kwarg/varargs
+# splats whose collection is a literal.
+function _const_value(val, ir)
+    val isa Core.Const && return val.val
+    val isa QuoteNode && return val.value
+    val isa Core.GlobalRef && return _const_value(getglobal(val.mod, val.name), ir)
+    val === nothing && return nothing
+    val isa Number && return val
+    val isa AbstractString && return val
+    val isa Function && return val
+    val isa Symbol && return val
+    val isa Bool && return val
+    val isa Tuple && begin
+        els = [_const_value(x, ir) for x in val]
+        any(e -> e isa _NotConst, els) && return _NotConst()
+        return tuple(els...)
+    end
+    val isa NamedTuple && begin
+        vals = [_const_value(x, ir) for x in values(val)]
+        any(v -> v isa _NotConst, vals) && return _NotConst()
+        return NamedTuple{keys(val)}(vals)
+    end
+    val isa Core.SSAValue || return _NotConst()
+    t = ir.stmts[val.id][:type]
+    t isa Core.Const && return t.val
+    stmt = ir.stmts[val.id][:stmt]
+    if stmt isa Expr && stmt.head == :call && length(stmt.args) >= 1 &&
+       (stmt.args[1] === Core.tuple || (stmt.args[1] isa Core.GlobalRef && stmt.args[1].name === :tuple))
+        els = [_const_value(a, ir) for a in stmt.args[2:end]]
+        any(e -> e isa _NotConst, els) && return _NotConst()
+        return tuple(els...)
+    end
+    return _NotConst()
+end
+
+# Core._apply_iterate(iterate, g, coll) = g(iterate(coll)...) — the kwarg/varargs
+# splat lowering. Compile-time-evaluate when `coll` is a known constant (e.g.
+# constant kwargs to open_flags(; read=true, …)); emit the result as a heap
+# pointer. Dynamic collections throw CompileError (tolerated → sentinel).
+function emit_apply_iterate(bc::BuilderCtx, args, ir, stmt_idx)
+    length(args) < 3 && throw(CompileError("_apply_iterate needs >=3 args"))
+    coll = _const_value(args[3], ir)
+    if !(coll isa _NotConst)
+        result = Core._apply_iterate(Base.iterate, Core.tuple, coll)
+        return emit_constant(bc, result)
+    end
+    # Non-constant collection (e.g. the generic kwcall sorter building a Vector of
+    # set-kwarg names at runtime). When the result type is a NON-CONCRETE (Vararg)
+    # Tuple, the value is only ever consumed by `isa(result, Tuple{})` (the
+    # any-kwargs-set check). Record the collection's value id so emit_isa can lower
+    # that to `length(coll) == 0`, and return the collection id as the SSA value.
+    resT = try; ir.stmts[stmt_idx][:type]; catch _; nothing; end
+    if resT isa DataType && resT <: Tuple && !isconcretetype(resT)
+        coll_id = resolve_operand(bc, args[3], ir)
+        bc.vararg_tuple_coll[Core.SSAValue(stmt_idx)] = coll_id
+        return coll_id
+    end
+    throw(CompileError("_apply_iterate: non-constant collection not yet supported"))
+end
+
 function emit_new(bc::BuilderCtx, T, field_args, ir, stmt_idx)
     # %new(T, fields...) — construct a new struct with Julia-compatible allocation
     # T can be: Core.Const, Core.GlobalRef, or direct DataType
@@ -2637,11 +3037,22 @@ function emit_new(bc::BuilderCtx, T, field_args, ir, stmt_idx)
             nel = size_arg[1]
             nel_id = emit_constant(bc, Int64(nel))
         elseif size_arg isa Core.SSAValue
-            # Dynamic size: resolve the Tuple{Int64} SSA and load field 1 (Int64)
-            tuple_ptr_id = resolve_operand(bc, size_arg, ir)
-            load_ptr = Libdl.dlsym(bc.lib_handle, :block_add_load)
-            nel_id = ccall(load_ptr, UInt32, (Ptr{Cvoid}, UInt32, Int32, UInt32),
-                         bc.fctx_handle, tuple_ptr_id, Int32(0), TYPE_I64)
+            # Dynamic size. The size arg is `Core.tuple(n)` of type Tuple{Int64}.
+            # emit_core_tuple PASSES single-element tuples through (no heap allocation),
+            # so for Tuple{Int64} the SSA already IS the element-count Int64 — loading
+            # it as a pointer (old code) dereferences the integer length (e.g. 0x5),
+            # SIGSEGV. Only multi-element tuples are heap-allocated and need a load.
+            local size_T = get_operand_type(size_arg, ir)
+            size_T = size_T isa Core.Const ? size_T.val : size_T
+            if size_T isa DataType && size_T <: Tuple && length(size_T.parameters) == 1
+                # 1-element tuple passed through by emit_core_tuple: value IS nel.
+                nel_id = resolve_operand(bc, size_arg, ir)
+            else
+                tuple_ptr_id = resolve_operand(bc, size_arg, ir)
+                load_ptr = Libdl.dlsym(bc.lib_handle, :block_add_load)
+                nel_id = ccall(load_ptr, UInt32, (Ptr{Cvoid}, UInt32, Int32, UInt32),
+                             bc.fctx_handle, tuple_ptr_id, Int32(0), TYPE_I64)
+            end
         else
             error("emit_new(array): only 1-d arrays supported, got size $size_arg")
         end

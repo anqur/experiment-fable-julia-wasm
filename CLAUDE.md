@@ -491,33 +491,114 @@ Three confirmed facts that govern this:
 cleanly** (0 Cranelift verifier failures, down from 8 then 7). Full
 `test_edsl_approach.jl` suite still passes.
 
-**Runtime (the current frontier):** `parse_into("1 + 2")` still segfaults at
-runtime in `#ParseStream#18` (`__compiled_fn_2`), which COMPILES but
-miscompiles — a runtime miscompilation (likely struct/array allocation or
-field-access bug in the `ParseStream(::String)` constructor), NOT a trap stub.
-This is the next thing to fix.
+**Runtime (current frontier — the long tail):** `parse_into("1 + 2")` still
+segfaults at runtime, but the segfault has moved steadily as each miscompilation
+is fixed. P1 progress so far:
+- **FIXED: `#ParseStream#18` wrong-base-load.** `emit_new`'s array dynamic-size
+  arm treated the size tuple (`Core.tuple(n)` :: `Tuple{Int64}`) as a heap
+  pointer and loaded field 0 from it — but `emit_core_tuple` PASSES single-element
+  tuples through (no heap alloc), so the SSA was already the length Int64. Loading
+  from address == length (e.g. 0x5) → SIGSEGV. Fix: detect 1-element size tuples
+  and use the value directly.
+- **FIXED: emit-loop "fill your block before switching" Rust panic.** The catch
+  set `had_terminator=true` whenever a terminator statement was SEEN, even if its
+  emit threw (caught) — so no fallback terminator fired, the block stayed
+  unfilled, and the next `switch_to_block` aborted the process (Rust panic across
+  FFI = abort). Fix: track `terminator_emitted` (set only on SUCCESSFUL term emit)
+  separately and key the fallback off it. Also hardened the catch sentinel to use
+  `_undef_placeholder` (typed zero).
+
+  With these, `test_final.jl` **Tier 3b passes entirely**, including `parse_into
+  runtime (host parse, native iterate) ✅ (7 events)` — native iteration of a
+  host-built `ParseStream` works.
+
+**FIXED (this turn) — the bulk of the runtime long tail.** Tolerated throws
+went from **925 → ~40**, 0 verifier errors, `test_edsl_approach.jl` still 93 ✅:
+- **MemoryRef dispatch gap (was 696, the dominant blocker).** `Core.memoryrefnew/
+  get/set!/offset` are Core singletons (like `Core.memoryrefunset!`/`Core.isa`),
+  NOT `Core.IntrinsicFunction` and NOT `GlobalRef` — so they bypassed BOTH handlers
+  and hit "Unsupported call". Fix: dispatch them by identity in `emit_instruction`.
+  Also added a cross-boundary fallback in `emit_memoryrefget/set/new/unset` (use
+  `resolve_operand` as the element pointer + derive element type from the IR type
+  when the memref is untracked — e.g. a callee return), and made Case 2 getfield of
+  a MemoryRef field store a usable element-address in `ssa_values` (not a sentinel).
+- **`_elem_size`** helper: `sizeof` THROWS for non-bitstype heap element types
+  (Symbol, String) used in `Memory{Symbol}` / arrays → use pointer-size (8).
+- **Vector/Dict/Symbol operands**: `resolve_operand` now `pointer_from_objref`s
+  any remaining heap object (module-constant `Vector`, `Symbol`, structs) instead
+  of erroring — unblocks `getfield(UnicodeNext._properties, :ref)`-style access.
+- **`isa(x, Tuple{})`** + concrete-heap-type targets: load type tag from object
+  header, compare to `pointer_from_objref(T)` (Case 4 in `emit_isa`; tuples are
+  always heap, even bitstype `Tuple{}`).
+- **Int128 constants**: `emit_constant` now handles sz==16 via bit-mask (low 64
+  bits). `UInt64(Int128)` is a *checked* conversion that throws for negatives —
+  the literal `-9223372036854775808` is `Int128`. The low-64-bits value is correct
+  for in-range Int128 (the overflow-check bounds), matching `cranelift_type(Int128)=TYPE_PTR/i64`.
+- **`Core._apply_iterate`** (kwarg/varargs splat): compile-time-evaluates when the
+  collection is a literal constant; else throws `CompileError` (the runtime/dynamic
+  case is the remaining wall — see below).
+- Cheap no-op GlobalRefs: `compilerbarrier`, `typeassert`, `_str_sizehint`.
+
+**More FIXED (this stretch) — three runtime miscompilations; the segfault marched
+through the call graph:**
+- **`open_flags` kwcall → compile-time-eval.** `open_flags(; read=true,…)` lowers
+  through the generic `Core.kwcall` sorter. `emit_invoke` now detects the kwcall
+  (callee `f` is a GlobalRef/QuoteNode wrapping `Core.kwcall` — NOT by
+  `method.name`, which is the sorted function's name) and, when the kwargs
+  NamedTuple is a compile-time constant (literal kwargs), evaluates the kwcall in
+  host Julia and emits the constant result — bypassing the sorter entirely (so it
+  is never invoked at runtime). `_const_value` was extended to resolve `nothing`,
+  `Function`, `NamedTuple`, `GlobalRef`.
+- **Lexer `Memory{T}` inline-data.** `emit_memoryrefnew`'s untracked `is_memory`
+  branch did `load(base+8)` to get a "data pointer", but a codegen-allocated
+  `Memory{T}` stores element data INLINE at obj+8 (like String — `gc.rs
+  __jl_gc_alloc_array_julia`: [type_tag][length@0][inline data@8]); loading obj+8
+  read the inline bytes ("hell"…) as a fake pointer → SIGBUS/SIGSEGV. Fix: compute
+  the element-data address as `base+8` via `iadd`, not load.
+- Result: `parse_into("1 + 2")` now runs PAST ParseStream construction, open_flags,
+  AND the Lexer — the segfault moved to `parse_toplevel` (which calls `peek_token`).
+
+**The current wall — generic kwcall sorter with RUNTIME positional args.**
+`parse_toplevel` calls `peek_token(ps, 1; skip_newlines=true, skip_whitespace=true)`:
+constant kwargs but a RUNTIME positional arg (`ps`), so the whole call can't be
+constant-eval'd. Julia's kwarg core methods do NOT take kwargs as trailing params
+(`peek_token`'s core is `(ParseStream, Integer)`), so a "call the core method with
+baked kwargs" bypass finds no method — the sorter IS the body. The sorter
+(`#peek_token#N`, 230 stmts) builds a `Memory{Symbol}` of set-kwarg names and runs
+`Core._apply_iterate(iterate, tuple, mem)` → `Tuple{Vararg{Symbol}}`, whose result
+is used ONLY in `isa(result, Tuple{})` (any-kwargs-set check). Supporting this
+needs either (a) real runtime `_apply_iterate` / Vararg-tuple construction, or
+(b) a targeted lowering (`_apply_iterate`→collection, `isa(…,Tuple{})`→
+`length(mem)==0` via `load(mem+0)`) — the latter is fragile (Memory-pipeline-
+specific) and the sorter's other ~228 stmts (getfield kwargs + the tokenize body)
+must also compile. This is the major feature blocking `parse!` end-to-end.
+Remaining minor throws (~13): `jl_genericmemory_to_*` foreigncall (3),
+`checked_urem_int` (3), getfield on non-concrete `Tuple` (2), `MemoryRef{...}`
+type (1), `print` (1).
 
 **Diagnostic env vars (keep using these):**
-- `NCG_TRACE_RETHROW=1` — log every rethrown emit exception with its IR stmt
-  (in the emit-loop catch, `builder_emit.jl`).
+- `NCG_TRACE_RETHROW=1` — log every REWN (rethrown) emit exception with its IR
+  stmt (non-tolerated throws that abort a fn's emission).
+- `NCG_TRACE_SENTINEL=1` — log every TOLERATED throw (CompileError/ErrorException)
+  that becomes a zero sentinel (the runtime-miscompilation long tail).
 - `NATIVE_BUILDER_DUMP_DIR=<dir>` — write each function's full Cranelift IR to
   `<dir>/<name>.cranelift` (in `native-builder/src/builder.rs::finalize`, before
   `define_function` — captures failing fns too).
 
 **Next work items:**
-1. **P1 — runtime miscompilation in `#ParseStream#18`.** Differential-test the
-   compiled `ParseStream(::String)` constructor against the host: dump its
-   Cranelift IR (`NATIVE_BUILDER_DUMP_DIR`), compare field stores/loads and the
-   allocated struct layout against `pointer_from_objref`-derived expectations
-   (CLAUDE.md "Key Julia object layouts"). Suspects: `:new` allocation of the
-   ParseStream struct, Vector/Memory field initialization, or a getfield on a
-   freshly-allocated field returning garbage.
-2. **P1 (defense-in-depth) — harden the emit loop** so a future rethrow can't
-   cascade into a misleading verifier error: on rethrow, emit a `trap`
-   terminator for that block and `continue` instead of aborting the whole fn.
-3. Beyond ParseStream: once `parse_into` runs past construction, expect more
-   runtime miscompilations to surface in `parse!`/`Lexer`/`next_token` — same
-   differential-testing approach.
+1. **P1 — the MemoryRef tracking pipeline** (highest leverage, ~75% of runtime
+   throws). `ref_tracking` must record MemoryRefs produced by more paths
+   (function returns, getfield of Memory fields on untracked bases, cross-call
+   results). Approach: differential-test array-iterating functions against the
+   host; widen `ref_tracking` population in `emit_memoryrefnew` /
+   `emit_struct_getfield` / `emit_invoke` (callee returns a Memory).
+2. **P1 — `count_lit` / `open_flags` segfaults** (Tier 4) — likely the same
+   MemoryRef root cause (they iterate `Vector`s / use token buffers).
+3. **Long-tail codegen gaps** (each a real feature): `bitcast` size mismatch,
+   `Memory{Symbol}` / Symbol definite-size, `isa(x, Tuple{})`, `Core._apply_iterate`
+   (varargs), Dict operands, `Vector{<abstract>}` operands.
+4. Once `parse_into` runs end-to-end, uncomment the runtime assertions in
+   `test_final.jl`'s `parse_into — native parse + native iterate` test (L1015–1019).
 
 ### Bridge type dispatch
 

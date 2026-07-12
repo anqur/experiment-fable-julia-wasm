@@ -985,10 +985,12 @@ const WEB_CORPUS = [
 
     @testset "parse_into — native parse + native iterate (from examples/parser)" begin
         # FULL native pipeline: ParseStream(src) → parse!(ps) → iterate ps.output.
-        # # TODO: Runtime blocked — recursive pipeline cannot yet compile parse!
-        # and ParseStream (8 remaining callee verifier errors in Lexer,
-        # parse_float_literal, print_to_string, _sort!, _buffer_lookahead_tokens,
-        # next_token, lex_string_chunk).
+        # # TODO: Runtime blocked. All callees now COMPILE (0 verifier errors) and
+        # # ParseStream construction + native iteration are fixed, but parse! itself
+        # # still miscompiles at runtime — the MemoryRef tracking pipeline
+        # # (~75% of sentinel throws) degrades array accesses to zero sentinels →
+        # # segfault in open_flags/next_token/etc. See CLAUDE.md recursive-pipeline
+        # # status. Uncomment the runtime block below once parse! runs end-to-end.
         print("  parse_into … ")
         try
             import Base.JuliaSyntax as JS
