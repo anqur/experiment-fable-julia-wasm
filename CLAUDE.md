@@ -555,26 +555,70 @@ through the call graph:**
   __jl_gc_alloc_array_julia`: [type_tag][length@0][inline data@8]); loading obj+8
   read the inline bytes ("hell"…) as a fake pointer → SIGBUS/SIGSEGV. Fix: compute
   the element-data address as `base+8` via `iadd`, not load.
-- Result: `parse_into("1 + 2")` now runs PAST ParseStream construction, open_flags,
-  AND the Lexer — the segfault moved to `parse_toplevel` (which calls `peek_token`).
+- **peek_token / generic kwcall sorter → targeted lowering.** The sorter
+  (`#peek_token#N`, 230 stmts) builds a `Vector{Symbol}` of set-kwarg names and
+  runs `Core._apply_iterate(iterate, tuple, vec)` → `Tuple{Vararg{Symbol}}`,
+  whose result is used ONLY in `isa(result, Tuple{})` (any-kwargs-set check).
+  Fix: targeted lowering in `emit_apply_iterate` (when the result type is a
+  non-concrete/Vararg Tuple, store the collection in a side-table
+  `vararg_tuple_coll` and return it as the SSA value) and `emit_isa` (for
+  `isa(x, Tuple{})` where x is in the side-table, emit `load(vec+16) == 0`).
+- **`_buffer_lookahead_tokens` → array-grow elem-size + SyntaxToken packer.** Two
+  bugs: the `_growend_internal!` handler hardcoded `elem_size = Int64(8)` →
+  `Vector{SyntaxToken}` (12-byte elements) allocated undersized buffers → heap
+  overflow → SIGSEGV; `emit_new` bitstype packer packed ALL bitstypes into a
+  single i64 register, including sizeof>8 types (SyntaxToken=12), where fields
+  at byte-offset ≥8 overflowed → data corruption. Fixes: derive elem_size from
+  `callee_mi.specTypes`; skip register-packing when `cranelift_type==TYPE_PTR`.
+- **`peek_token` sorter → NamedTuple TYPE_PTR.** `@NamedTuple{::Bools}` is
+  bitstype but heap; `cranelift_type` mapped it to `TYPE_I32` (bitstype sizeof
+  rule, missing `T <: NamedTuple`). Fix: add `T <: NamedTuple` to the
+  `TYPE_PTR` check.
+- **`peek_token` sorter → Case 3b (getfield of large bitstype from inline
+  storage).** `cranelift_type(SyntaxToken)=TYPE_PTR`. `emit_struct_getfield`
+  Case 4 dereferenced a loaded i64 (inline SyntaxToken bytes) as a heap
+  pointer → SIGSEGV/SIGILL. Fix: Case 3b — for large bitstypes, extract
+  fields from the i64 register via ireduce/ushr (offsets 0-7 only; ≥8 needs
+  ref_tracking/pointer model — deferred).
+- **Zero-fill heap allocs** (bounded, non-overrunning): `emit_new`'s
+  `__jl_gc_alloc_julia` path now zero-fills before field stores, preventing
+  uninitialized-field traps (e.g. `peek_count` at offset 72, not explicitly
+  stored by the constructor, reading malloc garbage → bounds-check trap).
+- **Heap-pointer model for large bitstypes**: `emit_new` records
+  `ref_tracking[ssa]=(ptr,0,T)` so `getfield` uses Case 1 (heap load at
+  fieldoffset) rather than Case 3b (register shift). Write paths
+  (`emit_pointerset`/`emit_memoryrefset`) store the pointer directly (8 bytes,
+  TYPE_PTR) into the Vector element slot.
+- **Result: `parse_into("1 + 2")` now runs through ParseStream, open_flags,
+  Lexer, parse_toplevel, peek_token sorter, and partially through
+  buffer_lookahead_tokens — the SIGILL in buffer_lookahead is from an
+  overflow check in its body (block14, conversion-overflow). All 18
+  `_apply_iterate` throws are 0. Remaining minor throws (~10): as before.
 
-**The current wall — generic kwcall sorter with RUNTIME positional args.**
-`parse_toplevel` calls `peek_token(ps, 1; skip_newlines=true, skip_whitespace=true)`:
-constant kwargs but a RUNTIME positional arg (`ps`), so the whole call can't be
-constant-eval'd. Julia's kwarg core methods do NOT take kwargs as trailing params
-(`peek_token`'s core is `(ParseStream, Integer)`), so a "call the core method with
-baked kwargs" bypass finds no method — the sorter IS the body. The sorter
-(`#peek_token#N`, 230 stmts) builds a `Memory{Symbol}` of set-kwarg names and runs
-`Core._apply_iterate(iterate, tuple, mem)` → `Tuple{Vararg{Symbol}}`, whose result
-is used ONLY in `isa(result, Tuple{})` (any-kwargs-set check). Supporting this
-needs either (a) real runtime `_apply_iterate` / Vararg-tuple construction, or
-(b) a targeted lowering (`_apply_iterate`→collection, `isa(…,Tuple{})`→
-`length(mem)==0` via `load(mem+0)`) — the latter is fragile (Memory-pipeline-
-specific) and the sorter's other ~228 stmts (getfield kwargs + the tokenize body)
-must also compile. This is the major feature blocking `parse!` end-to-end.
-Remaining minor throws (~13): `jl_genericmemory_to_*` foreigncall (3),
-`checked_urem_int` (3), getfield on non-concrete `Tuple` (2), `MemoryRef{...}`
-type (1), `print` (1).
+**More FIXED (this stretch) — two runtime miscompilations in buffer_lookahead / peek_token:**
+- **`_buffer_lookahead_tokens` → array-grow elem-size + SyntaxToken packer.** Two bugs:
+  the `_growend_internal!` handler hardcoded `elem_size = Int64(8)`, causing
+  `Vector{SyntaxToken}` (12-byte elements) to allocate undersized buffers → heap
+  overflow → SIGSEGV; `emit_new` bitstype packer packed ALL bitstypes into a
+  single i64 register, including `sizeof>8` types (SyntaxToken=12), where fields
+  at byte-offset ≥8 overflowed the i64 → data corruption. Fixes: derive elem_size
+  from `callee_mi.specTypes` (Array{T} → sizeof(T)); skip register-packing when
+  `cranelift_type` returns `TYPE_PTR` (sizeof>8 → heap-allocate via
+  `__jl_gc_alloc_julia`).
+- **`peek_token` sorter → NamedTuple TYPE_PTR.** `@NamedTuple{skip_newlines::Bool,
+  skip_whitespace::Bool}` (the kwarg NamedTuple) is bitstype/sizeof=2 but a heap
+  object. `cranelift_type` mapped it to `TYPE_I32` via the bitstype sizeof rule,
+  missing the NamedTuple heap-pointer case. `T <: Tuple` was handled but
+  NamedTuples aren't `<: Tuple`. Fix: add `T <: NamedTuple` to the `TYPE_PTR`
+  check — the kwcall sorter's NT arg is now i64 (pointer) instead of i32 (scalar),
+  so `getfield(nt, :skip_newlines)` loads from the right address.
+- **Result: `parse_into("1 + 2")` now runs through ParseStream, open_flags,
+  Lexer, parse_toplevel, and buffer_lookahead_tokens — the segfault became a
+  SIGILL (Cranelift bounds-check trap) in peek_token's sorter (555 lines, 7 trap
+  sites). A diagnosis+verify workflow is currently running to find which trap
+  fires. All 18 `_apply_iterate` throws are 0. Remaining minor throws (~10):
+  `jl_genericmemory_to_*` foreigncall (3), `checked_urem_int` (3), getfield on
+  non-concrete `Tuple` (2), `MemoryRef{...}` type (1).
 
 **Diagnostic env vars (keep using these):**
 - `NCG_TRACE_RETHROW=1` — log every REWN (rethrown) emit exception with its IR

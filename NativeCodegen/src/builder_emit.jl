@@ -47,8 +47,12 @@ function cranelift_type(T)
     T === Symbol && return TYPE_PTR
     (T === Int128 || T === UInt128) && return TYPE_PTR
     T isa DataType && Base.ismutabletype(T) && !(T <: Ptr) && return TYPE_PTR
-    # Handle tuples as pointer types (multi-element tuples need memory allocation)
-    T isa DataType && T <: Tuple && return TYPE_PTR
+    # Handle tuples and NamedTuples as pointer types — they are ALWAYS heap objects
+    # (even when isbitstype, e.g. Tuple{} is bitstype/sizeof 0, NamedTuple of Bools
+    # is bitstype/sizeof 2), so they must be passed as pointers. The kwcall sorter
+    # receives a NamedTuple of kwargs; treating it as a scalar (e.g. i32) breaks
+    # getfield(nt, :skip_newlines) because it dereferences the scalar as a pointer.
+    T isa DataType && (T <: Tuple || T <: NamedTuple) && return TYPE_PTR
     # Immutable non-bitstype structs with heap fields (e.g. GreenNode, Wrapper)
     # are also pointers. Exclude MemoryRef/Memory (need Case 2 ref_tracking).
     _is_heap_struct(T) && return TYPE_PTR
@@ -1564,8 +1568,22 @@ function emit_invoke(bc::BuilderCtx, invoke_target, f, args, ir, stmt_idx)
     if fn_name == :_growend_internal! && length(args) >= 2
         a_id = resolve_operand(bc, args[1], ir)
         delta_id = resolve_operand(bc, args[2], ir)
-        # TODO: derive from array type when _emit_array_elem_size works reliably
-        elem_size_id = emit_constant(bc, Int64(8))
+        # Derive element size from the array's concrete element type.
+        # Hardcoded 8 caused buffer overflow for Vector{SyntaxToken} (sizeof 12).
+        local elem_size = 8
+        if callee_mi isa Core.MethodInstance
+            local specTypes = callee_mi.specTypes
+            if specTypes isa DataType && length(specTypes.parameters) >= 3
+                local arr_T = specTypes.parameters[2]
+                if arr_T isa DataType && arr_T <: Array
+                    local el_T = eltype(arr_T)
+                    if el_T isa DataType && isbitstype(el_T)
+                        elem_size = sizeof(el_T)
+                    end
+                end
+            end
+        end
+        elem_size_id = emit_constant(bc, Int64(elem_size))
         return emit_call_runtime(bc, "__jl_array_grow_end", UInt32[a_id, delta_id, elem_size_id])
     end
     if fn_name == :resize! && length(args) >= 2
@@ -2266,6 +2284,38 @@ function emit_struct_getfield(bc::BuilderCtx, args, ir, stmt_idx)
         end
     end
 
+    # Case 3b: Large bitstype (sizeof > 8) mapped to TYPE_PTR by cranelift_type.
+    # The value was loaded as i64 from inline storage (e.g. Vector data) and is
+    # NOT a heap pointer. Extract the field from register bits instead of
+    # dereferencing. Fields at offset < 8 from the first-loaded register are
+    # available; fields at offset >= 8 need ref_tracking (TODO).
+    if T isa DataType && isbitstype(T)
+        offset = fieldoffset(T, field_sym)
+        field_T = fieldtype(T, field_sym)
+        ftype = cranelift_type(field_T)
+        if offset == 0
+            # Field at start: lower bytes of register ARE the field value.
+            if ftype == TYPE_I64 || ftype == TYPE_PTR
+                return obj_id
+            end
+            # Narrow from i64 to field width (e.g. i32 for SyntaxHead)
+            ird_ptr = Libdl.dlsym(bc.lib_handle, :block_add_ireduce)
+            return ccall(ird_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
+                         bc.fctx_handle, obj_id, ftype)
+        end
+        # Offset > 0: shift right to bring field to LSB, then narrow.
+        off_id = emit_constant(bc, Int64(offset * 8))
+        sh_ptr = Libdl.dlsym(bc.lib_handle, :block_add_ushr)
+        sh_id = ccall(sh_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
+                      bc.fctx_handle, obj_id, off_id)
+        if ftype == TYPE_I64 || ftype == TYPE_PTR
+            return sh_id
+        end
+        ird_ptr = Libdl.dlsym(bc.lib_handle, :block_add_ireduce)
+        return ccall(ird_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
+                     bc.fctx_handle, sh_id, ftype)
+    end
+
     # Case 4: regular mutable struct field — load from memory
     offset = fieldoffset(T, field_sym)
     field_type_enum = cranelift_type(field_T)
@@ -2392,7 +2442,10 @@ function emit_pointerset(bc::BuilderCtx, args, ir)
     elem_addr_id = ccall(iadd_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
                           bc.fctx_handle, ptr_id, byte_off_id)
 
-    # Store val at elem_addr + 0
+    # Store val at elem_addr + 0. For large bitstypes (sizeof > 8, e.g.
+    # SyntaxToken=12), the value is a heap pointer stored in a TYPE_PTR-width
+    # element slot — store the pointer directly (8 bytes). The ref_tracking
+    # entry set by emit_new routes getfield to Case 1 (heap load).
     elem_type_enum = cranelift_type(elem_T)
     store_ptr = Libdl.dlsym(bc.lib_handle, :block_add_store)
     ccall(store_ptr, Cvoid, (Ptr{Cvoid}, UInt32, Int32, UInt32, UInt32),
@@ -3082,33 +3135,39 @@ function emit_new(bc::BuilderCtx, T, field_args, ir, stmt_idx)
 
     # Bitstype immutable struct — pack fields into a register via uextend + ishl +
     # bor (the inverse of the existing getfield Case 3 ushr + band extraction).
-    # Only ≤8-byte structs (cranelift_type succeeds); larger need multi-register.
+    # Only ≤8-byte structs (cranelift_type succeeds); larger fall through to heap
+    # allocation (multi-register values cannot be packed into a single i64).
     if T isa DataType && isbitstype(T)
         ct = cranelift_type(T)
-        field_ids = [resolve_operand(bc, fa, ir) for fa in field_args]
-        nf = length(field_ids)
-        nf == 0 && return emit_constant(bc, Int64(0))
-        uext_ptr  = Libdl.dlsym(bc.lib_handle, :block_add_uextend)
-        shl_ptr   = Libdl.dlsym(bc.lib_handle, :block_add_ishl)
-        bor_ptr   = Libdl.dlsym(bc.lib_handle, :block_add_bor)
-        acc_id = emit_constant(bc, Int64(0))
-        for i in 1:nf
-            f_id = field_ids[i]
-            bitpos = fieldoffset(T, i) * 8
-            field_type_enum = cranelift_type(fieldtype(T, i))
-            if field_type_enum != ct
-                f_id = ccall(uext_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
-                             bc.fctx_handle, f_id, ct)
+        if ct != TYPE_PTR  # sizeof > 8 → heap-allocate, don't pack
+            field_ids = [resolve_operand(bc, fa, ir) for fa in field_args]
+            nf = length(field_ids)
+            nf == 0 && return emit_constant(bc, Int64(0))
+            uext_ptr  = Libdl.dlsym(bc.lib_handle, :block_add_uextend)
+            shl_ptr   = Libdl.dlsym(bc.lib_handle, :block_add_ishl)
+            bor_ptr   = Libdl.dlsym(bc.lib_handle, :block_add_bor)
+            acc_id = emit_constant(bc, Int64(0))
+            for i in 1:nf
+                f_id = field_ids[i]
+                bitpos = fieldoffset(T, i) * 8
+                field_type_enum = cranelift_type(fieldtype(T, i))
+                if field_type_enum != ct
+                    f_id = ccall(uext_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
+                                 bc.fctx_handle, f_id, ct)
+                end
+                if bitpos != 0
+                    shift_id = emit_constant(bc, Int64(bitpos))
+                    f_id = ccall(shl_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
+                                 bc.fctx_handle, f_id, shift_id)
+                end
+                acc_id = ccall(bor_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
+                               bc.fctx_handle, f_id, acc_id)
             end
-            if bitpos != 0
-                shift_id = emit_constant(bc, Int64(bitpos))
-                f_id = ccall(shl_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
-                             bc.fctx_handle, f_id, shift_id)
-            end
-            acc_id = ccall(bor_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
-                           bc.fctx_handle, f_id, acc_id)
+            return acc_id
         end
-        return acc_id
+        # Fall through to heap allocation for >8-byte bitstypes (e.g. SyntaxToken,
+        # sizeof=12). The register-packing loop above cannot represent fields at
+        # byte-offset >= 8 (bitpos >= 64) in a single i64.
     end
 
     if !(T isa DataType) || !isconcretetype(T)
@@ -3130,6 +3189,24 @@ function emit_new(bc::BuilderCtx, T, field_args, ir, stmt_idx)
     # Use the builder's runtime call mechanism
     ptr_id = emit_call_runtime(bc, "__jl_gc_alloc_julia", UInt32[type_ptr_id, size_id])
 
+    # Zero-fill the allocation before storing fields. Julia's %new may not
+    # pass every field (trailing fields default to 0 in Julia semantics), but
+    # __jl_gc_alloc_julia does NOT zero the memory. Reading an uninitialized
+    # field (e.g. ParseStream.peek_count) gets malloc garbage → downstream
+    # bounds-check traps (seen in the kwcall sorter's peek_count check).
+    # BEWARE: the last chunk may be smaller than 8 bytes — don't overrun the
+    # allocation (overrunning corrupts the next GC object).
+    zero_id = emit_constant(bc, Int64(0))
+    store_ptr2 = Libdl.dlsym(bc.lib_handle, :block_add_store)
+    local data_sz = Int(data_size)
+    for zoff in 0:8:(data_sz - 1)
+        rem = data_sz - zoff
+        chunk_ty = rem >= 8 ? TYPE_I64 : rem >= 4 ? TYPE_I32 :
+                   rem >= 2 ? TYPE_I16 : TYPE_I8
+        ccall(store_ptr2, Cvoid, (Ptr{Cvoid}, UInt32, Int32, UInt32, UInt32),
+              bc.fctx_handle, ptr_id, Int32(zoff), zero_id, chunk_ty)
+    end
+
     # Store each field at its offset
     field_names = fieldnames(T)
     store_ptr = Libdl.dlsym(bc.lib_handle, :block_add_store)
@@ -3139,6 +3216,14 @@ function emit_new(bc::BuilderCtx, T, field_args, ir, stmt_idx)
         field_type_enum = cranelift_type(field_T)
         ccall(store_ptr, Cvoid, (Ptr{Cvoid}, UInt32, Int32, UInt32, UInt32),
               bc.fctx_handle, ptr_id, offset, fid, field_type_enum)
+    end
+
+    # For large bitstypes (sizeof > 8, typ. SyntaxToken=12), the SSA value is a
+    # heap pointer. Record in ref_tracking so getfield uses Case 1 (load from
+    # heap at fieldoffset) rather than Case 3b (which would try to shift/extract
+    # from the pointer as if it were inline data).
+    if isbitstype(T) && sizeof(T) > 8
+        bc.ref_tracking[Core.SSAValue(stmt_idx)] = (ptr_id, 0, T)
     end
 
     return ptr_id
