@@ -462,6 +462,30 @@ impl FunctionCtx {
     }
 
     pub fn finalize_ctx(&mut self) -> Result<(), String> {
+        // Guarantee a valid entry block. A block only enters the layout when an
+        // instruction is emitted into it (frontend's ensure_inserted_block →
+        // layout.append_block); create_block/switch_to_block/append_block_param do
+        // not. If body emission threw before any instruction landed in a block
+        // (e.g. a rethrown non-CompileError emitter bug on the entry block's first
+        // statement), the layout is empty: layout.entry_block() == None.
+        // remove_constant_phis runs UNCONDITIONALLY during compilation
+        // (Context::optimize calls it at every opt_level, including "none" — only
+        // the egraph pass is opt-gated) and does
+        // func.layout.entry_block().expect("...entry block unknown"), aborting the
+        // whole process with an un-catchable panic. Emit a trap into the
+        // already-created entry block so it is inserted into the layout; such a
+        // callee then traps at runtime, the correct outcome for a body that could
+        // not be lowered.
+        if self.context.func.layout.entry_block().is_none() {
+            let entry = *self.blocks.get("block0")
+                .expect("entry block0 must exist (init_entry creates it)");
+            {
+                let fb = self.fb();
+                if fb.current_block() != Some(entry) { fb.switch_to_block(entry); }
+                fb.ins().trap(cranelift_codegen::ir::TrapCode::HEAP_OUT_OF_BOUNDS);
+            }
+        }
+
         // Seal any blocks not explicitly sealed (e.g. implicit-jump fallthrough).
         let unsealed: Vec<Block> = self.blocks.values().copied()
             .filter(|b| !self.sealed.contains(b)).collect();
@@ -499,7 +523,12 @@ impl BuilderContext {
         let triple = Triple::host();
         let mut fb = cranelift_codegen::settings::builder();
         fb.set("is_pic", "true").unwrap();
-        fb.set("opt_level", "none").unwrap();  // Skip remove_constant_phis bug
+        // opt_level "speed" enables the egraph pass. remove_constant_phis runs
+        // unconditionally at every opt_level (Context::optimize), so the prior
+        // "none" did NOT skip it — the entry_block panic it claimed to dodge is
+        // prevented in finalize_ctx, which guarantees a valid entry block for
+        // every function. Keep optimizations on; assert correctness via tests.
+        fb.set("opt_level", "speed").unwrap();
         let flags = cranelift_codegen::settings::Flags::new(fb);
         let isa = cranelift_codegen::isa::lookup(triple)
             .expect("ISA lookup").finish(flags).expect("ISA finish");
@@ -585,9 +614,18 @@ impl BuilderContext {
             match module.define_function(fid, &mut f.context) {
                 Ok(()) => { if verbose { eprintln!("[native-builder] defined: {}", nm); } }
                 Err(e) => {
-                    eprintln!("[native-builder] warning: {} verification failed, skipping: {:?}", nm, e);
-                    // Don't create trap stub — let module.finish() error on
-                    // undefined function instead of remove_constant_phis panic.
+                    // Verification failed on the emitted body (e.g. an invalid
+                    // block reference from an unsupported lowering). The function
+                    // was pre-declared Linkage::Export (for recursive self-calls),
+                    // and ObjectModule::finish() PANICS — does not return Err — on
+                    // an undefined Export symbol, which would abort the whole
+                    // process (un-catchable from Julia). Define a minimal trap
+                    // stub so the symbol is satisfied, the module links, and the
+                    // callee traps at runtime (correct for a body that could not be
+                    // lowered). The stub's entry block receives the trap, so it is
+                    // in the layout and remove_constant_phis stays safe.
+                    eprintln!("[native-builder] warning: {} verification failed ({:?}); defining trap stub", nm, e);
+                    define_trap_stub(&mut module, fid, &sig)?;
                 }
             }
         }
@@ -595,6 +633,30 @@ impl BuilderContext {
         std::fs::write(path, &obj).map_err(|e| format!("write: {}", e))?;
         self.done = true; Ok(())
     }
+}
+
+/// Define already-declared `fid` with a minimal body that traps immediately.
+/// Used when a function's real body failed verification: it was pre-declared
+/// `Linkage::Export` (for recursive self-calls), and `ObjectModule::finish()`
+/// panics — does not return `Err` — on an undefined Export symbol. The stub
+/// satisfies the symbol so the module links, and the callee traps at runtime
+/// (correct for a body that could not be lowered). The entry block receives the
+/// trap instruction, so it is inserted into the layout and `remove_constant_phis`
+/// (which requires a valid entry block) stays safe.
+fn define_trap_stub(module: &mut ObjectModule, fid: FuncId, sig: &Signature) -> Result<(), String> {
+    let mut ctx = Context::for_function(cranelift_codegen::ir::Function::with_name_signature(
+        UserFuncName::testcase("trap_stub"), sig.clone()));
+    {
+        let mut fb_ctx = FunctionBuilderContext::new();
+        let mut fb = FunctionBuilder::new(&mut ctx.func, &mut fb_ctx);
+        let entry = fb.create_block();
+        fb.switch_to_block(entry);
+        fb.append_block_params_for_function_params(entry);
+        fb.ins().trap(cranelift_codegen::ir::TrapCode::HEAP_OUT_OF_BOUNDS);
+        fb.seal_all_blocks();
+        fb.finalize();
+    }
+    module.define_function(fid, &mut ctx).map(|_| ()).map_err(|e| format!("{:?}", e))
 }
 
 // === Helpers ===

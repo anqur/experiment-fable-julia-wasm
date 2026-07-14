@@ -226,11 +226,19 @@ legacy `GCHeader` layout and are never returned to Julia.
   compile, but live parser execution can still miscompile because MemoryRef
   tracking degrades some array accesses to zero sentinels. Keep its runtime test
   commented with its `# TODO:` until it executes end-to-end.
-- Some newly enabled `Union{Nothing,T}` return paths trigger Cranelift 0.133's
-  `remove_constant_phis` abort (`entry_block()` missing during compilation).
-  It cannot be caught because Cranelift aborts panics. Resolution options are a
-  Cranelift upgrade or narrowly enabling only known-safe MethodInstances; do not
-  broadly map those unions to `TYPE_I64` without reproducing and checking this.
+- `remove_constant_phis` is **not** a Cranelift defect and is **not** opt-gated:
+  it runs unconditionally in `Context::optimize` (only the egraph pass depends on
+  `opt_level != none`). It requires `func.layout.entry_block()` to be `Some` —
+  i.e. at least one block must be in the layout, and a block only enters the
+  layout when an instruction is emitted into it. Two guards in
+  `native-builder/src/builder.rs` hold that invariant so a half-emitted or
+  unverifiable callee never aborts the whole module link: `finalize_ctx` emits a
+  trap into the entry block when the layout is empty (a body whose emission threw
+  before any instruction landed), and `finalize` defines a trap stub for any
+  function that fails verification (so a pre-declared `Linkage::Export` callee
+  never leaves `ObjectModule::finish()` aborting — it *panics*, does not return
+  `Err` — on an undefined symbol). `opt_level` is `speed` (egraph on); a former
+  `opt_level = "none"` did not in fact skip this pass.
 - When rethrowing from emission, preserve a real terminator in the current block.
   Otherwise later block switching produces misleading invalid-block/no-terminator
   verifier errors; use `NCG_TRACE_RETHROW` to identify the original exception.
