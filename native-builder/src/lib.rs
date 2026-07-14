@@ -180,9 +180,11 @@ ffi_unop!(block_add_ctz, emit_ctz);
 ffi_unop!(block_add_popcnt, emit_popcnt);
 ffi_unop!(block_add_bswap, emit_bswap);
 
-#[no_mangle] pub extern "C" fn block_add_iconst(fctx: *mut FunctionCtx, val: i64, ty: u32) -> u32 { if fctx.is_null() { 0 } else { unsafe { (*fctx).emit_iconst(val, ty) } } }
+#[no_mangle] pub extern "C" fn block_add_iconst(fctx: *mut FunctionCtx, val: i64, ty: u32) -> u32 { if fctx.is_null() || unsafe { (*fctx).is_block_sealed() } { 0 } else { unsafe { (*fctx).emit_iconst(val, ty) } } }
 #[no_mangle] pub extern "C" fn block_add_f64const(fctx: *mut FunctionCtx, val: f64) -> u32 { if fctx.is_null() { 0 } else { unsafe { (*fctx).emit_f64const(val) } } }
 #[no_mangle] pub extern "C" fn block_add_f32const(fctx: *mut FunctionCtx, val: f32) -> u32 { if fctx.is_null() { 0 } else { unsafe { (*fctx).emit_f32const(val) } } }
+
+#[no_mangle] pub extern "C" fn block_is_sealed(fctx: *mut FunctionCtx) -> u32 { if fctx.is_null() { 0 } else { unsafe { (*fctx).is_block_sealed() as u32 } } }
 
 #[no_mangle] pub extern "C" fn block_add_icmp(fctx: *mut FunctionCtx, c: u32, l: u32, r: u32) -> u32 { if fctx.is_null() { 0 } else { let cc = map_icmp_cond(c); unsafe { (*fctx).emit_icmp(cc, l, r) } } }
 #[no_mangle] pub extern "C" fn block_add_fcmp(fctx: *mut FunctionCtx, c: u32, l: u32, r: u32) -> u32 { if fctx.is_null() { 0 } else { let cc = map_fcmp_cond(c); unsafe { (*fctx).emit_fcmp(cc, l, r) } } }
@@ -193,7 +195,7 @@ ffi_unop!(block_add_bswap, emit_bswap);
 
 #[no_mangle] pub extern "C" fn block_add_return(fctx: *mut FunctionCtx, val: u32) { if !fctx.is_null() { unsafe { (*fctx).emit_return(val) } } }
 #[no_mangle] pub extern "C" fn block_add_return_void(fctx: *mut FunctionCtx) { if !fctx.is_null() { unsafe { (*fctx).emit_return_void() } } }
-#[no_mangle] pub extern "C" fn block_add_trap(fctx: *mut FunctionCtx) { if !fctx.is_null() { unsafe { (*fctx).emit_trap() } } }
+#[no_mangle] pub extern "C" fn block_add_trap(fctx: *mut FunctionCtx) { if !fctx.is_null() && !unsafe { (*fctx).is_block_sealed() } { unsafe { (*fctx).emit_trap() } } }
 
 #[no_mangle] pub extern "C" fn block_add_jump(fctx: *mut FunctionCtx, tgt: *const c_char) { if !fctx.is_null() && !tgt.is_null() { unsafe { (*fctx).emit_jump(CStr::from_ptr(tgt).to_str().unwrap_or("")) } } }
 #[no_mangle] pub extern "C" fn block_add_jump_args(fctx: *mut FunctionCtx, tgt: *const c_char, args: *const u32, nargs: usize) { if !fctx.is_null() && !tgt.is_null() { unsafe { (*fctx).emit_jump_with_args(CStr::from_ptr(tgt).to_str().unwrap_or(""), std::slice::from_raw_parts(args, nargs)) } } }

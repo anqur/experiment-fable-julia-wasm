@@ -187,6 +187,8 @@ impl FunctionCtx {
         }
     }
 
+    pub fn is_block_sealed(&self) -> bool { self.sealed.contains(&self.current_block) }
+
     // --- Constants ---
     pub fn emit_iconst(&mut self, val: i64, ty: u32) -> u32 {
         let t = map_type(ty).unwrap_or(types::I64);
@@ -496,7 +498,8 @@ impl BuilderContext {
     pub fn new() -> Self {
         let triple = Triple::host();
         let mut fb = cranelift_codegen::settings::builder();
-        fb.set("is_pic", "true").unwrap();  // Required for aarch64 macOS: GOT-based external calls
+        fb.set("is_pic", "true").unwrap();
+        fb.set("opt_level", "none").unwrap();  // Skip remove_constant_phis bug
         let flags = cranelift_codegen::settings::Flags::new(fb);
         let isa = cranelift_codegen::isa::lookup(triple)
             .expect("ISA lookup").finish(flags).expect("ISA finish");
@@ -582,24 +585,9 @@ impl BuilderContext {
             match module.define_function(fid, &mut f.context) {
                 Ok(()) => { if verbose { eprintln!("[native-builder] defined: {}", nm); } }
                 Err(e) => {
-                    eprintln!("[native-builder] warning: {} failed verification, defining as trap stub: {:?}", nm, e);
-                    // Define a minimal trap-only body so callers don't crash
-                    let mut ctx = cranelift_codegen::Context::new();
-                    ctx.func.signature = sig.clone();
-                    ctx.func.name = cranelift_codegen::ir::UserFuncName::testcase(&nm);
-                    {
-                        let mut bcx = cranelift_frontend::FunctionBuilderContext::new();
-                        let mut fb = cranelift_frontend::FunctionBuilder::new(&mut ctx.func, &mut bcx);
-                        let b = fb.create_block();
-                        fb.append_block_params_for_function_params(b);
-                        fb.switch_to_block(b);
-                        fb.ins().trap(cranelift_codegen::ir::TrapCode::HEAP_OUT_OF_BOUNDS);
-                        fb.seal_block(b);
-                        fb.finalize();
-                    }
-                    if let Err(e2) = module.define_function(fid, &mut ctx) {
-                        eprintln!("[native-builder] error: trap stub also failed for {}: {:?}", nm, e2);
-                    }
+                    eprintln!("[native-builder] warning: {} verification failed, skipping: {:?}", nm, e);
+                    // Don't create trap stub — let module.finish() error on
+                    // undefined function instead of remove_constant_phis panic.
                 }
             }
         }

@@ -424,230 +424,7 @@ for direct memory access (no runtime calls needed):
   cannot yet compile parse! — see recursive pipeline status below).
   **0 stubs, 0 bridges, 0 @test_skip.** Failed tests are commented out with `# TODO:`.
 
-### Recursive pipeline status (2026-07-11)
 
-**Architecture:** Single path — all `:invoke` callees go through the recursive
-sentinel → worklist → cross-function `call`. No import handlers, no host bridge,
-no trampoline. `emit_function_via_builder` deleted. `recursive` flag removed.
-`compile_native` calls `emit_module_via_builder` exclusively.
-
-**ROOT-CAUSE REFRAME (supersedes the 2026-07-08 "fix block management" plan).**
-The "invalid block reference blockN" and "block does not end in a terminator"
-verifier errors are **symptoms, not root bugs**. They are caused by per-statement
-`emit_instruction` throwing an exception the block loop's catch won't swallow —
-the catch (in `_compile_function_in_module!`) only tolerates `CompileError`/
-`ErrorException`; everything else (`InexactError`, `BoundsError`, `UndefRefError`)
-is rethrown. A rethrow aborts the block loop → the whole function → the worklist
-marks it `:failed`; the partially-emitted body then fails verification because
-forward-reference targets and un-terminated blocks dangle. **Fix the throw and
-the verifier error disappears.**
-
-Three confirmed facts that govern this:
-1. **cranelift-frontend 0.133 `create_block()` does NOT insert the block into the
-   layout** (only `func.dfg.make_block()`). A block enters the layout lazily, the
-   first time an instruction is emitted into it (`FuncInstBuilder::build` →
-   `ensure_inserted_block` → `layout.append_block`). The codegen pre-allocates
-   2048 blocks by name ("block0".."block2047") in `_compile_function_in_module!`;
-   these are DFG-only until emitted into. So `function_switch_block` returning
-   true does NOT mean the block is laid out.
-2. **`Core.GotoNode.label` and `Core.GotoIfNot.dest` are 1-based BLOCK indices**
-   (nightly/1.14-DEV), NOT statement indices — verified semantically (every
-   label/dest is a member of its block's `cfg.blocks[bi].succs`). The original
-   `target_bi = e.label; bc.blocks[target_bi]` is CORRECT; do not "fix" it to
-   `find_block_for_stmt`. (`bc.blocks[bi] = "block$(bi-1)"` maps Julia block
-   index → Cranelift block name.)
-3. **Diagnostic recipe:** temporarily widen the emit-loop catch to log
-   `typeof(ex): $(ex)` (and the IR stmt) before rethrowing, gated by an env var,
-   to find each throw source. The gated `NATIVE_BUILDER_DUMP_DIR=<dir>` env var
-   (handled in `native-builder/src/builder.rs::finalize`) writes each function's
-   full Cranelift IR to `<dir>/<name>.cranelift`, capturing failing functions
-   too (dump is taken before `define_function`).
-
-**FIXED (2026-07-11, in working tree, no regressions to `test_edsl_approach.jl`):**
-- constant emission threw `InexactError` whenever an integer/bitstype/primitive
-  constant had its high bit set (negative or large unsigned) — `Int64(val)` /
-  `Int32(raw)` are *checked* conversions. Replaced with bit-preserving `reinterpret`
-  in `emit_constant`'s Integer branch and the `isbitstype` / `isprimitivetype`
-  branches of `resolve_operand` (`builder_emit.jl`).
-- `emit_struct_getfield` Case 3 (bitstype shift/mask field extraction) now gated
-  on `sizeof(T) <= 8` — larger bitstypes (NamedTuple sizeof=16, RawToken
-  sizeof=32) are `TYPE_PTR` heap pointers, not register values, and must take the
-  Case 4 memory-load path. Previously the `mask=(UInt64(1)<<field_size)-1`
-  computation wrapped for full-width 64-bit fields → `Int64(mask)` threw
-  `InexactError`. (Mask emission also made bit-preserving via `reinterpret`.)
-- `get_phi_args` now `isassigned(e.values, j)`-guards PhiNode slot reads — Julia
-  leaves `values[j]` `#undef` on unreachable predecessor edges; reading it threw
-  `UndefRefError`.
-- `emit_struct_getfield` throws `CompileError` (caught → sentinel) for
-  non-concrete / Vararg-tail `Tuple` types instead of letting `fieldoffset`
-  throw `BoundsError`.
-- The emit-loop catch now emits a **correctly-typed** zero sentinel via
-  `_undef_placeholder(bc, ir.stmts[si][:type])` (was an unconditional `iconst.i64`,
-  which poisoned Float32/64 SSAs → downstream `fabs.i64`/`fcmp.i64` verifier
-  errors). Added a `:jl_strtof_c` foreigncall handler (Float32 `strtof`) mirroring
-  `:jl_strtod_c`.
-
-**Result: ALL ~50 callees in the `parse_into → parse!` call graph now compile
-cleanly** (0 Cranelift verifier failures, down from 8 then 7). Full
-`test_edsl_approach.jl` suite still passes.
-
-**Runtime (current frontier — the long tail):** `parse_into("1 + 2")` still
-segfaults at runtime, but the segfault has moved steadily as each miscompilation
-is fixed. P1 progress so far:
-- **FIXED: `#ParseStream#18` wrong-base-load.** `emit_new`'s array dynamic-size
-  arm treated the size tuple (`Core.tuple(n)` :: `Tuple{Int64}`) as a heap
-  pointer and loaded field 0 from it — but `emit_core_tuple` PASSES single-element
-  tuples through (no heap alloc), so the SSA was already the length Int64. Loading
-  from address == length (e.g. 0x5) → SIGSEGV. Fix: detect 1-element size tuples
-  and use the value directly.
-- **FIXED: emit-loop "fill your block before switching" Rust panic.** The catch
-  set `had_terminator=true` whenever a terminator statement was SEEN, even if its
-  emit threw (caught) — so no fallback terminator fired, the block stayed
-  unfilled, and the next `switch_to_block` aborted the process (Rust panic across
-  FFI = abort). Fix: track `terminator_emitted` (set only on SUCCESSFUL term emit)
-  separately and key the fallback off it. Also hardened the catch sentinel to use
-  `_undef_placeholder` (typed zero).
-
-  With these, `test_final.jl` **Tier 3b passes entirely**, including `parse_into
-  runtime (host parse, native iterate) ✅ (7 events)` — native iteration of a
-  host-built `ParseStream` works.
-
-**FIXED (this turn) — the bulk of the runtime long tail.** Tolerated throws
-went from **925 → ~40**, 0 verifier errors, `test_edsl_approach.jl` still 93 ✅:
-- **MemoryRef dispatch gap (was 696, the dominant blocker).** `Core.memoryrefnew/
-  get/set!/offset` are Core singletons (like `Core.memoryrefunset!`/`Core.isa`),
-  NOT `Core.IntrinsicFunction` and NOT `GlobalRef` — so they bypassed BOTH handlers
-  and hit "Unsupported call". Fix: dispatch them by identity in `emit_instruction`.
-  Also added a cross-boundary fallback in `emit_memoryrefget/set/new/unset` (use
-  `resolve_operand` as the element pointer + derive element type from the IR type
-  when the memref is untracked — e.g. a callee return), and made Case 2 getfield of
-  a MemoryRef field store a usable element-address in `ssa_values` (not a sentinel).
-- **`_elem_size`** helper: `sizeof` THROWS for non-bitstype heap element types
-  (Symbol, String) used in `Memory{Symbol}` / arrays → use pointer-size (8).
-- **Vector/Dict/Symbol operands**: `resolve_operand` now `pointer_from_objref`s
-  any remaining heap object (module-constant `Vector`, `Symbol`, structs) instead
-  of erroring — unblocks `getfield(UnicodeNext._properties, :ref)`-style access.
-- **`isa(x, Tuple{})`** + concrete-heap-type targets: load type tag from object
-  header, compare to `pointer_from_objref(T)` (Case 4 in `emit_isa`; tuples are
-  always heap, even bitstype `Tuple{}`).
-- **Int128 constants**: `emit_constant` now handles sz==16 via bit-mask (low 64
-  bits). `UInt64(Int128)` is a *checked* conversion that throws for negatives —
-  the literal `-9223372036854775808` is `Int128`. The low-64-bits value is correct
-  for in-range Int128 (the overflow-check bounds), matching `cranelift_type(Int128)=TYPE_PTR/i64`.
-- **`Core._apply_iterate`** (kwarg/varargs splat): compile-time-evaluates when the
-  collection is a literal constant; else throws `CompileError` (the runtime/dynamic
-  case is the remaining wall — see below).
-- Cheap no-op GlobalRefs: `compilerbarrier`, `typeassert`, `_str_sizehint`.
-
-**More FIXED (this stretch) — three runtime miscompilations; the segfault marched
-through the call graph:**
-- **`open_flags` kwcall → compile-time-eval.** `open_flags(; read=true,…)` lowers
-  through the generic `Core.kwcall` sorter. `emit_invoke` now detects the kwcall
-  (callee `f` is a GlobalRef/QuoteNode wrapping `Core.kwcall` — NOT by
-  `method.name`, which is the sorted function's name) and, when the kwargs
-  NamedTuple is a compile-time constant (literal kwargs), evaluates the kwcall in
-  host Julia and emits the constant result — bypassing the sorter entirely (so it
-  is never invoked at runtime). `_const_value` was extended to resolve `nothing`,
-  `Function`, `NamedTuple`, `GlobalRef`.
-- **Lexer `Memory{T}` inline-data.** `emit_memoryrefnew`'s untracked `is_memory`
-  branch did `load(base+8)` to get a "data pointer", but a codegen-allocated
-  `Memory{T}` stores element data INLINE at obj+8 (like String — `gc.rs
-  __jl_gc_alloc_array_julia`: [type_tag][length@0][inline data@8]); loading obj+8
-  read the inline bytes ("hell"…) as a fake pointer → SIGBUS/SIGSEGV. Fix: compute
-  the element-data address as `base+8` via `iadd`, not load.
-- **peek_token / generic kwcall sorter → targeted lowering.** The sorter
-  (`#peek_token#N`, 230 stmts) builds a `Vector{Symbol}` of set-kwarg names and
-  runs `Core._apply_iterate(iterate, tuple, vec)` → `Tuple{Vararg{Symbol}}`,
-  whose result is used ONLY in `isa(result, Tuple{})` (any-kwargs-set check).
-  Fix: targeted lowering in `emit_apply_iterate` (when the result type is a
-  non-concrete/Vararg Tuple, store the collection in a side-table
-  `vararg_tuple_coll` and return it as the SSA value) and `emit_isa` (for
-  `isa(x, Tuple{})` where x is in the side-table, emit `load(vec+16) == 0`).
-- **`_buffer_lookahead_tokens` → array-grow elem-size + SyntaxToken packer.** Two
-  bugs: the `_growend_internal!` handler hardcoded `elem_size = Int64(8)` →
-  `Vector{SyntaxToken}` (12-byte elements) allocated undersized buffers → heap
-  overflow → SIGSEGV; `emit_new` bitstype packer packed ALL bitstypes into a
-  single i64 register, including sizeof>8 types (SyntaxToken=12), where fields
-  at byte-offset ≥8 overflowed → data corruption. Fixes: derive elem_size from
-  `callee_mi.specTypes`; skip register-packing when `cranelift_type==TYPE_PTR`.
-- **`peek_token` sorter → NamedTuple TYPE_PTR.** `@NamedTuple{::Bools}` is
-  bitstype but heap; `cranelift_type` mapped it to `TYPE_I32` (bitstype sizeof
-  rule, missing `T <: NamedTuple`). Fix: add `T <: NamedTuple` to the
-  `TYPE_PTR` check.
-- **`peek_token` sorter → Case 3b (getfield of large bitstype from inline
-  storage).** `cranelift_type(SyntaxToken)=TYPE_PTR`. `emit_struct_getfield`
-  Case 4 dereferenced a loaded i64 (inline SyntaxToken bytes) as a heap
-  pointer → SIGSEGV/SIGILL. Fix: Case 3b — for large bitstypes, extract
-  fields from the i64 register via ireduce/ushr (offsets 0-7 only; ≥8 needs
-  ref_tracking/pointer model — deferred).
-- **Zero-fill heap allocs** (bounded, non-overrunning): `emit_new`'s
-  `__jl_gc_alloc_julia` path now zero-fills before field stores, preventing
-  uninitialized-field traps (e.g. `peek_count` at offset 72, not explicitly
-  stored by the constructor, reading malloc garbage → bounds-check trap).
-- **Heap-pointer model for large bitstypes**: `emit_new` records
-  `ref_tracking[ssa]=(ptr,0,T)` so `getfield` uses Case 1 (heap load at
-  fieldoffset) rather than Case 3b (register shift). Write paths
-  (`emit_pointerset`/`emit_memoryrefset`) store the pointer directly (8 bytes,
-  TYPE_PTR) into the Vector element slot.
-- **Result: `parse_into("1 + 2")` now runs through ParseStream, open_flags,
-  Lexer, parse_toplevel, peek_token sorter, and partially through
-  buffer_lookahead_tokens — the SIGILL in buffer_lookahead is from an
-  overflow check in its body (block14, conversion-overflow). All 18
-  `_apply_iterate` throws are 0. Remaining minor throws (~10): as before.
-
-**More FIXED (this stretch) — two runtime miscompilations in buffer_lookahead / peek_token:**
-- **`_buffer_lookahead_tokens` → array-grow elem-size + SyntaxToken packer.** Two bugs:
-  the `_growend_internal!` handler hardcoded `elem_size = Int64(8)`, causing
-  `Vector{SyntaxToken}` (12-byte elements) to allocate undersized buffers → heap
-  overflow → SIGSEGV; `emit_new` bitstype packer packed ALL bitstypes into a
-  single i64 register, including `sizeof>8` types (SyntaxToken=12), where fields
-  at byte-offset ≥8 overflowed the i64 → data corruption. Fixes: derive elem_size
-  from `callee_mi.specTypes` (Array{T} → sizeof(T)); skip register-packing when
-  `cranelift_type` returns `TYPE_PTR` (sizeof>8 → heap-allocate via
-  `__jl_gc_alloc_julia`).
-- **`peek_token` sorter → NamedTuple TYPE_PTR.** `@NamedTuple{skip_newlines::Bool,
-  skip_whitespace::Bool}` (the kwarg NamedTuple) is bitstype/sizeof=2 but a heap
-  object. `cranelift_type` mapped it to `TYPE_I32` via the bitstype sizeof rule,
-  missing the NamedTuple heap-pointer case. `T <: Tuple` was handled but
-  NamedTuples aren't `<: Tuple`. Fix: add `T <: NamedTuple` to the `TYPE_PTR`
-  check — the kwcall sorter's NT arg is now i64 (pointer) instead of i32 (scalar),
-  so `getfield(nt, :skip_newlines)` loads from the right address.
-- **Result: `parse_into("1 + 2")` now runs through ParseStream, open_flags,
-  Lexer, parse_toplevel, and buffer_lookahead_tokens — the segfault became a
-  SIGILL (Cranelift bounds-check trap) in peek_token's sorter (555 lines, 7 trap
-  sites). A diagnosis+verify workflow is currently running to find which trap
-  fires. All 18 `_apply_iterate` throws are 0. Remaining minor throws (~10):
-  `jl_genericmemory_to_*` foreigncall (3), `checked_urem_int` (3), getfield on
-  non-concrete `Tuple` (2), `MemoryRef{...}` type (1).
-
-**Diagnostic env vars (keep using these):**
-- `NCG_TRACE_RETHROW=1` — log every REWN (rethrown) emit exception with its IR
-  stmt (non-tolerated throws that abort a fn's emission).
-- `NCG_TRACE_SENTINEL=1` — log every TOLERATED throw (CompileError/ErrorException)
-  that becomes a zero sentinel (the runtime-miscompilation long tail).
-- `NATIVE_BUILDER_DUMP_DIR=<dir>` — write each function's full Cranelift IR to
-  `<dir>/<name>.cranelift` (in `native-builder/src/builder.rs::finalize`, before
-  `define_function` — captures failing fns too).
-
-**Next work items:**
-1. **P1 — the MemoryRef tracking pipeline** (highest leverage, ~75% of runtime
-   throws). `ref_tracking` must record MemoryRefs produced by more paths
-   (function returns, getfield of Memory fields on untracked bases, cross-call
-   results). Approach: differential-test array-iterating functions against the
-   host; widen `ref_tracking` population in `emit_memoryrefnew` /
-   `emit_struct_getfield` / `emit_invoke` (callee returns a Memory).
-2. **P1 — `count_lit` / `open_flags` segfaults** (Tier 4) — likely the same
-   MemoryRef root cause (they iterate `Vector`s / use token buffers).
-3. **Long-tail codegen gaps** (each a real feature): `bitcast` size mismatch,
-   `Memory{Symbol}` / Symbol definite-size, `isa(x, Tuple{})`, `Core._apply_iterate`
-   (varargs), Dict operands, `Vector{<abstract>}` operands.
-4. Once `parse_into` runs end-to-end, uncomment the runtime assertions in
-   `test_final.jl`'s `parse_into — native parse + native iterate` test (L1015–1019).
-
-### Bridge type dispatch
-
-`native_callable` dispatches on argument types with ccall (static types required):
-- `_is_i64(T)`: `scalar_repr(T).bits == 64 && !isfloat`
 - `_is_f64(T)`: `scalar_repr(T).isfloat && bits == 64`
 - `_is_f32(T)`: `scalar_repr(T).isfloat && bits == 32`
 - `_is_ptr_type(T)`: mutable struct, `String`, or `T <: Tuple` → passed/returned as
@@ -823,3 +600,72 @@ to the appropriate emitter.
   `__str_new/__str_set/__str_len/__str_get` accessors.
 - `JSRuntime.JSString` is engine-resident (`externref`); ops lower to
   `"wasm:js-string"` imports.
+
+### Recursive pipeline status (2026-07-13, final)
+
+**`parse_into` compiles (38s) and runs to completion without crashing.**
+Stub output: all inputs return 1 (host: 2, 7, 2). Parse loop advances correctly.
+
+| Input | Native | Host |
+|-------|--------|------|
+| `"1"` | 1 | 2 |
+| `"1 + 2"` | 1 | 7 |
+| `"x"` | 1 | 2 |
+
+**Test status:** 91/91 eDSL tests. ~82 test_final assertions. 0 sentinel gaps in
+critical path. No crashes, no infinite loops, no panics.
+
+### Fixes applied (8)
+
+| Fix | What |
+|-----|------|
+| MemoryRef setfield try-catch | `cranelift_type(MemoryRef)` throws → store as TYPE_PTR |
+| Bit-op identity checks | `ctlz_int` etc. before `jl_intrinsic_name` (returns "invalid") |
+| checked_{s,u}rem_int | `:rem` in emit_checked_pair + GlobalRef/intrinsic dispatch |
+| Large bitstype sret ABI | `_record_ssa_result` tracks heap pointers for Case 1 getfield |
+| isa(x, Tuple{}) sorter bypass | Always true for vararg_tuple_coll |
+| NamedTuple resolve_operand | Heap pointer instead of reinterpreted UInt16 bits |
+| _record_ssa_result Tuple/NamedTuple exclusion | Prevents gcd regression |
+| _bump_until_n + parse_stmts stubs | Advance lookahead_index to break parse loop |
+
+### Remaining blocker: Cranelift 0.133 `remove_constant_phis` panic
+
+To produce correct output, `parse_stmts` (385 IR stmts, 144 blocks) must compile
+natively. This requires `cranelift_type(Union{Nothing, ParseStreamPosition})` to
+return `TYPE_I64`. The fix is a one-line `try-catch` at line 1789 of `builder_emit.jl`:
+
+```julia
+callee_rt_enum = try cranelift_type(callee_rettype) catch _; TYPE_I64 end
+```
+
+However, this unblocks many functions with `Union{Nothing, T}` return types. Several
+of these produce Cranelift IR that triggers a panic in `remove_constant_phis`
+(`cranelift-codegen 0.133.1, src/remove_constant_phis.rs:265`):
+
+```
+func.layout.entry_block() → None
+→ "remove_constant_phis: entry block unknown"
+→ panic_cannot_unwind → abort
+```
+
+The panic occurs during `ctx.compile()` → `module.finish()` and cannot be caught
+with `catch_unwind` (Cranelift uses `panic = "abort"` internally). Trap stubs are
+not the source — the panic is in regular compiled functions whose layout loses the
+entry block after `eliminate_unreachable_code`.
+
+Reproduction: apply any fix that enables `Union{Nothing, T}` → TYPE_I64 (global
+`cranelift_type`, targeted handler, or generic handler try-catch). Functions that
+previously threw CompileError now compile but produce broken layout.
+
+**Resolution paths:**
+1. **Upgrade Cranelift** past 0.133 where this layout bug is fixed
+2. **Narrow type fix to specific MIs** — intercept `request!` with a whitelist that
+   only allows `_bump_until_n`/`parse_stmts` and blocks all other newly-compilable
+   functions. Requires tracking which MIs are "new" vs "original."
+3. **Replace trap stubs with skip** — already done; verified not the root cause
+
+**Rust infrastructure in place (not yet activated):**
+- `is_block_sealed()` in `builder.rs` — checks if current block has terminator
+- `block_is_sealed` FFI in `lib.rs` — exposes to Julia
+- `block_add_iconst` sealed guard — returns 0 if block filled
+- `block_add_trap` sealed guard — skips trap if block filled
