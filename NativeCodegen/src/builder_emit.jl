@@ -13,6 +13,13 @@ const TYPE_I8  = UInt32(5)
 const TYPE_I16 = UInt32(6)
 const TYPE_VOID = UInt32(7)  # void return (maps to None → no return type)
 
+# GC root for compile-time constant bitstype/NamedTuple values emitted as heap
+# pointers (pointer_from_objref(Ref(val))). The Ref is created during emission;
+# without rooting it the GC can reclaim it before the compiled .so runs, leaving
+# a dangling pointer (a folded `RawGreenNode(...)` const stored into a vector
+# then read back as 0 / SIGSEGV). Entries live for the Julia session.
+const _ROOTED_CONST_REFS = Any[]
+
 # === IntCC condition enums ===
 const ICMP_EQ  = UInt32(0)
 const ICMP_NE  = UInt32(1)
@@ -84,7 +91,32 @@ function cranelift_type(T)
         if length(pointer_arms) == length(arms_nonvoid)
             return TYPE_PTR
         end
-        # Check if all arms have the same Cranelift type
+        # All non-Nothing arms agree on a Cranelift type? Use it. `Nothing` is
+        # the void / "returns nothing" arm; excluding it lets functions whose
+        # inference-widened return type is `Union{Nothing, T}` (e.g.
+        # _bump_until_n::Union{Nothing, Int64}, where the Int64 path carries the
+        # value and the fall-through is void) still resolve for recursive
+        # compilation. Without this, cranelift_type throws on such a union, the
+        # recursive callee resolution fails (got_ir=false), and the mutating
+        # call is replaced by a sentinel that gets DCE'd — so bump()/bump_trivia()
+        # become no-ops and the parser loops forever on peek().
+        if !isempty(arms_nonvoid)
+            nv_types = try cranelift_type.(arms_nonvoid) catch _; [] end
+            if length(nv_types) == length(arms_nonvoid)
+                all(==(nv_types[1]), nv_types) && return nv_types[1]
+                # Mixed union with at least one TYPE_PTR arm (a non-Nothing arm
+                # whose cranelift_type is TYPE_PTR — includes >8-byte bitstypes
+                # like RawGreenNode=12B that cranelift_type maps to TYPE_PTR but
+                # is_ptr_type misses): represent the whole union as TYPE_PTR;
+                # scalar arms are boxed at phi edges. This unblocks e.g.
+                # parse_unary::Union{Nothing, ParseStreamPosition(I64), RawGreenNode(PTR)}
+                # — without it cranelift_type throws, recursive callee resolution
+                # fails, the call is sentinel'd + DCE'd, and the function is
+                # never invoked.
+                any(==(TYPE_PTR), nv_types) && return TYPE_PTR
+            end
+        end
+        # Check if all arms (including Nothing) have the same Cranelift type
         arm_types = try cranelift_type.(arms) catch _; [] end
         if length(arm_types) == length(arms) && all(==(arm_types[1]), arm_types)
             return arm_types[1]
@@ -853,12 +885,24 @@ function resolve_operand(bc::BuilderCtx, val, ir)
         end
     elseif isbitstype(typeof(val))
         # Bitstype structs (e.g. SyntaxHead, RawGreenNode) — reinterpret as UInt.
-        # NamedTuples are bitstype but must be emitted as heap pointers.
+        # NamedTuples AND any >8-byte bitstype (RawGreenNode=12, …) are mapped to
+        # TYPE_PTR by cranelift_type, so they must be emitted as HEAP POINTERS
+        # (pointer_from_objref), not reinterpreted into a register. Without this,
+        # a constant RawGreenNode — Julia constant-folds `RawGreenNode(...)` literals
+        # in push!(v, RawGreenNode(...)) — was emitted as 0 (the old `else raw=0`
+        # fallback), so push! stored 0 and a later read dereferenced null → SIGSEGV
+        # (the peek_behind sorter crash).
         sz = sizeof(val)
-        # Detect NamedTuples by their type name (avoids `val isa NamedTuple` which
-        # can cause compilation issues in some contexts).
-        if typeof(val).name.name === :NamedTuple
-            ptr = try pointer_from_objref(val) catch _; pointer_from_objref(Ref(val)) end
+        if sz > 8 || typeof(val).name.name === :NamedTuple
+            ptr = try
+                pointer_from_objref(val)
+            catch _
+                # Immutable bitstype/NamedTuple: box in a Ref and ROOT it so the
+                # pointer stays valid when the compiled .so runs later.
+                ref = Ref(val)
+                push!(_ROOTED_CONST_REFS, ref)
+                pointer_from_objref(ref)
+            end
             return emit_constant(bc, Int64(reinterpret(UInt64, ptr)))
         end
         local raw::UInt64
@@ -1739,45 +1783,11 @@ function emit_invoke(bc::BuilderCtx, invoke_target, f, args, ir, stmt_idx)
         end
     end
 
-    if fn_name == :parse_stmts && length(args) >= 1
-        ps_id = resolve_operand(bc, args[1], ir)
-        ld = Libdl.dlsym(bc.lib_handle, :block_add_load)
-        stream_id = ccall(ld, UInt32, (Ptr{Cvoid}, UInt32, Int32, UInt32), bc.fctx_handle, ps_id, Int32(0), TYPE_PTR)
-        idx_id = ccall(ld, UInt32, (Ptr{Cvoid}, UInt32, Int32, UInt32), bc.fctx_handle, stream_id, Int32(32), TYPE_I64)
-        new_idx = ccall(Libdl.dlsym(bc.lib_handle, :block_add_iadd), UInt32, (Ptr{Cvoid}, UInt32, UInt32), bc.fctx_handle, idx_id, emit_constant(bc, Int64(1)))
-        sp = Libdl.dlsym(bc.lib_handle, :block_add_store)
-        ccall(sp, Cvoid, (Ptr{Cvoid}, UInt32, Int32, UInt32, UInt32), bc.fctx_handle, stream_id, Int32(32), new_idx, TYPE_I64)
-        ccall(sp, Cvoid, (Ptr{Cvoid}, UInt32, Int32, UInt32, UInt32), bc.fctx_handle, stream_id, Int32(72), emit_constant(bc, Int64(0)), TYPE_I64)
-        return emit_constant(bc, Int64(0))
-    end
-
     # Unknown invoke — two paths depending on compilation mode:
     # 1. Recursive (bc.module_compiler set): enqueue callee and emit cross-function call.
     #    Mirrors WasmCodegen's request! + CallTarget pattern (compiler.jl line 1451-1452).
     # 2. Fallback: emit sentinel constant.
     mc = bc.module_compiler
-
-    # _bump_until_n and parse_stmts stubs
-    if fn_name == :_bump_until_n && length(args) >= 2
-        stream_id = resolve_operand(bc, args[1], ir)
-        n_id = resolve_operand(bc, args[2], ir)
-        new_idx_id = ccall(Libdl.dlsym(bc.lib_handle, :block_add_iadd), UInt32, (Ptr{Cvoid}, UInt32, UInt32), bc.fctx_handle, n_id, emit_constant(bc, Int64(1)))
-        sp = Libdl.dlsym(bc.lib_handle, :block_add_store)
-        ccall(sp, Cvoid, (Ptr{Cvoid}, UInt32, Int32, UInt32, UInt32), bc.fctx_handle, stream_id, Int32(32), new_idx_id, TYPE_I64)
-        ccall(sp, Cvoid, (Ptr{Cvoid}, UInt32, Int32, UInt32, UInt32), bc.fctx_handle, stream_id, Int32(72), emit_constant(bc, Int64(0)), TYPE_I64)
-        return n_id
-    end
-    if fn_name == :parse_stmts && length(args) >= 1
-        ps_id = resolve_operand(bc, args[1], ir)
-        ld = Libdl.dlsym(bc.lib_handle, :block_add_load)
-        stream_id = ccall(ld, UInt32, (Ptr{Cvoid}, UInt32, Int32, UInt32), bc.fctx_handle, ps_id, Int32(0), TYPE_PTR)
-        idx_id = ccall(ld, UInt32, (Ptr{Cvoid}, UInt32, Int32, UInt32), bc.fctx_handle, stream_id, Int32(32), TYPE_I64)
-        new_idx = ccall(Libdl.dlsym(bc.lib_handle, :block_add_iadd), UInt32, (Ptr{Cvoid}, UInt32, UInt32), bc.fctx_handle, idx_id, emit_constant(bc, Int64(1)))
-        sp = Libdl.dlsym(bc.lib_handle, :block_add_store)
-        ccall(sp, Cvoid, (Ptr{Cvoid}, UInt32, Int32, UInt32, UInt32), bc.fctx_handle, stream_id, Int32(32), new_idx, TYPE_I64)
-        ccall(sp, Cvoid, (Ptr{Cvoid}, UInt32, Int32, UInt32, UInt32), bc.fctx_handle, stream_id, Int32(72), emit_constant(bc, Int64(0)), TYPE_I64)
-        return emit_constant(bc, Int64(0))
-    end
 
     if mc !== nothing && callee_mi isa Core.MethodInstance
         # Try to resolve the callee's IR. If cranelift_type throws (e.g. Union{}
@@ -1860,6 +1870,26 @@ end
 function emit_globalref(bc::BuilderCtx, f::Core.GlobalRef, args, ir, stmt_idx)
     fn = f.name
     mod = f.mod
+
+    # Base.getglobal(module, :name) — const-global access (e.g.
+    # `ascii_is_identifier_char`, `KSet` tables, module-const Vectors). Inference
+    # types the result `Core.Const(value)` when the global is a const, so resolve
+    # it at compile time and emit the value. Without this the whole getindex chain
+    # (`arr[i]` on a const Vector{Bool}) is sentinel'd, breaking lex_identifier's
+    # break condition and making the lexer stop after one identifier.
+    if fn === :getglobal && length(args) >= 2
+        gv = if args[1] isa Module; args[1]
+              elseif args[1] isa Core.GlobalRef
+                  try; g = getglobal(args[1].mod, args[1].name); g isa Module ? g : nothing; catch _; nothing; end
+              else; (try; cv = _const_value(args[1], ir); cv isa _NotConst ? nothing : cv; catch _; nothing; end); end
+        nm = if args[2] isa QuoteNode; args[2].value
+              elseif args[2] isa Core.Const; args[2].val
+              elseif args[2] isa Symbol; args[2]
+              else nothing end
+        if gv isa Module && nm isa Symbol && isdefined(gv, nm)
+            return emit_constant(bc, getglobal(gv, nm))
+        end
+    end
 
     # === Integer arithmetic ===
     if fn == :add_int || fn == :+ ; return emit_binop(bc, :block_add_iadd, args, ir) end
@@ -2308,12 +2338,16 @@ function emit_struct_getfield(bc::BuilderCtx, args, ir, stmt_idx)
     end
 
     # Case 3: bitstype struct field — extract from value (not memory load).
-    # ONLY for sizeof<=8 bitstypes: cranelift_type maps these to a real scalar
-    # register (I64/I32/I8), so the value lives in a register and we extract the
-    # field by shift+mask. Larger bitstypes (NamedTuple sizeof=16, RawToken
-    # sizeof=32, ...) are mapped to TYPE_PTR by cranelift_type — they are passed
-    # as heap pointers and must use the Case 4 memory-load path below.
-    if T isa DataType && isbitstype(T) && sizeof(T) <= 8
+    # ONLY for sizeof<=8 bitstypes that cranelift_type maps to a real SCALAR
+    # register (I64/I32/I8): the value lives in a register and we extract the
+    # field by shift+mask. Exclude cranelift_type==TYPE_PTR: NamedTuples are
+    # ALWAYS TYPE_PTR (even when isbitstype sizeof<=8, e.g. NamedTuple{kind,flags,
+    # orig_kind,is_leaf}=8B), so they are heap pointers — shifting a pointer gives
+    # garbage. This is the peek_behind(s) kwcall bug: getfield(namedtuple_ptr,
+    # :kind) returned the pointer bits. Such types fall through to Case 4's
+    # memory load. (Larger bitstypes — RawToken sizeof=32, … — are also TYPE_PTR
+    # and handled by Case 3b.)
+    if T isa DataType && isbitstype(T) && sizeof(T) <= 8 && cranelift_type(T) != TYPE_PTR
         # Bitstype getfield: value is in register, extract field by offset
         offset = fieldoffset(T, field_sym)
         if offset == 0
@@ -2367,36 +2401,23 @@ function emit_struct_getfield(bc::BuilderCtx, args, ir, stmt_idx)
         end
     end
 
-    # Case 3b: Large bitstype (sizeof > 8) mapped to TYPE_PTR by cranelift_type.
-    # The value was loaded as i64 from inline storage (e.g. Vector data) and is
-    # NOT a heap pointer. Extract the field from register bits instead of
-    # dereferencing. Fields at offset < 8 from the first-loaded register are
-    # available; fields at offset >= 8 need ref_tracking (TODO).
-    if T isa DataType && isbitstype(T)
+    # Case 3b: Large bitstype (sizeof > 8) is heap-allocated by emit_new and
+    # emit_core_tuple (cranelift_type maps it to TYPE_PTR), so obj_id is a POINTER
+    # to the heap object — NOT inline register bits. Vector loads (emit_memoryrefget)
+    # and callee returns hand back the same pointer. Load the field from
+    # obj_id + fieldoffset; the field's own representation is cranelift_type(field_T)
+    # (a pointer for a nested >8-byte sub-value such as a SyntaxToken field of a
+    # Tuple, a scalar otherwise). The old shift-on-register path assumed obj_id
+    # held the value inline; for a heap pointer it computed ushr(ptr, off*8) →
+    # garbage, which made peek_dotted_op_token return a corrupt SyntaxToken and
+    # looped parse_LtoR forever on `is_op(tk)`.
+    if T isa DataType && isbitstype(T) && sizeof(T) > 8
         offset = fieldoffset(T, field_sym)
         field_T = fieldtype(T, field_sym)
-        ftype = cranelift_type(field_T)
-        if offset == 0
-            # Field at start: lower bytes of register ARE the field value.
-            if ftype == TYPE_I64 || ftype == TYPE_PTR
-                return obj_id
-            end
-            # Narrow from i64 to field width (e.g. i32 for SyntaxHead)
-            ird_ptr = Libdl.dlsym(bc.lib_handle, :block_add_ireduce)
-            return ccall(ird_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
-                         bc.fctx_handle, obj_id, ftype)
-        end
-        # Offset > 0: shift right to bring field to LSB, then narrow.
-        off_id = emit_constant(bc, Int64(offset * 8))
-        sh_ptr = Libdl.dlsym(bc.lib_handle, :block_add_ushr)
-        sh_id = ccall(sh_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
-                      bc.fctx_handle, obj_id, off_id)
-        if ftype == TYPE_I64 || ftype == TYPE_PTR
-            return sh_id
-        end
-        ird_ptr = Libdl.dlsym(bc.lib_handle, :block_add_ireduce)
-        return ccall(ird_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
-                     bc.fctx_handle, sh_id, ftype)
+        field_type_enum = cranelift_type(field_T)
+        load_ptr = Libdl.dlsym(bc.lib_handle, :block_add_load)
+        return ccall(load_ptr, UInt32, (Ptr{Cvoid}, UInt32, Int32, UInt32),
+                     bc.fctx_handle, obj_id, Int32(offset), field_type_enum)
     end
 
     # Case 4: regular mutable struct field — load from memory
@@ -2660,9 +2681,29 @@ function emit_memoryrefget(bc::BuilderCtx, args, ir)
         (eT, cranelift_type(eT), resolve_operand(bc, memref_val, ir), 0)
     end
 
+    # Memory load WIDTH must match the in-memory element size, NOT the register
+    # repr from cranelift_type: Bool/UInt8/Int8 occupy an i32 REGISTER (per the
+    # sub-word convention) but are 1 byte in a Vector{Bool}. Loading cranelift_type's
+    # i32 reads 4 adjacent elements (e.g. ascii_is_identifier_char[98] → 0x01010101),
+    # which breaks lex_identifier's break test and makes the lexer stop after one
+    # identifier. Load sizeof(elem) bytes, then uextend to the register repr.
+    mem_width = if elem_type_enum == TYPE_PTR
+        TYPE_PTR  # heap-pointer element: pointer-width in memory too
+    elseif elem_T isa DataType && isbitstype(elem_T)
+        sz = sizeof(elem_T)
+        sz <= 1 ? TYPE_I8 : sz <= 2 ? TYPE_I16 : sz <= 4 ? TYPE_I32 : TYPE_I64
+    else
+        elem_type_enum
+    end
     load_ptr = Libdl.dlsym(bc.lib_handle, :block_add_load)
-    return ccall(load_ptr, UInt32, (Ptr{Cvoid}, UInt32, Int32, UInt32),
-                 bc.fctx_handle, base_id, Int32(base_off), elem_type_enum)
+    loaded = ccall(load_ptr, UInt32, (Ptr{Cvoid}, UInt32, Int32, UInt32),
+                   bc.fctx_handle, base_id, Int32(base_off), mem_width)
+    if mem_width != elem_type_enum && elem_type_enum != TYPE_PTR && mem_width != TYPE_PTR
+        ext_ptr = Libdl.dlsym(bc.lib_handle, :block_add_uextend)
+        return ccall(ext_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
+                     bc.fctx_handle, loaded, elem_type_enum)
+    end
+    return loaded
 end
 
 function emit_memoryrefset(bc::BuilderCtx, args, ir)
@@ -2738,6 +2779,27 @@ function emit_isa(bc::BuilderCtx, args, ir)
     end
 
     val_id = resolve_operand(bc, args[1], ir)
+
+    # If x's type is statically known and concrete, isa(x, T) is a COMPILE-TIME
+    # check: emit the constant `value_type <: target_type`. This avoids the
+    # runtime type-tag load below (which assumes x is a heap pointer) for scalar
+    # values. Crucial for `in(Kind, Tuple{Kind})`: Base.in's 3-valued lowering
+    # produces `isa(kind_scalar, Missing)` / `isa(kind_scalar, WeakRef)`, and
+    # loading a type tag from a Kind register (UInt16 in an i32) derefs the
+    # scalar as an address → SIGSEGV. That is the parse_Nary loop (its
+    # `while peek(ps) in delimiters` never terminates) and thus the parse_eq
+    # runaway. Only short-circuit CONCRETE value types; Union/Any values (the
+    # dynamic cases) fall through to the type-tag loads.
+    val_T0 = get_operand_type(args[1], ir)
+    val_T0 = val_T0 isa Core.Const ? val_T0.val : val_T0
+    if val_T0 isa DataType && isconcretetype(val_T0) && target_type isa Type
+        result = try; val_T0 <: target_type; catch _; nothing end
+        if result !== nothing
+            iconst_ptr = Libdl.dlsym(bc.lib_handle, :block_add_iconst)
+            return ccall(iconst_ptr, UInt32, (Ptr{Cvoid}, Int64, UInt32),
+                         bc.fctx_handle, result ? Int64(1) : Int64(0), TYPE_I32)
+        end
+    end
 
     if target_type === Nothing
         # nothing in union fields is tagged, not raw null (0x0).
@@ -3054,31 +3116,34 @@ function emit_core_tuple(bc::BuilderCtx, args, ir)
     elem_types = [get_operand_type(a, ir) for a in args]
     elem_types = [t isa Core.Const ? t.val : t for t in elem_types]
 
-    # Calculate offsets for each element (tuple fields are aligned)
+    # Construct the actual tuple type, then use Julia's REAL field layout
+    # (fieldoffset/sizeof) so the element STORE offsets here exactly match the
+    # fieldoffset-based LOAD offsets in emit_struct_getfield. The old manual
+    # computation used align=sizeof(ET), which over-aligns fields whose natural
+    # alignment is smaller than their size — e.g. SyntaxToken (sizeof 12 but
+    # 4-byte alignment from its UInt32 field). That stored the field at offset 12
+    # while getfield read fieldoffset=4, yielding a garbage pointer → SIGSEGV in
+    # kind(peek_dotted_op_token(ps)[3]) and the parse_atom crash.
+    tuple_type = Tuple{elem_types...}
     offsets = Int[]
-    current_offset = 0
-    for ET in elem_types
-        if isghost(ET)
-            push!(offsets, current_offset)  # ghost element: no space, but still addressable
-            continue
+    local total_size
+    try
+        total_size = sizeof(tuple_type)
+        for i in 1:length(elem_types)
+            push!(offsets, Int(fieldoffset(tuple_type, i)))
         end
-        # Align to natural boundary of the type
-        # Use pointer width for heap-reference types (typeof does not have sizeof)
-        elem_sz = try sizeof(ET) catch; 8 end
-        align = elem_sz
-        current_offset = cld(current_offset, align) * align
-        push!(offsets, current_offset)
-        current_offset += elem_sz
+    catch _
+        # Fallback (non-concrete tuple): pack at pointer-width boundaries.
+        cur = 0
+        for ET in elem_types
+            if isghost(ET); push!(offsets, cur); continue; end
+            sz = try sizeof(ET) catch; 8 end
+            cur = cld(cur, 8) * 8
+            push!(offsets, cur); cur += sz
+        end
+        total_size = cur
     end
 
-    total_size = current_offset
-
-    # For tuples, we need to allocate a chunk of memory for the elements
-    # Since tuples are immutable and fixed-size, we can use a simple allocation
-    # Allocate memory for tuple elements (using struct allocation)
-
-    # Construct the actual tuple type from element types
-    tuple_type = Tuple{elem_types...}
     type_ptr = pointer_from_objref(tuple_type)  # Use actual tuple type pointer
     size_id = emit_constant(bc, Int32(total_size))
     type_ptr_id = emit_constant(bc, Int64(reinterpret(UInt64, type_ptr)))

@@ -985,12 +985,16 @@ const WEB_CORPUS = [
 
     @testset "parse_into — native parse + native iterate (from examples/parser)" begin
         # FULL native pipeline: ParseStream(src) → parse!(ps) → iterate ps.output.
-        # # TODO: Runtime blocked. All callees now COMPILE (0 verifier errors) and
-        # # ParseStream construction + native iteration are fixed, but parse! itself
-        # # still miscompiles at runtime — the MemoryRef tracking pipeline
-        # # (~75% of sentinel throws) degrades array accesses to zero sentinels →
-        # # segfault in open_flags/next_token/etc. See CLAUDE.md recursive-pipeline
-        # # status. Uncomment the runtime block below once parse! runs end-to-end.
+        # # TODO: Runtime still blocked. Progress this session (2026-07-14): the
+        # # parse_stmts/_bump_until_n stubs were removed (architecture violation),
+        # # and four codegen bugs were fixed (Union{Nothing,T} return type, entry-
+        # # block branch target, getfield Case 3b for >8-byte bitstypes, and
+        # # emit_core_tuple field offsets). parse! now COMPILES ~160 callees, and
+        # # at runtime parse_atom + the peek/bump drain loop + all leaf predicates
+        # # are correct. But the precedence-climbing chain still miscompiles:
+        # # parse_unary("1") returns 1 (should be 2) and parse_eq("1") runs away
+        # # allocating — a control-flow miscompilation not yet localized.
+        # # Uncomment the runtime block below once parse! runs end-to-end.
         print("  parse_into … ")
         try
             import Base.JuliaSyntax as JS
@@ -1014,12 +1018,12 @@ const WEB_CORPUS = [
 
             comp = compile_native(parse_into, Tuple{String}; name="parse_into")
             rm(comp.so_path)
-            # # TODO: Uncomment when recursive pipeline compiles parse! fully
+            # # TODO: Uncomment when parse! runs end-to-end
             # host = parse_into("1 + 2")
             # native_result = NativeCodegen.compile_and_call(
             #     parse_into, Int64, Tuple{String}, "1 + 2"; name="parse_into")
             # @test native_result == host
-            println("✅ (compiles; runtime blocked — see CLAUDE.md recursive pipeline status)")
+            println("✅ (compiles ~160 callees; runtime blocked — see CLAUDE.md / parse! runtime unblockers memory)")
         catch e
             if e isa InterruptException; rethrow(); end
             println("❌ ", sprint(showerror, e))

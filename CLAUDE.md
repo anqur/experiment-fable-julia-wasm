@@ -221,11 +221,58 @@ legacy `GCHeader` layout and are never returned to Julia.
   multi-argument formatting, `String(Vector{UInt8})`, mutation, and UTF-8
   character indexing. String reads, literals, and concatenation have dedicated
   lowering paths.
-- **Recursive pipeline status:** `parse_into`/native `parse!` remains a
-  compile-only case in `NativeCodegen/test/test_final.jl`. The recursive callees
-  compile, but live parser execution can still miscompile because MemoryRef
-  tracking degrades some array accesses to zero sentinels. Keep its runtime test
-  commented with its `# TODO:` until it executes end-to-end.
+- **Recursive pipeline status (2026-07-15):** `parse!`/`parse_stmts` COMPILE
+  ~160 callees through the recursive pipeline (the `parse_stmts`/`_bump_until_n`
+  stubs that used to short-circuit the descent have been removed — they were an
+  architecture violation). At runtime the **lexer is now correct** (`next_token`,
+  `peek`, `peek_token`, and the peek/bump drain loop all match the host for
+  whitespace inputs like `"a a"`, `"1 + 2"`), and every isolated parser function
+  (`parse_atom`, `parse_unary`, `parse_factor`, `parse_call`, `parse_power`,
+  `peek_behind`) runs correctly native. The full **composed** `parse!("1")` /
+  `parse_stmts("1")` still SIGSEGVs at runtime in `__lookahead_index` — a single
+  bad deref of `lookahead[i]` (a `SyntaxToken` pointer). The ~75M "allocations"
+  in that crash report are the descent's ~4.7 GB *compilation* (the runtime
+  fault is one deref, not a loop); the identical `__lookahead_index`/peek path
+  passes in the drain loop and in isolation, so it is a composition-only state
+  corruption — most likely a stale tracked element address in `ref_tracking`
+  after the lookahead vector's `_deletebeg!`/`_growend_internal!` reallocation,
+  which the isolated drain never triggers. Keep the `parse_into` runtime test in
+  `test_final.jl` commented with its `# TODO:` until this executes end-to-end.
+  Eleven codegen fixes got the pipeline here (all regression-safe: eDSL 91 ✅,
+  test_final Tier 1-2 ✅); see `NativeCodegen/PARSEBANG_UNBLOCKERS.md` for the
+  full list and the exact next diagnostic step.
+- **Sub-word array element load width:** `cranelift_type(Bool)` returns `TYPE_I32`
+  (Bool occupies an i32 register per the shared `scalar_repr` convention), but in
+  a `Vector{Bool}` each element is 1 byte in memory. `emit_memoryrefget` must load
+  the **memory width** = `sizeof(elem)` bytes (Bool→`TYPE_I8`, UInt16→`TYPE_I16`;
+  heap-pointer elements stay `TYPE_PTR`) then `uextend` to the register repr —
+  otherwise a `load.i32` at a 1-byte stride reads 4 adjacent elements (this was
+  the lexer bug that made `lex_identifier` stop after one identifier). The same
+  memory-width rule should be applied to `emit_pointerset` (sub-word stores) and
+  to `emit_struct_getfield` bitstype-field loads for completeness.
+- **`Base.getglobal(module, :name)`** (how const globals are accessed in lowered
+  IR) must be handled in `emit_globalref`: args[1] is a `GlobalRef` to the module
+  (resolve via `getglobal(ref.mod, ref.name)`), args[2] is the `QuoteNode` name;
+  resolve `getglobal(mod, name)` and `emit_constant` it. Without this, const
+  `Vector{Bool}` tables like `ascii_is_identifier_char` read as garbage.
+- **Entry block can't be a Cranelift branch target:** Julia IR block 1 is
+  frequently a `while`-loop condition with a back-edge to itself
+  (`parse_chain`, `parse_generator`, …). `init_entry` creates a synthetic entry
+  holding the function params and immediately `jump block0`, so `block0` is a
+  normal branch-targetable block. (Julia block 1 has no phi nodes in these
+  cases, so the jump passes no args; param SSA values stay valid since entry
+  dominates.)
+- **`cranelift_type` for Unions:** a `Union{Nothing,T}` (and 3+-arm
+  `Union{Nothing,T1,T2}` with a `TYPE_PTR` arm) must not throw — classify by the
+  non-Nothing arms (drop the void arm); if they agree, return that type; if any
+  arm is `TYPE_PTR`, return `TYPE_PTR` (scalars box at phi edges). Without this,
+  functions whose inference-widened return is such a Union (e.g.
+  `parse_unary::Union{Nothing,ParseStreamPosition,RawGreenNode}`) fail recursive
+  resolution, the call is sentinel'd + DCE'd, and the function is never invoked.
+- **Constant >8-byte bitstypes** (e.g. a folded `RawGreenNode(...)` literal) must
+  be emitted as **rooted** heap pointers (`pointer_from_objref(Ref(val))`, pushed
+  into the module-global `_ROOTED_CONST_REFS`); without rooting the GC reclaims
+  the `Ref` after `compile_native` returns and the pointer dangles.
 - `remove_constant_phis` is **not** a Cranelift defect and is **not** opt-gated:
   it runs unconditionally in `Context::optimize` (only the egraph pass depends on
   `opt_level != none`). It requires `func.layout.entry_block()` to be `Some` —

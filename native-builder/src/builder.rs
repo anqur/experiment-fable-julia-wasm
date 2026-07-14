@@ -106,17 +106,27 @@ impl FunctionCtx {
         let func: *mut cranelift_codegen::ir::Function = &mut self.context.func;
         let fctx: *mut FunctionBuilderContext = &mut self.fb_ctx;
         let mut fb = unsafe { FunctionBuilder::new(&mut *func, &mut *fctx) };
+        // `entry` holds the function params and immediately jumps to `block0`
+        // (Julia IR block 1), so `block0` is NOT the Cranelift entry block.
+        // Cranelift forbids branching TO the entry block; Julia block 1 is
+        // frequently a while-loop condition with a back-edge to itself
+        // (parse_chain, parse_generator, parse_decl_with_initial_ex), so it must
+        // be a normal, branch-targetable block. Julia block 1 has no phi nodes,
+        // so block0 takes no block params and the jump passes no args; the
+        // function-param SSA values remain valid in block0 since entry dominates.
         let entry = fb.create_block();
         fb.switch_to_block(entry);
         fb.append_block_params_for_function_params(entry);
-        // Snapshot the entry params before erasing the builder's lifetime.
         let params: Vec<Value> = fb.func.dfg.block_params(entry).to_vec();
+        let block0 = fb.create_block();
+        fb.ins().jump(block0, &[]);
+        fb.seal_block(entry);
+        self.blocks.insert("block0".to_string(), block0);
+        self.current_block = block0;
         self.fb = Box::into_raw(Box::new(fb)) as *mut FunctionBuilder<'static>;
         for (i, val) in params.iter().enumerate() {
             self.ssa_values.insert(i as u32, *val);
         }
-        self.blocks.insert("block0".to_string(), entry);
-        self.current_block = entry;
     }
 
     /// Borrow the persistent builder. Callers must read any needed `self` fields
