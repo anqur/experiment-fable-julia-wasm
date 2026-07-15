@@ -1,7 +1,16 @@
 // GC allocator — Boehm GC with Julia-compatible object layout.
+//
+// TEMPORARY DIAGNOSTIC: the `__jl_gc_*` allocators currently use the SYSTEM
+// allocator (plain malloc) instead of Boehm GC, so every Julia object allocated
+// by the compiled .so LEAKS and is never reclaimed. This isolates whether the
+// `parse!` runtime crash (a bad `lookahead[i]` SyntaxToken-pointer deref) is a
+// GC reclamation / rooting bug — Boehm missing a root and collecting an object
+// whose raw pointer the native code still holds — versus a genuine codegen store
+// miscompilation. If the crash disappears with leaking, it is a GC-rooting bug;
+// if it persists, the store itself is wrong. Revert to `bdwgc_alloc::Allocator`
+// (and restore `Allocator::force_collect()`) once diagnosed.
 
-use std::alloc::{GlobalAlloc, Layout};
-use bdwgc_alloc::Allocator;
+use std::alloc::{GlobalAlloc, Layout, System};
 
 // Julia-compatible object header: starts with type pointer (jl_datatype_t*)
 // Julia's jl_value_t structure: type pointer followed by data
@@ -21,23 +30,19 @@ pub struct GCHeader {
 pub const HEADER_SIZE: usize = std::mem::size_of::<GCHeader>();
 pub const JULIA_HEADER_SIZE: usize = std::mem::size_of::<JuliaGCHeader>();
 
-// GC allocator instance (NOT the global allocator — only the __jl_gc_* API
-// routes through Boehm; the rest of the process uses the system allocator).
-static GC_ALLOC: Allocator = Allocator;
+// TEMPORARY: system allocator (leak) instead of Boehm GC. Only the __jl_gc_*
+// API routes through here; the rest of the process already uses the system
+// allocator (bdwgc was never the #[global_allocator]).
+static GC_ALLOC: System = System;
 
 #[no_mangle]
 pub unsafe extern "C" fn __jl_gc_alloc(type_tag: u32, data_size: u32) -> *mut u8 {
     let total = HEADER_SIZE + data_size as usize;
     let layout = Layout::from_size_align(total, 16).unwrap();
-    let mut ptr = GlobalAlloc::alloc(&GC_ALLOC, layout);
-    // Force a GC collection and retry once if allocation fails. The compilation
-    // phase consumes most of the Boehm heap; after compile, the heap may be
-    // close to exhausted. Returning NULL here causes a segfault-at-0 when the
-    // caller stores and later dereferences the null pointer.
-    if ptr.is_null() {
-        Allocator::force_collect();
-        ptr = GlobalAlloc::alloc(&GC_ALLOC, layout);
-    }
+    let ptr = GlobalAlloc::alloc(&GC_ALLOC, layout);
+    // (Boehm's force_collect-and-retry-on-null is removed while leaking: malloc
+    // does not reclaim, so collecting would not help. malloc essentially never
+    // returns null here; keep the null guard for safety.)
     if ptr.is_null() { return std::ptr::null_mut(); }
     let h = ptr as *mut GCHeader;
     (*h).type_tag = type_tag;

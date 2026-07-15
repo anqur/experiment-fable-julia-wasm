@@ -119,10 +119,40 @@ the `mc !== nothing` recursive path). After removal the real bugs became visible
     broke `lex_identifier`'s break test and made the lexer stop after one
     identifier (`next_token("a a")` → `[a, EndMarker]` instead of
     `[a,WS,a,EndMarker]`). Fix: load the **memory width** = `sizeof(elem)` bytes
-    (Bool→`TYPE_I8`, UInt16→`TYPE_I16`, …; heap-pointer elements stay `TYPE_PTR`),
-    then `uextend` to the register repr. **After this the lexer works.** The same
-    memory-width rule should be applied to `emit_pointerset` (sub-word stores) and
-    to `emit_struct_getfield` bitstype-field loads for completeness.
+    (Bool→`TYPE_I8`, UInt16→`TYPE_I16`, …; heap-pointer/float elements keep their
+    own type), then `uextend` to the register repr. **After this the lexer works.**
+
+12. **Sub-word STRUCT/TUPLE field load width** (`emit_struct_getfield` Case 1/3b/4
+    + `emit_tuple_index_from_ssa` via the new `_load_field_mem` helper). Same bug
+    class as #11 but for `getfield` on a heap struct/tuple: a `Bool` field at
+    tuple offset 1 was loaded `load.i32` (4 bytes), reading into the adjacent
+    `SyntaxToken` pointer → `is_compound_assignment` (the 2nd element of
+    `Tuple{Bool,Bool,SyntaxToken}` from `peek_dotted_op_token`) appeared `true` →
+    `parse_assignment_with_initial_ex`'s early-return guard failed → it recursed
+    via `parse_assignment` forever → **stack overflow**. Fix: all getfield load
+    paths now use `_load_field_mem` (load `sizeof(field)` bytes + `uextend`; floats
+    keep F64/F32). **After this `parse!("1 + 2")` runs end-to-end = 7 events
+    (native == host), and `parse!("1")`, `parse!("x")`, `parse!("1 + 2 * 3")`,
+    `parse!("f(x)")`, `parse!("a + b * c")` all match host.**
+
+13. **GC disabled (leak) — diagnostic.** `__jl_gc_alloc*` in `gc.rs` switched from
+    `bdwgc_alloc::Allocator` to `std::alloc::System` (malloc, never reclaimed).
+    This proved the day-long `lookahead[i]` SIGSEGV was a Boehm-rooting bug
+    (conservative scan dropping `SyntaxToken` roots); with leaking the deref is
+    gone. Proper Boehm rooting is the eventual replacement. **With GC off + fixes
+    #11/#12, `parse!` works for simple expressions.**
+
+## Current state after 13 fixes
+
+`parse!("1 + 2")` → **7 events, native == host** (end-to-end, GC off). Simple
+expressions all pass. **Remaining gaps** (likely one shared root cause — loop /
+mutation-propagation): (a) **assignment statements** (`x = 1`) SIGILL — a runtime
+arrayref OOB (one of ~45 bounds-check traps in the assignment path fires; the
+index drifts past the buffer in the deeper assignment descent); simple expressions
+don't trigger it. (b) `pop!` **in a loop** (eDSL `popsum`) regressed: single
+`pop!` is correct (last elt + length--), but `pop!` ×4 in a loop leaves the array
+non-empty — the loop body doesn't observe the previous iteration's mutation. eDSL
+90 ✅ (was 91; popsum is the 1 regression; gcd/gcd2 pre-existing).
 
 ## The remaining end-to-end blocker
 

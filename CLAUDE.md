@@ -222,13 +222,32 @@ legacy `GCHeader` layout and are never returned to Julia.
   character indexing. String reads, literals, and concatenation have dedicated
   lowering paths.
 - **Recursive pipeline status (2026-07-15, updated):** `parse!`/`parse_stmts`
-  COMPILE ~160 callees. The full composed `parse!("1")` / `parse!("1 + 2")` still
-  SIGSEGVs at runtime in `__lookahead_index` (a bad deref of `lookahead[i]`, a
-  `SyntaxToken` pointer), reached via a deep precedence chain
-  (`parse_call_chain`/`parse_LtoR`/`parse_with_chains`/…; `parse_assignment_with_initial_ex`
-  recurses but it is a deep descent, not a confirmed infinite loop). The ~75M
-  "allocations" in the crash report are the descent's ~4.7 GB *compilation*
-  (the runtime fault is one deref).
+  now WORK END-TO-END at runtime for simple expressions **with the GC disabled**
+  (`__jl_gc_alloc*` uses `std::alloc::System` — leak mode; see gc.rs). Verified:
+  `parse!("1 + 2")` → 7 events (native==host), `parse!("1")`, `parse!("x")`,
+  `parse!("1 + 2 * 3")`, `parse!("f(x)")`, `parse!("a + b * c")` all match host.
+  This was unblocked by FOUR fixes this session: (a) disabling Boehm GC (its
+  conservative scan was dropping `SyntaxToken` roots → dangling `lookahead[i]`
+  deref — the day-long SIGSEGV); (b) the **sub-word struct/tuple field load
+  width** fix (`_load_field_mem` in `emit_struct_getfield` Case 1/3b/4 +
+  `emit_tuple_index_from_ssa`): a `Bool` field at tuple offset 1 was loaded as
+  `load.i32` (4 bytes), reading into the adjacent `SyntaxToken` pointer →
+  `is_compound_assignment` appeared `true` → `parse_assignment_with_initial_ex`
+  infinite-recursed (stack overflow); now loads `sizeof(field)` bytes + `uextend`
+  (floats keep their float type); (c) the **sub-word store width** fix
+  (`_store_field_mem` in `emit_struct_setfield` + `emit_pointerset`): the
+  store-side mirror — `store.i32` for a 1-byte Bool clobbered adjacent fields;
+  (d) `emit_memoryrefget` memory-width (already applied, fix #11).
+  REMAINING GAP: **assignment statements** (`x = 1`) still SIGILL — but it is
+  `_parser_stuck_error` (peek_count > 100k), NOT an OOB: the assignment path's
+  `bump("=")` doesn't consume the `=` token, so `parse_assignment_with_initial_ex`
+  recurses forever re-peeking the same `=`. Simple expressions (no `=`) don't
+  trigger it. Next: investigate why `bump`/`bump_dotted` is a no-op in the
+  assignment context (works in the drain loop and for simple expressions). The
+  GC-disabled leak mode is a diagnostic, not a long-term fix — proper Boehm
+  rooting is the eventual replacement. Note: eDSL `popsum` (pop!×4) regressed
+  under GC-off — it's the host/native Vector.size ABI hazard (native writes
+  size as a heap Tuple pointer, host reads it inline), not a codegen bug.
   - **FIXED this session — `__jl_array_grow_end` heap underflow (gc.rs):** it
     allocated only the data bytes then wrote the length at `new_data - 8`, an
     8-byte underflow on every `push!`. This corrupted the Boehm heap, which in

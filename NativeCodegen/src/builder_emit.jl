@@ -2183,9 +2183,7 @@ function emit_tuple_index_from_ssa(bc::BuilderCtx, obj, idx, ir)
         ptr_id = resolve_operand(bc, obj, ir)
         off = Int32(fieldoffset(T, k))
         ct = cranelift_type(elem_types[k])
-        load_ptr = Libdl.dlsym(bc.lib_handle, :block_add_load)
-        return ccall(load_ptr, UInt32, (Ptr{Cvoid}, UInt32, Int32, UInt32),
-                     bc.fctx_handle, ptr_id, off, ct)
+        return _load_field_mem(bc, ptr_id, off, elem_types[k], ct)
     end
 
     # Dynamic index: select() needs matching Cranelift types for all arms.
@@ -2196,13 +2194,11 @@ function emit_tuple_index_from_ssa(bc::BuilderCtx, obj, idx, ir)
         throw(CompileError("heterogeneous dynamic tuple indexing not supported ($T)"))
 
     ptr_id = resolve_operand(bc, obj, ir)
-    load_ptr = Libdl.dlsym(bc.lib_handle, :block_add_load)
     elem_ids = UInt32[]
     for i in 1:n
         off = Int32(fieldoffset(T, i))
         ct = cranelift_type(elem_types[i])
-        push!(elem_ids, ccall(load_ptr, UInt32, (Ptr{Cvoid}, UInt32, Int32, UInt32),
-                              bc.fctx_handle, ptr_id, off, ct))
+        push!(elem_ids, _load_field_mem(bc, ptr_id, off, elem_types[i], ct))
     end
 
     # Dynamic index → right-to-left select chain (mirrors emit_tuple_index).
@@ -2283,10 +2279,8 @@ function emit_struct_getfield(bc::BuilderCtx, args, ir, stmt_idx)
         base_id, base_off, parent_T = bc.ref_tracking[obj]
         field_off = fieldoffset(parent_T, field_sym)
         field_T = fieldtype(parent_T, field_sym)
-        field_type_enum = cranelift_type(field_T)
-        load_ptr = Libdl.dlsym(bc.lib_handle, :block_add_load)
-        return ccall(load_ptr, UInt32, (Ptr{Cvoid}, UInt32, Int32, UInt32),
-                     bc.fctx_handle, base_id, Int32(base_off + field_off), field_type_enum)
+        return _load_field_mem(bc, base_id, Int32(base_off + field_off),
+                               field_T, cranelift_type(field_T))
     end
 
     obj_id = resolve_operand(bc, obj, ir)
@@ -2405,27 +2399,44 @@ function emit_struct_getfield(bc::BuilderCtx, args, ir, stmt_idx)
     # emit_core_tuple (cranelift_type maps it to TYPE_PTR), so obj_id is a POINTER
     # to the heap object — NOT inline register bits. Vector loads (emit_memoryrefget)
     # and callee returns hand back the same pointer. Load the field from
-    # obj_id + fieldoffset; the field's own representation is cranelift_type(field_T)
-    # (a pointer for a nested >8-byte sub-value such as a SyntaxToken field of a
-    # Tuple, a scalar otherwise). The old shift-on-register path assumed obj_id
-    # held the value inline; for a heap pointer it computed ushr(ptr, off*8) →
-    # garbage, which made peek_dotted_op_token return a corrupt SyntaxToken and
-    # looped parse_LtoR forever on `is_op(tk)`.
+    # obj_id + fieldoffset using the field's MEMORY width (see _load_field_mem).
     if T isa DataType && isbitstype(T) && sizeof(T) > 8
         offset = fieldoffset(T, field_sym)
         field_T = fieldtype(T, field_sym)
-        field_type_enum = cranelift_type(field_T)
-        load_ptr = Libdl.dlsym(bc.lib_handle, :block_add_load)
-        return ccall(load_ptr, UInt32, (Ptr{Cvoid}, UInt32, Int32, UInt32),
-                     bc.fctx_handle, obj_id, Int32(offset), field_type_enum)
+        return _load_field_mem(bc, obj_id, offset, field_T, cranelift_type(field_T))
     end
 
-    # Case 4: regular mutable struct field — load from memory
+    # Case 4: regular mutable struct field — load from memory (memory width)
     offset = fieldoffset(T, field_sym)
-    field_type_enum = cranelift_type(field_T)
+    return _load_field_mem(bc, obj_id, offset, field_T, cranelift_type(field_T))
+end
+
+# Load a struct/tuple field at `obj_id + offset` using the field's MEMORY width
+# (sizeof), then uextend to the register repr (cranelift_type). Bool/UInt8/Int8
+# occupy an i32 REGISTER but are 1 byte in memory; a load.i32 at a 1-byte field
+# reads into adjacent fields — e.g. the `is_compound_assignment` Bool at offset 1
+# of `Tuple{Bool,Bool,SyntaxToken}` read the SyntaxToken pointer's low byte,
+# appeared `true`, and made `parse_assignment_with_initial_ex` never return
+# (infinite recursion → stack overflow). Mirrors the array memory-width fix in
+# emit_memoryrefget.
+function _load_field_mem(bc, obj_id, offset, field_T, field_type_enum)
+    mem_width = if field_type_enum == TYPE_PTR || field_type_enum == TYPE_F64 || field_type_enum == TYPE_F32
+        field_type_enum  # pointer/float: memory width == register repr
+    elseif field_T isa DataType && isbitstype(field_T)
+        sz = sizeof(field_T)
+        sz <= 1 ? TYPE_I8 : sz <= 2 ? TYPE_I16 : sz <= 4 ? TYPE_I32 : TYPE_I64
+    else
+        field_type_enum
+    end
     load_ptr = Libdl.dlsym(bc.lib_handle, :block_add_load)
-    return ccall(load_ptr, UInt32, (Ptr{Cvoid}, UInt32, Int32, UInt32),
-                 bc.fctx_handle, obj_id, Int32(offset), field_type_enum)
+    loaded = ccall(load_ptr, UInt32, (Ptr{Cvoid}, UInt32, Int32, UInt32),
+                   bc.fctx_handle, obj_id, Int32(offset), mem_width)
+    if mem_width != field_type_enum && field_type_enum != TYPE_PTR && mem_width != TYPE_PTR
+        ext_ptr = Libdl.dlsym(bc.lib_handle, :block_add_uextend)
+        return ccall(ext_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
+                     bc.fctx_handle, loaded, field_type_enum)
+    end
+    return loaded
 end
 
 function emit_struct_setfield(bc::BuilderCtx, args, ir)
@@ -2499,12 +2510,29 @@ function emit_struct_setfield(bc::BuilderCtx, args, ir)
         TYPE_PTR
     end
 
-    store_ptr = Libdl.dlsym(bc.lib_handle, :block_add_store)
-    ccall(store_ptr, Cvoid, (Ptr{Cvoid}, UInt32, Int32, UInt32, UInt32),
-          bc.fctx_handle, obj_id, Int32(offset), val_id, field_type_enum)
+    _store_field_mem(bc, obj_id, offset, val_id, field_T, field_type_enum)
 
     # setfield! returns the stored value
     return val_id
+end
+
+# Store a struct/tuple field at `obj_id + offset` using the field's MEMORY width
+# (sizeof) — the store-side mirror of `_load_field_mem`. Bool/UInt8/Int8 occupy an
+# i32 register but are 1 byte in memory; a store.i32 would overwrite adjacent
+# fields (e.g. a Bool at offset 1 clobbering the next field's low bytes). Stores
+# the low `sizeof(field)` bytes of val_id.
+function _store_field_mem(bc, obj_id, offset, val_id, field_T, field_type_enum)
+    mem_width = if field_type_enum == TYPE_PTR || field_type_enum == TYPE_F64 || field_type_enum == TYPE_F32
+        field_type_enum
+    elseif field_T isa DataType && isbitstype(field_T)
+        sz = sizeof(field_T)
+        sz <= 1 ? TYPE_I8 : sz <= 2 ? TYPE_I16 : sz <= 4 ? TYPE_I32 : TYPE_I64
+    else
+        field_type_enum
+    end
+    store_ptr = Libdl.dlsym(bc.lib_handle, :block_add_store)
+    ccall(store_ptr, Cvoid, (Ptr{Cvoid}, UInt32, Int32, UInt32, UInt32),
+          bc.fctx_handle, obj_id, Int32(offset), val_id, mem_width)
 end
 
 # === Pointer operations ===
@@ -2600,14 +2628,11 @@ function emit_pointerset(bc::BuilderCtx, args, ir)
     elem_addr_id = ccall(iadd_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
                           bc.fctx_handle, ptr_id, byte_off_id)
 
-    # Store val at elem_addr + 0. For large bitstypes (sizeof > 8, e.g.
-    # SyntaxToken=12), the value is a heap pointer stored in a TYPE_PTR-width
-    # element slot — store the pointer directly (8 bytes). The ref_tracking
-    # entry set by emit_new routes getfield to Case 1 (heap load).
+    # Store val at elem_addr + 0 using the element's MEMORY width (sizeof) —
+    # sub-word elements (Bool/UInt8) occupy an i32 register but 1 byte in memory;
+    # a store.i32 would clobber adjacent elements. Mirrors _store_field_mem.
     elem_type_enum = cranelift_type(elem_T)
-    store_ptr = Libdl.dlsym(bc.lib_handle, :block_add_store)
-    ccall(store_ptr, Cvoid, (Ptr{Cvoid}, UInt32, Int32, UInt32, UInt32),
-          bc.fctx_handle, elem_addr_id, Int32(0), val_id, elem_type_enum)
+    _store_field_mem(bc, elem_addr_id, 0, val_id, elem_T, elem_type_enum)
 
     # pointerset returns the pointer (first argument)
     return ptr_id
@@ -2754,8 +2779,8 @@ function emit_memoryrefget(bc::BuilderCtx, args, ir)
     # i32 reads 4 adjacent elements (e.g. ascii_is_identifier_char[98] → 0x01010101),
     # which breaks lex_identifier's break test and makes the lexer stop after one
     # identifier. Load sizeof(elem) bytes, then uextend to the register repr.
-    mem_width = if elem_type_enum == TYPE_PTR
-        TYPE_PTR  # heap-pointer element: pointer-width in memory too
+    mem_width = if elem_type_enum == TYPE_PTR || elem_type_enum == TYPE_F64 || elem_type_enum == TYPE_F32
+        elem_type_enum  # heap-pointer / float element: memory width == register repr
     elseif elem_T isa DataType && isbitstype(elem_T)
         sz = sizeof(elem_T)
         sz <= 1 ? TYPE_I8 : sz <= 2 ? TYPE_I16 : sz <= 4 ? TYPE_I32 : TYPE_I64
