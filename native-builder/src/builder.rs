@@ -431,6 +431,13 @@ impl FunctionCtx {
     }
     pub fn emit_return_void(&mut self) { let curr = self.current_block; self.emit_void(|fb| { fb.ins().return_(&[]); }); self.sealed.insert(curr); }
     pub fn emit_trap(&mut self) { let curr = self.current_block; self.emit_void(|fb| { fb.ins().trap(cranelift_codegen::ir::TrapCode::HEAP_OUT_OF_BOUNDS); }); self.sealed.insert(curr); }
+    /// Conditional trap: traps with HEAP_OUT_OF_BOUNDS if `v` is nonzero. Used for
+    /// bounds checks matching Wasm's array.get OOB-trap semantics. NOT a terminator
+    /// — execution continues to the next instruction if v==0.
+    pub fn emit_trapnz(&mut self, v: u32) {
+        let vv = self.ssa(v);
+        self.emit_void(|fb| { fb.ins().trapnz(vv, cranelift_codegen::ir::TrapCode::HEAP_OUT_OF_BOUNDS); });
+    }
 
     pub fn emit_call_import(&mut self, module: &mut ObjectModule, imports: &HashMap<String, FuncId>, name: &str, arg_ids: &[u32]) -> u32 {
         let func_id = *imports.get(name).unwrap_or_else(|| panic!("import not declared: {}", name));

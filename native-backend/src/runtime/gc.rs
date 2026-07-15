@@ -21,15 +21,23 @@ pub struct GCHeader {
 pub const HEADER_SIZE: usize = std::mem::size_of::<GCHeader>();
 pub const JULIA_HEADER_SIZE: usize = std::mem::size_of::<JuliaGCHeader>();
 
-// Global GC allocator
-#[global_allocator]
-pub static GC_ALLOC: Allocator = Allocator;
+// GC allocator instance (NOT the global allocator — only the __jl_gc_* API
+// routes through Boehm; the rest of the process uses the system allocator).
+static GC_ALLOC: Allocator = Allocator;
 
 #[no_mangle]
 pub unsafe extern "C" fn __jl_gc_alloc(type_tag: u32, data_size: u32) -> *mut u8 {
     let total = HEADER_SIZE + data_size as usize;
     let layout = Layout::from_size_align(total, 16).unwrap();
-    let ptr = GlobalAlloc::alloc(&GC_ALLOC, layout);
+    let mut ptr = GlobalAlloc::alloc(&GC_ALLOC, layout);
+    // Force a GC collection and retry once if allocation fails. The compilation
+    // phase consumes most of the Boehm heap; after compile, the heap may be
+    // close to exhausted. Returning NULL here causes a segfault-at-0 when the
+    // caller stores and later dereferences the null pointer.
+    if ptr.is_null() {
+        Allocator::force_collect();
+        ptr = GlobalAlloc::alloc(&GC_ALLOC, layout);
+    }
     if ptr.is_null() { return std::ptr::null_mut(); }
     let h = ptr as *mut GCHeader;
     (*h).type_tag = type_tag;
@@ -308,25 +316,39 @@ pub unsafe extern "C" fn __jl_array_grow_end(
     let new_bytes = (new_len as usize) * elem_size;
 
     let old_data = (*arr).elem_ptr;
-    // Allocate fresh buffer and copy — always works regardless of who
-    // originally allocated the old buffer (us or Julia's GC).
-    let layout = Layout::from_size_align(new_bytes.max(1), 16).unwrap();
-    let new_data = GlobalAlloc::alloc(&GC_ALLOC, layout);
-    if !new_data.is_null() {
+    // Allocate a FULL Memory object layout [type_ptr(8)][length(i64,8)][data...],
+    // exactly matching __jl_gc_alloc_array_julia, so that mem_obj (= data - 8)
+    // points at a VALID in-allocation length field. The prior code allocated
+    // ONLY the data bytes and then wrote the length at `data - 8` — an 8-byte
+    // heap UNDERFLOW that corrupted whatever object preceded the new buffer on
+    // every push!. With a push!-heavy parser this silently corrupted the heap
+    // and surfaced as the composition-only SIGSEGV in __lookahead_index.
+    let len_field_size = std::mem::size_of::<i64>();
+    let total = JULIA_HEADER_SIZE + len_field_size + new_bytes;
+    let layout = Layout::from_size_align(total, 16).unwrap();
+    let new_alloc = GlobalAlloc::alloc(&GC_ALLOC, layout);
+    if !new_alloc.is_null() {
+        // Preserve the Memory's type pointer (GC tracing / type-tag queries).
+        // It lives JULIA_HEADER_SIZE + len_field_size (= 16) bytes before the
+        // data pointer in both the original and prior-grow layouts.
+        if !old_data.is_null() {
+            let old_type_ptr = *(old_data.sub(JULIA_HEADER_SIZE + len_field_size) as *mut *mut u8);
+            *(new_alloc as *mut *mut u8) = old_type_ptr;
+        }
+        let new_data = new_alloc.add(JULIA_HEADER_SIZE + len_field_size);
         if old_bytes > 0 && !old_data.is_null() {
             std::ptr::copy_nonoverlapping(old_data, new_data, old_bytes);
         }
+        // Length field (i64) at alloc + JULIA_HEADER_SIZE (= new_data - 8): the
+        // location pointer_from_objref(Memory) points at; a valid in-allocation
+        // write (not an underflow).
+        *(new_alloc.add(JULIA_HEADER_SIZE) as *mut i64) = new_len;
         (*arr).elem_ptr = new_data;
-        (*arr).mem_obj = new_data.sub(8);  // mem_obj = elem_ptr - 8
+        (*arr).mem_obj = new_alloc.add(JULIA_HEADER_SIZE);  // = new_data - 8 (valid)
         (*arr).capacity = new_len as i64;
-    }
-    // If alloc failed, keep old data and length unchanged (arr stays valid)
-    if !(*arr).elem_ptr.is_null() {
         (*arr).length = new_len;
-        // Sync Memory object's internal length (i64 at mem_obj + 0).
-        // mem_obj = pointer_from_objref(Memory), length at fieldoffset 0.
-        *((*arr).mem_obj as *mut i64) = new_len as i64;
     }
+    // If alloc failed, keep old data/length unchanged (arr stays valid).
     a
 }
 

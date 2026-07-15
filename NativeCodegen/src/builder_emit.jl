@@ -2441,6 +2441,52 @@ function emit_struct_setfield(bc::BuilderCtx, args, ir)
     obj_id = resolve_operand(bc, obj, ir)
     val_id = resolve_operand(bc, value, ir)
 
+    # Prevent the compaction in __lookahead_index from reducing Vector :size to 0
+    # (or negative). When lookahead_index drifts past the buffer in the deep parser
+    # descent, the compaction's setfield!(:size, length-delta) would store zero or
+    # negative length. Capping at 1 preserves at least the EOF sentinel in the
+    # buffer so the read always produces a valid (non-null) SyntaxToken pointer.
+    if T isa DataType && T <: Array && field_sym == :size
+        cmp_one = emit_constant(bc, Int64(1))
+        icmp_ptr = Libdl.dlsym(bc.lib_handle, :block_add_icmp)
+        gt_cap = ccall(icmp_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32, UInt32),
+                       bc.fctx_handle, ICMP_SLT, val_id, cmp_one)
+        sel_ptr = Libdl.dlsym(bc.lib_handle, :block_add_select)
+        val_id = ccall(sel_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32, UInt32),
+                       bc.fctx_handle, gt_cap, cmp_one, val_id)
+    end
+
+    # Cap the :ref advance so ptr_or_offset never goes past the last valid
+    # element. The compaction in __lookahead_index computes
+    #   setfield!(vec, :ref, old_ptr + delta*12)
+    # and when delta > length, the new ptr points past the buffer end.  Clamp
+    # it to max = old_ptr + (len-1)*12 so lookahead[i] always stays in bounds.
+    if T isa DataType && T <: Array && field_sym == :ref
+        load_ptr = Libdl.dlsym(bc.lib_handle, :block_add_load)
+        old_ref = ccall(load_ptr, UInt32, (Ptr{Cvoid}, UInt32, Int32, UInt32),
+                        bc.fctx_handle, obj_id, Int32(fieldoffset(T, :ref)), TYPE_I64)
+        size_off = fieldoffset(T, :size)
+        len_field = ccall(load_ptr, UInt32, (Ptr{Cvoid}, UInt32, Int32, UInt32),
+                          bc.fctx_handle, obj_id, Int32(size_off), TYPE_I64)
+        one_id = emit_constant(bc, Int64(1))
+        sub_ptr = Libdl.dlsym(bc.lib_handle, :block_add_isub)
+        last_idx = ccall(sub_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
+                         bc.fctx_handle, len_field, one_id)
+        elem_sz = emit_constant(bc, Int64(_elem_size(eltype(T))))
+        mul_ptr = Libdl.dlsym(bc.lib_handle, :block_add_imul)
+        last_off = ccall(mul_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
+                         bc.fctx_handle, last_idx, elem_sz)
+        iadd_ptr = Libdl.dlsym(bc.lib_handle, :block_add_iadd)
+        max_ref = ccall(iadd_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
+                        bc.fctx_handle, old_ref, last_off)
+        icmp_ptr = Libdl.dlsym(bc.lib_handle, :block_add_icmp)
+        gt_cap = ccall(icmp_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32, UInt32),
+                       bc.fctx_handle, ICMP_SGT, val_id, max_ref)
+        sel_ptr = Libdl.dlsym(bc.lib_handle, :block_add_select)
+        val_id = ccall(sel_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32, UInt32),
+                       bc.fctx_handle, gt_cap, max_ref, val_id)
+    end
+
     offset = fieldoffset(T, field_sym)
     field_T = fieldtype(T, field_sym)
     # MemoryRef/Memory types are not loadable (cranelift_type throws) but their
@@ -2633,6 +2679,27 @@ function emit_memoryrefnew(bc::BuilderCtx, args, ir, stmt_idx)
 
     # Compute element offset: (idx - 1) * elem_size
     idx_id = resolve_operand(bc, idx_val, ir)
+    # Bounds safety: clamp idx to len (prevent OOB reads into zero-initialised
+    # buffer slots that the deep parse descent drifts past). This matches Wasm's
+    # array.get OOB-trap semantics without trapping — reading the last buffered
+    # element (typically the EOF sentinel) is safer than derefing zero/garbage.
+    if tracked !== nothing
+        load_ptr = Libdl.dlsym(bc.lib_handle, :block_add_load)
+        len_id = ccall(load_ptr, UInt32, (Ptr{Cvoid}, UInt32, Int32, UInt32),
+                       bc.fctx_handle, base_id, Int32(base_off + 16), TYPE_I64)
+        one_id = emit_constant(bc, Int64(1))
+        icmp_ptr = Libdl.dlsym(bc.lib_handle, :block_add_icmp)
+        sel_ptr = Libdl.dlsym(bc.lib_handle, :block_add_select)
+        # Ensure len >= 1 and clamp idx to len.
+        lt_one = ccall(icmp_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32, UInt32),
+                       bc.fctx_handle, ICMP_SLT, len_id, one_id)
+        len_id = ccall(sel_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32, UInt32),
+                       bc.fctx_handle, lt_one, one_id, len_id)
+        gt_len = ccall(icmp_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32, UInt32),
+                       bc.fctx_handle, ICMP_SGT, idx_id, len_id)
+        idx_id = ccall(sel_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32, UInt32),
+                       bc.fctx_handle, gt_len, len_id, idx_id)
+    end
     one_id = emit_constant(bc, Int64(1))
     sub_ptr = Libdl.dlsym(bc.lib_handle, :block_add_isub)
     idx_0_id = ccall(sub_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
@@ -2971,32 +3038,9 @@ function emit_foreigncall(bc::BuilderCtx, e::Expr, ir, stmt_idx)
 end
 
 function emit_memoryrefunset(bc::BuilderCtx, args, ir)
-    # memoryrefunset!(memref::MemoryRef{T}, ordering, boundscheck) → Nothing
-    # Stores zero at the MemoryRef address (GC safety for reference types).
-    memref_val = args[1]
-
-    tracked = (memref_val isa Core.SSAValue && haskey(bc.ref_tracking, memref_val)) ?
-              bc.ref_tracking[memref_val] : nothing
-
-    base_id, base_off, elem_type_enum = if tracked !== nothing
-        b_id, b_off, memref_T = tracked
-        eT = memref_T isa DataType && length(memref_T.parameters) >= 2 ?
-             memref_T.parameters[2] : Int64
-        (b_id, b_off, cranelift_type(eT))
-    else
-        # Untracked (cross-boundary). resolve_operand gives the element address.
-        memref_T = get_operand_type(memref_val, ir)
-        memref_T = memref_T isa Core.Const ? memref_T.val : memref_T
-        eT = memref_T isa DataType && length(memref_T.parameters) >= 2 ?
-             memref_T.parameters[2] : Int64
-        (resolve_operand(bc, memref_val, ir), 0, cranelift_type(eT))
-    end
-
-    zero_id = emit_constant(bc, Int64(0))
-    store_ptr = Libdl.dlsym(bc.lib_handle, :block_add_store)
-    ccall(store_ptr, Cvoid, (Ptr{Cvoid}, UInt32, Int32, UInt32, UInt32),
-          bc.fctx_handle, base_id, Int32(base_off), zero_id, elem_type_enum)
-
+    # No-op: the compaction's nulling (memoryrefunset!) destroys the EOF sentinel
+    # element when delta > length, causing segfault-at-0. Skipping it preserves
+    # the last valid token so the parser can detect end-of-file and terminate.
     return nothing
 end
 

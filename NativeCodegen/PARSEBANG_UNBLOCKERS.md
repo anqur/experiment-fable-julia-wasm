@@ -126,20 +126,90 @@ the `mc !== nothing` recursive path). After removal the real bugs became visible
 
 ## The remaining end-to-end blocker
 
-Full `parse!("1")` / `parse_eq("1")` SIGSEGVs at runtime in `__lookahead_index`
-— a single bad deref of `lookahead[i]` (a `SyntaxToken` pointer). The ~75M
-"allocations" in the crash report are parse_eq's ~4.7 GB / 21 s COMPILATION
-(verified via `@timed`); the runtime fault is one deref, not a loop. The
-identical `__lookahead_index`/peek path passes in the drain loop and in
-isolation, so it is a **composition-only** state corruption — some operation in
-the `parse_toplevel`→`parse_stmts`→`parse_Nary`→… descent writes a bad pointer
-into `stream.lookahead` (or leaves a stale tracked element address in
-`ref_tracking` after the lookahead vector's `_deletebeg!`/`_growend_internal!`
-reallocation) that only the composed descent triggers.
+**Update 2026-07-15 (this session):** THREE bugs were found on the grow/shift
+path; the live one is **Bug C (`_deletebeg!`)**, NOT the ref_tracking staleness.
 
-**Next step:** differential-test `stream.lookahead`'s data pointer and length at
-each peek across the descent vs the isolated drain, to find the first divergence
-— i.e. where the composed run corrupts state that the isolated run doesn't.
+**Bug B (FIXED — `native-backend/src/runtime/gc.rs` `__jl_array_grow_end`).** The
+grow handler allocated only `new_bytes` (the data) but then wrote the length at
+`new_data - 8` (gc.rs:320/328) — an unconditional **8-byte heap underflow** on
+every `push!`. This corrupted the Boehm heap, which in turn corrupted the
+Cranelift `ObjectModule`/`FunctionBuilder` state during compilation and produced
+**spurious verifier failures** (`parse_chain`/`parse_generator`/
+`parse_decl_with_initial_ex` → "invalid reference to entry block block0" → trap
+stub → SIGILL). Fix: allocate the full `[type_ptr(8)][length(8)][data…]` Memory
+layout (mirroring `__jl_gc_alloc_array_julia`), copying the type ptr from
+`old_data - 16`, so `mem_obj = new_data - 8` is a valid in-allocation field.
+**After this fix the SIGILL and those 3 spurious trap stubs are GONE**; only the
+3 known non-live-path stubs (typejoin/parse_resword/first_child_position)
+remain, and the crash becomes a clean SIGSEGV in `__lookahead_index`. (An 8-agent
+workflow unanimously concluded the runtime was "100% correct" and missed this —
+its runtime lens only checked `elem_ptr` re-publishing, not the `mem_obj` write.)
+
+**Bug A (mitigated — `builder_emit.jl` memref re-derivation).** `emit_memoryrefnew`
+cached a *concrete* element address in `ref_tracking` (line ~2656) that
+`memoryrefget`/`set`/`unset` consumed without re-deriving; after a
+`push!`/`_growend_internal!` the runtime always moves the data pointer, so a
+cached address is stale. Fix: added `BuilderCtx.memref_recipes`; `memoryrefnew`
+records `(stable_base_id, data_field_off, byte_off_id, elem_T)` for tracked
+bases; `memoryrefget`/`set`/`unset` **reload the data pointer fresh** each use.
+This is a correct robustness improvement (eDSL suite still 91 ✅) but did **not**
+move the SIGSEGV — so it was not the live trigger.
+
+**Bug C (THE live blocker — `_deletebeg!` front-deletion, UNHANDLED).**
+`__lookahead_index`'s own IR compacts the lookahead buffer:
+`if (lookahead_index-1) > 0.9*length(lookahead); _deletebeg!(lookahead, n); end`
+(stmt 13-19 of `JuliaSyntax.__lookahead_index`). `_deletebeg!` has **no handler**
+in `builder_emit.jl` and **no runtime `__jl_array_delete_beg`** (grep confirms;
+only `_growend_internal!`/`resize!`/`unsafe_copyto!` are handled). So the
+front-shift is either sentinel'd (no-op) or mis-compiled, corrupting
+`stream.lookahead` (wrong element stride / un-updated length / dangling tail) →
+the `lookahead[i]` deref in `__lookahead_index` reads a garbage `SyntaxToken`
+pointer → SIGSEGV (SEGV_MAPERR). This is why the *composed* descent (which
+compacts) crashes but the isolated peek drain (which never compacts) does not.
+
+**Next step:** implement `_deletebeg!` correctly — either (a) a `builder_emit.jl`
+handler that lowers `Base._deletebeg!(a, n)` to a new runtime
+`__jl_array_delete_beg(a, n, elem_size)` in `gc.rs` (memmove the surviving
+`len-n` elements to the front, zero the freed tail for GC safety, set length;
+the data pointer does NOT move on a front-shift, but length/contents change), or
+(b) ensure the overlay (`WasmCodegen/src/interp.jl` `WASM_MT`) supplies a correct
+loop-based `_deletebeg!`. Then re-run `debug_parse_bang.jl` (host=7 for
+`"1 + 2"`).
+
+**Update 3 (compaction is NOT the bug — a 5-agent workflow was wrong).** A
+targeted workflow (3 investigators + verifier + designer) unanimously concluded
+the compaction "corrupts the MemoryRef / double-offsets" and proposed rejecting
+`setfield!(:ref, memoryrefnew(...))`. **That verdict is WRONG**, disproven by the
+workflow's own Probe 2, run for real: replicate the exact inlined compaction on a
+`Vector{SyntaxToken}` (null front δ, `setfield!(:size, len-δ)`,
+`setfield!(:ref, memoryrefnew(ref, δ+1))`, read `[1]`) → **host = 3, native = 3**
+(MATCH). Direct Cranelift-IR reading confirms it: after compaction
+`lookahead[i] = load(old_ptr_or_offset + δ*12 + (i-1)*12) = element (δ+i)`, which
+is *exactly intended*. So the inlined compaction + MemoryRef-:ref advance are
+CORRECT. (The F2 memref re-derivation and the `_deletebeg!` handler/runtime added
+above are correct but unused on this path; keep them, they are regression-safe.)
+
+**THE ACTUAL remaining bug (2026-07-15): a parser infinite-loop.** The crash stack
+shows `parse_assignment_with_initial_ex` **self-recursing 27 times** for
+`"1 + 2"` (it self-calls at overlay-IR stmt 233, after `parse_pair` at stmt 232;
+guard is an upstream `=`-token check in this ~500-stmt function). A simple
+`1 + 2` has no `=`, so it must NOT recurse 27×. The SIGSEGV (SEGV_MAPERR) is at
+the leaf `__lookahead_index` read deep in the recursion — most likely stack
+overflow at the guard page (or an out-of-bounds `lookahead_index` read with
+boundscheck off). Next step: differential-test the parser step-by-step (peek/bump
+a few tokens, compare `lookahead_index`/`lookahead` length/kind native vs host) to
+find the first divergence — i.e. where the native parser mis-detects an
+assignment operator or fails to consume a token, causing the self-recursion. The
+compaction and MemoryRef lowering are ruled out.
+
+---
+
+(Prior text, kept for context.) Full `parse!("1")` / `parse_eq("1")` SIGSEGVs at
+runtime in `__lookahead_index` — a single bad deref of `lookahead[i]` (a
+`SyntaxToken` pointer). The ~75M "allocations" in the crash report are parse_eq's
+~4.7 GB / 21 s COMPILATION (verified via `@timed`); the runtime fault is one
+deref, not a loop. The identical `__lookahead_index`/peek path passes in the
+drain loop and in isolation, so it is a **composition-only** state corruption.
 
 ## Other known gaps (not on the live `"1+2"` path, but worth fixing)
 

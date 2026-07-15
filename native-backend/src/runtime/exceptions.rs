@@ -19,8 +19,8 @@ extern "C" {
 /// Maximum depth of nested try/catch frames
 const MAX_CATCH_DEPTH: usize = 16;
 
-/// Thread-local catch frame stack
 thread_local! {
+    /// Thread-local catch frame stack
     static CATCH_STACK: RefCell<Vec<*mut JmpBuf>> = RefCell::new(Vec::with_capacity(MAX_CATCH_DEPTH));
 }
 

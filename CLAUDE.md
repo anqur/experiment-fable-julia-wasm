@@ -221,26 +221,98 @@ legacy `GCHeader` layout and are never returned to Julia.
   multi-argument formatting, `String(Vector{UInt8})`, mutation, and UTF-8
   character indexing. String reads, literals, and concatenation have dedicated
   lowering paths.
-- **Recursive pipeline status (2026-07-15):** `parse!`/`parse_stmts` COMPILE
-  ~160 callees through the recursive pipeline (the `parse_stmts`/`_bump_until_n`
-  stubs that used to short-circuit the descent have been removed — they were an
-  architecture violation). At runtime the **lexer is now correct** (`next_token`,
-  `peek`, `peek_token`, and the peek/bump drain loop all match the host for
-  whitespace inputs like `"a a"`, `"1 + 2"`), and every isolated parser function
-  (`parse_atom`, `parse_unary`, `parse_factor`, `parse_call`, `parse_power`,
-  `peek_behind`) runs correctly native. The full **composed** `parse!("1")` /
-  `parse_stmts("1")` still SIGSEGVs at runtime in `__lookahead_index` — a single
-  bad deref of `lookahead[i]` (a `SyntaxToken` pointer). The ~75M "allocations"
-  in that crash report are the descent's ~4.7 GB *compilation* (the runtime
-  fault is one deref, not a loop); the identical `__lookahead_index`/peek path
-  passes in the drain loop and in isolation, so it is a composition-only state
-  corruption — most likely a stale tracked element address in `ref_tracking`
-  after the lookahead vector's `_deletebeg!`/`_growend_internal!` reallocation,
-  which the isolated drain never triggers. Keep the `parse_into` runtime test in
-  `test_final.jl` commented with its `# TODO:` until this executes end-to-end.
-  Eleven codegen fixes got the pipeline here (all regression-safe: eDSL 91 ✅,
-  test_final Tier 1-2 ✅); see `NativeCodegen/PARSEBANG_UNBLOCKERS.md` for the
-  full list and the exact next diagnostic step.
+- **Recursive pipeline status (2026-07-15, updated):** `parse!`/`parse_stmts`
+  COMPILE ~160 callees. The full composed `parse!("1")` / `parse!("1 + 2")` still
+  SIGSEGVs at runtime in `__lookahead_index` (a bad deref of `lookahead[i]`, a
+  `SyntaxToken` pointer), reached via a deep precedence chain
+  (`parse_call_chain`/`parse_LtoR`/`parse_with_chains`/…; `parse_assignment_with_initial_ex`
+  recurses but it is a deep descent, not a confirmed infinite loop). The ~75M
+  "allocations" in the crash report are the descent's ~4.7 GB *compilation*
+  (the runtime fault is one deref).
+  - **FIXED this session — `__jl_array_grow_end` heap underflow (gc.rs):** it
+    allocated only the data bytes then wrote the length at `new_data - 8`, an
+    8-byte underflow on every `push!`. This corrupted the Boehm heap, which in
+    turn corrupted the Cranelift module state and produced *spurious* verifier
+    failures (`parse_chain`/`parse_generator`/`parse_decl_with_initial_ex` →
+    "invalid reference to entry block block0" → trap stub → SIGILL). The fix
+    allocates the full `[type_ptr(8)][length(8)][data…]` Memory layout (mirroring
+    `__jl_gc_alloc_array_julia`) so `mem_obj = new_data - 8` is a valid
+    in-allocation field; this removes the SIGILL and those 3 phantom trap stubs.
+    (Only the 3 known non-live-path stubs remain: `typejoin`, `parse_resword`,
+    `first_child_position`.)
+  - **DISPROVEN — the compaction/"stale ref_tracking" theory:** the prior note's
+    leading hypothesis (stale tracked element address after `_deletebeg!`/
+    `_growend_internal!`) is NOT the live trigger. Replicating `__lookahead_index`'s
+    *inlined* compaction on a `Vector{SyntaxToken}` (null front δ, `setfield!(:ref,
+    memoryrefnew(ref,δ+1))`, `setfield!(:size,len-δ)`, read `[1]`) gives
+    **host=native=3** (correct). Direct Cranelift-IR reading confirms
+    `lookahead[i] = element(δ+i)` as intended. So MemoryRef lowering + the
+    `:ref` advance are correct.
+  - **Confirmed working natively:** `peek(stream,1)` on a native-constructed
+    stream (native=48=host); `push!`+read of `Vector{SyntaxToken}` (host=native);
+    `codeunit`/`length`/`ncodeunits` on `String`.
+  - **ABI hazard (NOT the parse! bug):** passing a *host*-constructed
+    `ParseStream`/`Vector{SyntaxToken}` into native crashes — the host stores
+    `SyntaxToken` (isbitstype, sizeof 12) **inline**, but native assumes
+    heap-allocated **pointers** (`cranelift_type(SyntaxToken)=TYPE_PTR`,
+    sizeof>8 → heap via emit_new). The real `parse!` constructs its stream
+    *inside* native (native layout), so this only bites the callable bridge
+    (`native_callable_from_so` with a `ParseStream` arg). Differential probes
+    must construct streams inside the compiled fn.
+  - **FIXED this session — `__jsonarray_lookahead_index` OOB read (builder.rs /
+    builder_emit.jl).** The native codegen **never emitted bounds checks** for
+    `memoryrefnew` (the `boundscheck` flag was documented but ignored — no code
+    consumed `args[3]` in any `emit_memoryref*`). In contrast, **Wasm always
+    OOB-traps on `array.get`** (modeled after `WasmCodegen/src/compiler.jl`
+    line 1307). The parse's `__lookahead_index` advanced its index past the
+    buffered tokens and, with `boundscheck=false`, read garbage → SIGSEGV.
+    Fix: added a `trapnz` builder operation (`native-builder/src/builder.rs`
+    `emit_trapnz` + `lib.rs` `block_add_trap_if`) and an unconditional bounds
+    check in `emit_memoryrefnew` (tracked-base path): load `Vector+16` (the
+    `:size` length), `icmp idx > len`, `trapnz` if true — matching Wasm's
+    safety semantics. **After this fix the crash changes from SIGSEGV
+    (garbage deref) → SIGILL (`ud2` trap, the Cranelift trap instruction)**;
+    the parse still fails (the index IS going OOB), but fails safely.
+    Regression-safe (eDSL 91 ✅).
+  - **Bug B (`__jl_array_grow_end` heap underflow) also FIXED this session**
+    (see above). Together Bug B + the bounds check account for all the
+    fixes deliverable so far.
+  - **Current remaining unknown:** WHY `lookahead_index` goes OOB in the
+    composed descent (the bounds check fires cleanly in `__lookahead_index`,
+    reached through `parse_assignment_with_initial_ex` deep recursion).
+    The recursion guard (`%2 = getfield(peek_dotted_op_token(...), 1)` =
+    `is_dotted` Bool) is correct in isolation (Probe `pdot_bool`: host=native=0),
+    so the guard works; the index drift happens further downstream (multiple
+    self-calls / parse cycle). Next step: differential-test the parser
+    step-by-step on native-constructed streams (capture `lookahead_index`,
+    `length(lookahead)`, and the peeked token kind at each step) to find
+    the first state divergence where the index outpaces the buffer.
+  - **CONFIRMED this session — EOF is NOT the cause.** The buffering loop in
+    `_buffer_lookahead_tokens` (read from Cranelift IR at
+    `/tmp/cranelift_dumps/__compiled_fn_45__buffer_lookahead_tokens.cranelift`,
+    257 lines) correctly calls `next_token(lexer, 1)` in a loop, pushes each
+    token via `push!` (grow+store), and exits when `kind == 161` (K"EndMarker").
+    Native `peek(s,6)` (= the EOF sentinel at source end) returns **161**,
+    matching host — so `next_token` correctly produces the EOF marker even
+    after multiple real tokens. The OOB is therefore NOT from the lexer
+    failing to return EOF or the buffering failing to push it. See
+    `NativeCodegen/PARSEBANG_UNBLOCKERS.md` for the full history.
+  - **CRITICAL NARROWING (clamp experiment):** The bounds-check `trapnz` was
+    changed to a `select`-based **clamp** (`idx = min(idx, length)`) to prevent
+    the OOB trap and let the parser run past the OOB. Result: the crash changed
+    from **SIGILL (trap) → SIGSEGV (bad deref)**. This means the OOB index WAS
+    hitting an unmapped address before; now the clamped index reads a valid
+    buffer slot, but the **content of that slot is a garbage/null SyntaxToken
+    pointer**, and dereferencing it causes the SIGSEGV. The garbage element is
+    at the slot that SHOULD hold the EOF sentinel (kind 161). The root cause is
+    therefore: why is the `SyntaxToken` pointer in the lookahead buffer slot
+    garbage (null or corrupt)? Candidates: (a) the `push!` in the buffering
+    loop stores a null pointer (Bohem GC `__jl_gc_alloc` returns null under
+    memory pressure, or the store is miscompiled); (b) the compaction's
+    `memoryrefunset!` nulls the slot erroneously (off-by-one, or the compaction
+    and the buffering disagree on the slot index after `:ref` advance); (c) the
+    `_buffer_lookahead_tokens` Cranelift IR stores at a wrong offset (the
+    store-to-element instruction is at the wrong byte offset).
 - **Sub-word array element load width:** `cranelift_type(Bool)` returns `TYPE_I32`
   (Bool occupies an i32 register per the shared `scalar_repr` convention), but in
   a `Vector{Bool}` each element is 1 byte in memory. `emit_memoryrefget` must load
