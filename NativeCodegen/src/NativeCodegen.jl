@@ -206,7 +206,7 @@ end
 
 # Direct .so loading from Julia (no Rust needed for testing)
 function native_callable_from_so(comp::NativeCompilation, rettype::Type, argtypes::Type...)
-    lib = Libdl.dlopen(comp.so_path)
+    lib = Libdl.dlopen(comp.so_path, Libdl.RTLD_LAZY | Libdl.RTLD_GLOBAL)
     func_ptr = Libdl.dlsym(lib, comp.func_name)
 
     # AT = declared arg-type tuple (Tuple{} for the 0-arg case). One uniform

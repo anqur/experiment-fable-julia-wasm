@@ -197,6 +197,7 @@ ffi_unop!(block_add_bswap, emit_bswap);
 #[no_mangle] pub extern "C" fn block_add_return_void(fctx: *mut FunctionCtx) { if !fctx.is_null() { unsafe { (*fctx).emit_return_void() } } }
 #[no_mangle] pub extern "C" fn block_add_trap(fctx: *mut FunctionCtx) { if !fctx.is_null() && !unsafe { (*fctx).is_block_sealed() } { unsafe { (*fctx).emit_trap() } } }
 #[no_mangle] pub extern "C" fn block_add_trap_if(fctx: *mut FunctionCtx, v: u32) { if !fctx.is_null() && !unsafe { (*fctx).is_block_sealed() } { unsafe { (*fctx).emit_trapnz(v) } } }
+#[no_mangle] pub extern "C" fn block_add_fence(fctx: *mut FunctionCtx) { if !fctx.is_null() { unsafe { (*fctx).emit_fence() } } }
 
 #[no_mangle] pub extern "C" fn block_add_jump(fctx: *mut FunctionCtx, tgt: *const c_char) { if !fctx.is_null() && !tgt.is_null() { unsafe { (*fctx).emit_jump(CStr::from_ptr(tgt).to_str().unwrap_or("")) } } }
 #[no_mangle] pub extern "C" fn block_add_jump_args(fctx: *mut FunctionCtx, tgt: *const c_char, args: *const u32, nargs: usize) { if !fctx.is_null() && !tgt.is_null() { unsafe { (*fctx).emit_jump_with_args(CStr::from_ptr(tgt).to_str().unwrap_or(""), std::slice::from_raw_parts(args, nargs)) } } }

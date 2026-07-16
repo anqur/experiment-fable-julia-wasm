@@ -1,16 +1,93 @@
-// GC allocator — Boehm GC with Julia-compatible object layout.
+// GC allocator — one-shot bump arena for Julia-compatible objects.
 //
-// TEMPORARY DIAGNOSTIC: the `__jl_gc_*` allocators currently use the SYSTEM
-// allocator (plain malloc) instead of Boehm GC, so every Julia object allocated
-// by the compiled .so LEAKS and is never reclaimed. This isolates whether the
-// `parse!` runtime crash (a bad `lookahead[i]` SyntaxToken-pointer deref) is a
-// GC reclamation / rooting bug — Boehm missing a root and collecting an object
-// whose raw pointer the native code still holds — versus a genuine codegen store
-// miscompilation. If the crash disappears with leaking, it is a GC-rooting bug;
-// if it persists, the store itself is wrong. Revert to `bdwgc_alloc::Allocator`
-// (and restore `Allocator::force_collect()`) once diagnosed.
+// All `__jl_gc_*` allocations land in a thread-local bump arena that never
+// frees individual objects.  A single `__jl_gc_reset()` call frees every block
+// at once, reclaiming all memory allocated since the last reset.  The rest of
+// the Rust backend (Cranelift, std containers) uses the normal system allocator
+// — only the `__jl_gc_*` / `__jl_array_new_1d` / `__jl_array_grow_end` /
+// `rust_alloc_string` family goes through the arena.
+//
+// This keeps the design simple: no GC, no ref-counting, no per-object free
+// bookkeeping — just a leaky arena that can be torn down between test suites.
 
-use std::alloc::{GlobalAlloc, Layout, System};
+use std::alloc::Layout;
+use std::cell::RefCell;
+
+// ----------------------------------------------------------------
+// Bump arena (thread-local, never frees individual allocs)
+// ----------------------------------------------------------------
+
+const DEFAULT_BLOCK_SIZE: usize = 65536; // 64 KB
+
+struct Arena {
+    blocks: Vec<(*mut u8, usize)>, // (block_base, block_capacity)
+    current: *mut u8,
+    remaining: usize,
+    allocated: usize,              // total bytes bump'd since last reset
+}
+
+impl Arena {
+    fn new() -> Self {
+        Arena { blocks: Vec::new(), current: std::ptr::null_mut(), remaining: 0, allocated: 0 }
+    }
+
+    /// Allocate `size` bytes aligned to `align` inside the arena.  Falls back
+    /// to a fresh system-allocated block when the current block is exhausted.
+    fn bump(&mut self, size: usize, align: usize) -> *mut u8 {
+        let offset = (self.current as usize) & (align - 1);
+        let padding = if offset == 0 { 0 } else { align - offset };
+        let needed = size.checked_add(padding).unwrap_or(usize::MAX);
+
+        if needed <= self.remaining {
+            let ptr = unsafe { self.current.add(padding) };
+            self.current = unsafe { ptr.add(size) };
+            self.remaining -= needed;
+            self.allocated += size;
+            ptr
+        } else {
+            // Current block exhausted — allocate a fresh one.
+            let block_size = core::cmp::max(DEFAULT_BLOCK_SIZE, size);
+            let layout = Layout::from_size_align(block_size, align).unwrap();
+            let block = unsafe { std::alloc::alloc(layout) };
+            if block.is_null() { unreachable!("oom"); }
+            self.blocks.push((block, block_size));
+            self.current = block;
+            self.remaining = block_size;
+            // Retry once with the fresh block (guaranteed to fit for size≤block_size).
+            self.bump(size, align)
+        }
+    }
+
+    fn reset(&mut self) {
+        for &(block, cap) in &self.blocks {
+            let layout = Layout::from_size_align(cap, 16).unwrap();
+            unsafe { std::alloc::dealloc(block, layout); }
+        }
+        self.blocks.clear();
+        self.current = std::ptr::null_mut();
+        self.remaining = 0;
+        self.allocated = 0;
+    }
+}
+
+thread_local! {
+    static ARENA: RefCell<Arena> = RefCell::new(Arena::new());
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn __jl_gc_reset() {
+    ARENA.with(|a| a.borrow_mut().reset());
+}
+/// Return total bytes allocated through the bump arena since the last reset.
+#[no_mangle]
+pub unsafe extern "C" fn __jl_gc_usage() -> i64 {
+    ARENA.with(|a| a.borrow().allocated as i64)
+}
+
+/// Raw bump-alloc: returns `size` bytes with `align`-byte alignment.
+fn bump_alloc(size: usize, align: usize) -> *mut u8 {
+    ARENA.with(|a| a.borrow_mut().bump(size, align))
+}
 
 // Julia-compatible object header: starts with type pointer (jl_datatype_t*)
 // Julia's jl_value_t structure: type pointer followed by data
@@ -30,20 +107,10 @@ pub struct GCHeader {
 pub const HEADER_SIZE: usize = std::mem::size_of::<GCHeader>();
 pub const JULIA_HEADER_SIZE: usize = std::mem::size_of::<JuliaGCHeader>();
 
-// TEMPORARY: system allocator (leak) instead of Boehm GC. Only the __jl_gc_*
-// API routes through here; the rest of the process already uses the system
-// allocator (bdwgc was never the #[global_allocator]).
-static GC_ALLOC: System = System;
-
 #[no_mangle]
 pub unsafe extern "C" fn __jl_gc_alloc(type_tag: u32, data_size: u32) -> *mut u8 {
     let total = HEADER_SIZE + data_size as usize;
-    let layout = Layout::from_size_align(total, 16).unwrap();
-    let ptr = GlobalAlloc::alloc(&GC_ALLOC, layout);
-    // (Boehm's force_collect-and-retry-on-null is removed while leaking: malloc
-    // does not reclaim, so collecting would not help. malloc essentially never
-    // returns null here; keep the null guard for safety.)
-    if ptr.is_null() { return std::ptr::null_mut(); }
+    let ptr = bump_alloc(total, 16);
     let h = ptr as *mut GCHeader;
     (*h).type_tag = type_tag;
     (*h).flags = 0;
@@ -57,9 +124,8 @@ pub unsafe extern "C" fn __jl_gc_alloc_array(
 ) -> *mut u8 {
     let data_size = (length as usize) * (elem_size as usize);
     let total = HEADER_SIZE + data_size;
-    let layout = Layout::from_size_align(total, 16).unwrap();
-    let ptr = GlobalAlloc::alloc(&GC_ALLOC, layout);
-    if ptr.is_null() { return std::ptr::null_mut(); }
+    let ptr = bump_alloc(total, 16);
+    if ptr.is_null() { unreachable!("oom"); }
     let h = ptr as *mut GCHeader;
     (*h).type_tag = type_tag;
     (*h).flags = 0;
@@ -143,9 +209,8 @@ pub unsafe extern "C" fn __jl_gc_alloc_julia(
     data_size: u32,
 ) -> *mut u8 {
     let total = JULIA_HEADER_SIZE + data_size as usize;
-    let layout = Layout::from_size_align(total, 16).unwrap();
-    let ptr = GlobalAlloc::alloc(&GC_ALLOC, layout);
-    if ptr.is_null() { return std::ptr::null_mut(); }
+    let ptr = bump_alloc(total, 16);
+    if ptr.is_null() { unreachable!("oom"); }
 
     // Set Julia type pointer at start (Julia expects this)
     let h = ptr as *mut JuliaGCHeader;
@@ -170,9 +235,8 @@ pub unsafe extern "C" fn __jl_gc_alloc_array_julia(
     // Always include the 8-byte length field in the allocation, even for length==0.
     let len_field_size = std::mem::size_of::<i64>();
     let total = JULIA_HEADER_SIZE + len_field_size + data_size;
-    let layout = Layout::from_size_align(total, 16).unwrap();
-    let ptr = GlobalAlloc::alloc(&GC_ALLOC, layout);
-    if ptr.is_null() { return std::ptr::null_mut(); }
+    let ptr = bump_alloc(total, 16);
+    if ptr.is_null() { unreachable!("oom"); }
 
     // Set Julia type pointer at start
     let h = ptr as *mut JuliaGCHeader;
@@ -247,11 +311,8 @@ pub const ARRAY_REPR_SIZE: usize = std::mem::size_of::<JuliaArrayRepr>();
 /// constant by the compiled code — the runtime does not call into libjulia.
 pub unsafe fn rust_alloc_string(n: usize, type_ptr: *mut u8) -> *mut u8 {
     let total = JULIA_HEADER_SIZE + 8 + n + 1; // header + i64 length + data + nul
-    let layout = Layout::from_size_align(total, 16).unwrap();
-    let alloc = GlobalAlloc::alloc(&GC_ALLOC, layout);
-    if alloc.is_null() {
-        return std::ptr::null_mut();
-    }
+    let alloc = bump_alloc(total, 16);
+    if alloc.is_null() { unreachable!("oom"); }
     // Type tag at alloc+0
     *(alloc as *mut *mut u8) = type_ptr;
     // i64 length at alloc+8 (data pointer points here)
@@ -278,11 +339,8 @@ pub unsafe extern "C" fn __jl_array_new_1d(
     let nel = nel.max(0);
 
     let struct_total = JULIA_HEADER_SIZE + ARRAY_REPR_SIZE;
-    let struct_layout = Layout::from_size_align(struct_total, 16).unwrap();
-    let alloc = GlobalAlloc::alloc(&GC_ALLOC, struct_layout);
-    if alloc.is_null() {
-        return std::ptr::null_mut();
-    }
+    let alloc = bump_alloc(struct_total, 16);
+    if alloc.is_null() { unreachable!("oom"); }
 
     *(alloc as *mut *mut u8) = atype;
 
@@ -330,9 +388,8 @@ pub unsafe extern "C" fn __jl_array_grow_end(
     // and surfaced as the composition-only SIGSEGV in __lookahead_index.
     let len_field_size = std::mem::size_of::<i64>();
     let total = JULIA_HEADER_SIZE + len_field_size + new_bytes;
-    let layout = Layout::from_size_align(total, 16).unwrap();
-    let new_alloc = GlobalAlloc::alloc(&GC_ALLOC, layout);
-    if !new_alloc.is_null() {
+    let new_alloc = bump_alloc(total, 16);
+    {
         // Preserve the Memory's type pointer (GC tracing / type-tag queries).
         // It lives JULIA_HEADER_SIZE + len_field_size (= 16) bytes before the
         // data pointer in both the original and prior-grow layouts.
@@ -353,7 +410,6 @@ pub unsafe extern "C" fn __jl_array_grow_end(
         (*arr).capacity = new_len as i64;
         (*arr).length = new_len;
     }
-    // If alloc failed, keep old data/length unchanged (arr stays valid).
     a
 }
 

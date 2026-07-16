@@ -1591,7 +1591,16 @@ function emit_invoke(bc::BuilderCtx, invoke_target, f, args, ir, stmt_idx)
     end
     if bc.current_mi !== nothing && callee_mi == bc.current_mi
         # Self-recursive call — resolve args and emit call to self-import
-        return emit_call_import(bc, bc.current_func_name, args, ir)
+        result_id = emit_call_import(bc, bc.current_func_name, args, ir)
+        # Fence: prevent Cranelift's egraph from hoisting mutable-struct field
+        # loads (e.g. stream.lookahead_index) across this self-recursive call,
+        # which may mutate those fields through the passed-by-pointer argument.
+        # Without this, parse_RtoL reads a stale (pre-loop, hoisted) value of
+        # lookahead_index=1 while next_byte=14, producing a negative byte_span
+        # and throw_inexacterror on 4+ chained operands.
+        fence_ptr = Libdl.dlsym(bc.lib_handle, :block_add_fence)
+        ccall(fence_ptr, Cvoid, (Ptr{Cvoid},), bc.fctx_handle)
+        return result_id
     end
 
     # Core.kwcall(kwargs_nt, func) — keyword-argument dispatch. Detect by the
@@ -3345,9 +3354,11 @@ function _declare_imports(bc::BuilderCtx)
           bc.builder_handle, "__jl_memcpy", TYPE_PTR, memcpy_args, length(memcpy_args))
     # Diagnostic: __jl_dbg_i64(tag: i64, v: i64) -> i64 — prints tag+v, returns v
     # (returning v makes the call non-DCEable, so mid-block traces survive opt).
-    dbg_args = UInt32[TYPE_I64, TYPE_I64]
-    ccall(declare_ptr, Cint, (Ptr{Cvoid}, Ptr{UInt8}, UInt32, Ptr{UInt32}, Csize_t),
-          bc.builder_handle, "__jl_dbg_i64", TYPE_I64, dbg_args, length(dbg_args))
+    # DISABLED — the unconditional import declaration caused linker errors when
+    # no code calls it. Re-enable when debugging by un-commenting this block.
+    # dbg_args = UInt32[TYPE_I64, TYPE_I64]
+    # ccall(declare_ptr, Cint, (Ptr{Cvoid}, Ptr{UInt8}, UInt32, Ptr{UInt32}, Csize_t),
+    #       bc.builder_handle, "__jl_dbg_i64", TYPE_I64, dbg_args, length(dbg_args))
 end
 
 function emit_call_runtime(bc::BuilderCtx, func_name::String, arg_ids::Vector{UInt32})

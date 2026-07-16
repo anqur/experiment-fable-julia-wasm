@@ -438,6 +438,13 @@ impl FunctionCtx {
         let vv = self.ssa(v);
         self.emit_void(|fb| { fb.ins().trapnz(vv, cranelift_codegen::ir::TrapCode::HEAP_OUT_OF_BOUNDS); });
     }
+    /// Memory fence: prevents Cranelift's egraph from hoisting mutable-struct
+    /// field loads across self-recursive :invoke calls which may have mutated
+    /// those fields through the passed-by-pointer argument (fixes the
+    /// `parse_RtoL` lookahead_index-hoisting bug).
+    pub fn emit_fence(&mut self) {
+        self.emit_void(|fb| { fb.ins().fence(); });
+    }
 
     pub fn emit_call_import(&mut self, module: &mut ObjectModule, imports: &HashMap<String, FuncId>, name: &str, arg_ids: &[u32]) -> u32 {
         let func_id = *imports.get(name).unwrap_or_else(|| panic!("import not declared: {}", name));

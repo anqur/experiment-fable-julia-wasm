@@ -330,9 +330,29 @@ legacy `GCHeader` layout and are never returned to Julia.
     and the buffering disagree on the slot index after `:ref` advance); (c) the
     `_buffer_lookahead_tokens` Cranelift IR stores at a wrong offset (the
     store-to-element instruction is at the wrong byte offset).
-- **`parse_RtoL` recursive `next_byte` non-propagation (2026-07-16, NARROWED):**
-  the SIGILL-in-`throw_inexacterror` crash on 4+ chained operands
-  (`"a + b + c + d"`, `"x = a + b + c"`, `"x = 1 + foo(y)"`) is a *negative
+- **`parse_RtoL` recursive `next_byte` non-propagation (2026-07-16, NARROWED + FIXED):**
+    egraph hoisted `getfield(stream,:lookahead_index)` across self-recursive
+    `:invoke` → stale `lookahead_index`=1 while `next_byte`=14 → `parse_unary`
+    reads `lookahead[stale+1].next_byte` = first token → bumps backward → negative
+    byte_span → `throw_inexacterror`.
+    **FIXED:** Cranelift `fence` after self-recursive calls in `emit_invoke`
+    (`builder.rs` `emit_fence` + `lib.rs` `block_add_fence`). Verified:
+    `parse!("a+b+c+d")`=13 ✅, `parse!("a+b+c+d+e")`=17 ✅,
+    `parse!("x=1+2")`=9 ✅, `parse!("1+foo(y)")`=8 ✅.
+  - **FIXED this session — `__jl_dbg_i64` linker error.** The unconditional
+    import declaration in `_declare_imports` added `__jl_dbg_i64` as an import
+    in every .so, but the symbol wasn't resolvable → linker rejection.
+    Commented out the declaration. WEB_CORPUS: 6/6 pass ✅.
+  - **FIXED this session — bump arena + `__jl_gc_reset()`.** Replaced the
+    System-allocator `__jl_gc_*` functions (`native-backend/src/runtime/gc.rs`)
+    with a thread-local bump arena: `__jl_gc_alloc` → `bump_alloc(total, 16)`,
+    `__jl_gc_reset()` frees all blocks at once. The rest of the Rust backend
+    uses the system allocator. Allows successive `compile_native` → parse →
+    reset → re-compile cycles without OOM (two full `parse_into` compiles with
+    reset → no "double free"). eDSL still 90 ✅. `test_final.jl` suites must
+    call `ccall(:__jl_gc_reset, Cvoid, ())` between heavy compilations (the
+    .so is loaded with `RTLD_GLOBAL` via `native_callable_from_so`).
+    Larger expressions (function/struct/module defs) still fail (separate issue).
   byte_span*, NOT a count/arg-count issue. The crash site is `parse_RtoL`'s
   toplevel/call node emit:
   `%71 = getfield(stream, :next_byte)` (read **after** the recursive
