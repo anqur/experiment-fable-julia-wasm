@@ -24,6 +24,17 @@ thread_local! {
     static CATCH_STACK: RefCell<Vec<*mut JmpBuf>> = RefCell::new(Vec::with_capacity(MAX_CATCH_DEPTH));
 }
 
+/// Diagnostic: print an i64 to stderr AND return it unchanged. Returning the
+/// value makes calls non-removable by Cranelift's egraph (the result is used by
+/// the surrounding computation), so traces placed mid-block survive — unlike a
+/// void-returning call whose unused result gets DCE'd/reordered. stderr is
+/// unbuffered so the line survives a subsequent SIGILL.
+#[no_mangle]
+pub unsafe extern "C" fn __jl_dbg_i64(tag: i64, v: i64) -> i64 {
+    eprintln!("NCG_DBG tag={} val={} (0x{:016x})", tag, v, v as u64);
+    v
+}
+
 /// Throw an exception. Longjmp to the nearest catch frame.
 #[no_mangle]
 pub unsafe extern "C" fn __jl_throw() -> ! {

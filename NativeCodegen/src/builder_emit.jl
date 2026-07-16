@@ -20,6 +20,26 @@ const TYPE_VOID = UInt32(7)  # void return (maps to None → no return type)
 # then read back as 0 / SIGSEGV). Entries live for the Julia session.
 const _ROOTED_CONST_REFS = Any[]
 
+# Reverse lookup: Core.IntrinsicFunction => name Symbol.
+# `ccall(:jl_intrinsic_name, ...)` returns "invalid" for almost every intrinsic
+# on current Julia nightly, which would make the name-based dispatch in
+# emit_intrinsic silently dead (only the `===` identity checks would fire).
+# We build this table once at module load so raw `(Core.Intrinsics.X)(...)`
+# calls — which arrive as Core.IntrinsicFunction, not a Base.X GlobalRef —
+# resolve to their real name.
+const INTRINSIC_NAMES = let d = IdDict{Core.IntrinsicFunction, Symbol}()
+    for nm in names(Core.Intrinsics; all=true)
+        nm === :Intrinsics && continue
+        try
+            f = getfield(Core.Intrinsics, nm)
+            f isa Core.IntrinsicFunction || continue
+            get!(d, f, nm)
+        catch
+        end
+    end
+    d
+end
+
 # === IntCC condition enums ===
 const ICMP_EQ  = UInt32(0)
 const ICMP_NE  = UInt32(1)
@@ -50,6 +70,11 @@ const CRANELIFT_TYPE_MAP = IdDict{Any,UInt32}(
 function cranelift_type(T)
     t = get(CRANELIFT_TYPE_MAP, T, nothing)
     t !== nothing && return t
+    # Union{} (bottom type / unreachable): appears in kwcall sorter return types
+    # (from kwerr error paths). Without this, cranelift_type throws and the sorter's
+    # recursive callee resolution fails → bump_dotted is sentinel'd → the `=` token
+    # is never consumed → parse_assignment_with_initial_ex recurses forever.
+    T === Union{} && return TYPE_I64
     # Symbol and Int128/UInt128 — always TYPE_PTR (immutable heap objects)
     T === Symbol && return TYPE_PTR
     (T === Int128 || T === UInt128) && return TYPE_PTR
@@ -217,6 +242,11 @@ mutable struct BuilderCtx
     # type is a non-concrete (Vararg) Tuple → the underlying Vector value id.
     # `isa(result, Tuple{})` then lowers to `length(vec) == 0` (load vec+16).
     vararg_tuple_coll::Dict{Core.SSAValue, UInt32}
+    # SSAs known to hold host (Julia-constructed) objects — primarily const-global
+    # Memorys like Dict.slots/keys/vals, whose data is at load(obj+8) (host Memory
+    # ptr@8 → &data), NOT obj+8 (compiled inline). Used by emit_memoryrefnew's
+    # untracked is_memory path to pick the right data-pointer computation.
+    host_ssas::Set{Core.SSAValue}
 end
 
 function BuilderCtx(lib_path::String)
@@ -233,7 +263,8 @@ function BuilderCtx(lib_path::String)
                "", nothing,
                Set{String}(),
                nothing,
-               Dict{Core.SSAValue, UInt32}())
+               Dict{Core.SSAValue, UInt32}(),
+               Set{Core.SSAValue}())
 end
 
 function free_builder(bc::BuilderCtx)
@@ -518,6 +549,7 @@ function _compile_function_in_module!(mc::ModuleCompiler, mi::Core.MethodInstanc
         empty!(bc.ssa_pairs)
         empty!(bc.ssa_types)
         empty!(bc.vararg_tuple_coll)
+        empty!(bc.host_ssas)
         bc.current_func_name = ""
         bc.current_mi = nothing
     end
@@ -990,10 +1022,24 @@ function emit_intrinsic(bc::BuilderCtx, f::Core.IntrinsicFunction, args, ir, stm
     f === Core.Intrinsics.ctpop_int && return emit_unop(bc, :block_add_popcnt, args, ir)
     f === Core.Intrinsics.bswap_int && return emit_unop(bc, :block_add_bswap, args, ir)
     f === Core.Intrinsics.flipsign_int && return emit_flipsign_int(bc, args, ir)
+    # Bitwise arithmetic/shift intrinsics also return "invalid" from jl_intrinsic_name
+    # on this Julia version, so identify by === before the name-based dispatch.
+    f === Core.Intrinsics.and_int  && return emit_binop(bc, :block_add_band, args, ir)
+    f === Core.Intrinsics.or_int   && return emit_binop(bc, :block_add_bor,  args, ir)
+    f === Core.Intrinsics.xor_int  && return emit_binop(bc, :block_add_bxor, args, ir)
+    f === Core.Intrinsics.shl_int  && return emit_binop(bc, :block_add_ishl, args, ir)
+    f === Core.Intrinsics.lshr_int && return emit_binop(bc, :block_add_ushr, args, ir)
+    f === Core.Intrinsics.ashr_int && return emit_binop(bc, :block_add_sshr, args, ir)
 
-    # Map intrinsic to Rust FFI call
-    fn_name = ccall(:jl_intrinsic_name, Ptr{UInt8}, (Any,), f)
-    fn_sym = unsafe_string(fn_name) |> Symbol
+    # Resolve the intrinsic name. ccall(:jl_intrinsic_name) returns "invalid"
+    # for nearly all intrinsics on current Julia nightly, so use the prebuilt
+    # INTRINSIC_NAMES identity table (the authoritative source); fall back to
+    # jl_intrinsic_name only for anything not in the table.
+    fn_sym = get(INTRINSIC_NAMES, f, nothing)
+    if fn_sym === nothing
+        fn_name = ccall(:jl_intrinsic_name, Ptr{UInt8}, (Any,), f)
+        fn_sym = Symbol(unsafe_string(fn_name))
+    end
 
     # Arithmetic
     fn_sym == :add_int && return emit_binop(bc, :block_add_iadd, args, ir)
@@ -1601,6 +1647,43 @@ function emit_invoke(bc::BuilderCtx, invoke_target, f, args, ir, stmt_idx)
     end
     fn_name = method.name
 
+    # Workaround: get(const_Dict, key, default) — the compiled Base.get slot-probe
+    # misreads certain host-constructed Dict Vectors (e.g. `_kw_hash` in
+    # lex_identifier → keywords tokenize as Identifier). When the Dict is a
+    # compile-time constant, lower get to a linear search (chain of selects) over
+    # its known entries. Keys/values are emitted as constants; key==k ? v : …
+    # The set is small (e.g. _kw_hash has 42 entries) so the linear search is fine.
+    if fn_name === :get && length(args) >= 3
+        dict_val = try; _const_value(args[1], ir); catch _; _NotConst(); end
+        if !(dict_val isa _NotConst) && dict_val isa Dict && !isempty(dict_val)
+            res = _emit_const_dict_get(bc, dict_val, args[2], args[3], ir)
+            res !== nothing && return res
+        end
+    end
+
+    # Diagnostic: capture the offending value at a throw_inexacterror(:trunc,T,v)
+    # :invoke call site before the callee traps inside its body. args[3] = value.
+    # If args[3] is a sub_int(A, B), also print A and B at runtime to see which
+    # operand is corrupted.
+    if fn_name === :throw_inexacterror && haskey(ENV, "NCG_DBG_INEXACT") && length(args) >= 3
+        val_id = try; resolve_operand(bc, args[3], ir); catch; nothing; end
+        if val_id !== nothing
+            println(stderr, "[inexact-site] $(bc.current_func_name) si=$stmt_idx val_ssa=$(args[3]) :: $(repr(ir.stmts[stmt_idx][:stmt]))")
+            # Walk back: if val is sub_int(A,B), print A and B too.
+            if args[3] isa Core.SSAValue
+                def = ir.stmts[args[3].id][:stmt]
+                if def isa Expr && def.head == :call && length(def.args) >= 3
+                    println(stderr, "[inexact-def] $(bc.current_func_name) :: $(repr(def))")
+                    for a in def.args[2:3]
+                        oid = try; resolve_operand(bc, a, ir); catch; nothing; end
+                        oid isa UInt32 && emit_call_runtime(bc, "__jl_dbg_i64", UInt32[emit_constant(bc, Int64(9)), oid])
+                    end
+                end
+            end
+            emit_call_runtime(bc, "__jl_dbg_i64", UInt32[emit_constant(bc, Int64(9)), val_id])
+        end
+    end
+
     # Core.kwcall(kwargs_nt, func) — keyword-argument dispatch. The callee MI is
     # the generic kwcall SORTER (84+ stmts, needs runtime _apply_iterate / Vararg-
     # tuple support — a future feature). But when the kwargs NamedTuple is a
@@ -1794,6 +1877,11 @@ function emit_invoke(bc::BuilderCtx, invoke_target, f, args, ir, stmt_idx)
         # return in dead error paths), fall through to the sentinel constant.
         local callee_rt_enum, callee_param_types
         local got_ir = false
+        # Skip typejoin: ~2.2 GB to infer via the overlay interp, fails Cranelift
+        # verification (trap stub), and is never called at runtime. Skipping saves
+        # ~2.2 GB / ~12 s per parse! compilation, preventing test_final.jl OOM.
+        callee_fn = try; callee_mi.def.name; catch; nothing end
+        if callee_fn !== :typejoin
         try
             callee_result = Base.code_ircode_by_type(callee_mi.specTypes;
                                                       world=mc.interp.world, interp=mc.interp)
@@ -1814,6 +1902,7 @@ function emit_invoke(bc::BuilderCtx, invoke_target, f, args, ir, stmt_idx)
             end
         catch _
         end
+        end # if callee_fn !== :typejoin
         if got_ir
             callee_name = request!(mc, callee_mi)
             decl_ptr = Libdl.dlsym(bc.lib_handle, :builder_declare_self_function)
@@ -1865,6 +1954,26 @@ function emit_string_codeunit(bc, args, ir)
                  bc.fctx_handle, byte_id, TYPE_I32)
 end
 
+# Lower `get(const_Dict, key, default)` to a linear search over the Dict's
+# compile-time-known entries: result = default; for (k,v): result = key==k ? v : result.
+# Works around the broken compiled Base.get slot-probe for host-constructed Dicts
+# (e.g. _kw_hash keyword lookup).
+function _emit_const_dict_get(bc, dict::Dict, key_arg, default_arg, ir)
+    key_id = try; resolve_operand(bc, key_arg, ir); catch _; return nothing; end
+    result_id = try; resolve_operand(bc, default_arg, ir); catch _; return nothing; end
+    icmp_ptr = Libdl.dlsym(bc.lib_handle, :block_add_icmp)
+    sel_ptr = Libdl.dlsym(bc.lib_handle, :block_add_select)
+    for (k, v) in dict
+        k_id = emit_constant(bc, k)
+        v_id = emit_constant(bc, v)
+        eq = ccall(icmp_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32, UInt32),
+                   bc.fctx_handle, ICMP_EQ, key_id, k_id)
+        result_id = ccall(sel_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32, UInt32),
+                          bc.fctx_handle, eq, v_id, result_id)
+    end
+    return result_id
+end
+
 # === GlobalRef handling (external function calls) ===
 
 function emit_globalref(bc::BuilderCtx, f::Core.GlobalRef, args, ir, stmt_idx)
@@ -1887,6 +1996,7 @@ function emit_globalref(bc::BuilderCtx, f::Core.GlobalRef, args, ir, stmt_idx)
               elseif args[2] isa Symbol; args[2]
               else nothing end
         if gv isa Module && nm isa Symbol && isdefined(gv, nm)
+            push!(bc.host_ssas, Core.SSAValue(stmt_idx))   # const global → host object
             return emit_constant(bc, getglobal(gv, nm))
         end
     end
@@ -2091,10 +2201,43 @@ function emit_globalref(bc::BuilderCtx, f::Core.GlobalRef, args, ir, stmt_idx)
         ccall(trap_ptr, Cvoid, (Ptr{Cvoid},), bc.fctx_handle)
         return nothing
     end
+    # Core.apply_type — type construction (e.g. apply_type(Union, UInt16, Kind, X)).
+    # Appears in error-recovery and type-computation paths in the parser. For
+    # Union construction (apply_type(Union, T1, T2, ...)), compute from constant
+    # type args, DROPPING unresolved args (e.g. typejoin results that were
+    # sentinel'd). This gives the correct type when dropped args are subsumed by
+    # the constant ones (typejoin(UInt16, Kind) ⊂ Union{UInt16, Kind}). Without
+    # this, the sentinel (0/null type) → wrong isa() branch → cascading crash.
+    if fn === :apply_type && length(args) >= 1
+        union_arg = _const_value(args[1], ir)
+        if !(union_arg isa _NotConst) && union_arg === Union
+            type_args = Type[]
+            for a in args[2:end]
+                v = _const_value(a, ir)
+                if !(v isa _NotConst) && v isa Type
+                    push!(type_args, v)
+                end
+            end
+            if !isempty(type_args)
+                resolved = try; Union{type_args...}; catch _; Any; end
+                return emit_constant(bc, resolved)
+            end
+        end
+        return emit_constant(bc, Int64(reinterpret(UInt64, pointer_from_objref(Any))))
+    end
+
     # Dead-error-path sentinels: these Core globals appear in bounds-error /
     # method-error paths that never execute on correct inputs. Emit trap so
     # they become loud failures if reached, not silent undefined symbols.
     if fn == :throw_methoderror || fn == :throw_inexacterror || fn == :throw_undef_if_null || fn == :isdefined
+        # Diagnostic: when NCG_DBG_INEXACT is set, print the offending value for a
+        # throw_inexacterror(:trunc, T, value) before trapping (args[3] = value).
+        if fn == :throw_inexacterror && haskey(ENV, "NCG_DBG_INEXACT") && length(args) >= 3
+            val_id = try; resolve_operand(bc, args[3], ir); catch; nothing; end
+            if val_id !== nothing
+                emit_call_runtime(bc, "__jl_dbg_i64", UInt32[emit_constant(bc, Int64(9)), val_id])
+            end
+        end
         trap_ptr = Libdl.dlsym(bc.lib_handle, :block_add_trap)
         ccall(trap_ptr, Cvoid, (Ptr{Cvoid},), bc.fctx_handle)
         return nothing
@@ -2220,6 +2363,21 @@ end
 
 function emit_struct_getfield(bc::BuilderCtx, args, ir, stmt_idx)
     obj = args[1]
+    # Propagate host-ness: a field fetched from a host object (e.g.
+    # getfield(const_Dict, :slots/:keys/:vals)) is itself host. Detect host-ness
+    # of the object by: (a) prior host mark, (b) it's a GlobalRef (module globals
+    # like _kw_hash are host-constructed), or (c) it resolves to a compile-time
+    # constant. Host Memorys need load(obj+8) (ptr@8 → &data), not compiled inline
+    # obj+8.
+    local _is_host_obj = obj isa Core.SSAValue && obj in bc.host_ssas
+    if !_is_host_obj && obj isa Core.GlobalRef
+        _is_host_obj = isdefined(obj.mod, obj.name)
+    end
+    if !_is_host_obj
+        _cv = try; _const_value(obj, ir); catch _; _NotConst(); end
+        _is_host_obj = !(_cv isa _NotConst)
+    end
+    _is_host_obj && push!(bc.host_ssas, Core.SSAValue(stmt_idx))
     # checked-arithmetic pair: getfield(pair, 1)=value, getfield(pair, 2)=flag.
     # The pair stmt stored two value ids in bc.ssa_pairs (no tuple allocation).
     if obj isa Core.SSAValue && haskey(bc.ssa_pairs, obj.id)
@@ -2279,8 +2437,13 @@ function emit_struct_getfield(bc::BuilderCtx, args, ir, stmt_idx)
         base_id, base_off, parent_T = bc.ref_tracking[obj]
         field_off = fieldoffset(parent_T, field_sym)
         field_T = fieldtype(parent_T, field_sym)
-        return _load_field_mem(bc, base_id, Int32(base_off + field_off),
-                               field_T, cranelift_type(field_T))
+        r = _load_field_mem(bc, base_id, Int32(base_off + field_off),
+                            field_T, cranelift_type(field_T))
+        if (field_sym === :next_byte || field_sym === :lookahead_index) && haskey(ENV, "NCG_TRACE_NB")
+            tag = field_sym === :next_byte ? Int64(1) : Int64(2)
+            r = emit_call_runtime(bc, "__jl_dbg_i64", UInt32[emit_constant(bc, tag), r])
+        end
+        return r
     end
 
     obj_id = resolve_operand(bc, obj, ir)
@@ -2343,13 +2506,13 @@ function emit_struct_getfield(bc::BuilderCtx, args, ir, stmt_idx)
     # and handled by Case 3b.)
     if T isa DataType && isbitstype(T) && sizeof(T) <= 8 && cranelift_type(T) != TYPE_PTR
         # Bitstype getfield: value is in register, extract field by offset
+        field_T = fieldtype(T, field_sym)
         offset = fieldoffset(T, field_sym)
-        if offset == 0
-            return obj_id  # value is the field itself
+        if offset == 0 && sizeof(field_T) >= sizeof(T)
+            return obj_id  # field fills the entire struct (e.g. single-field bitstype)
         end
 
         # Multi-field bitstype: extract with shift/mask operations
-        field_T = fieldtype(T, field_sym)
         field_size = sizeof(field_T) * 8  # field size in bits
         struct_size = sizeof(T) * 8        # struct size in bits
 
@@ -2408,7 +2571,13 @@ function emit_struct_getfield(bc::BuilderCtx, args, ir, stmt_idx)
 
     # Case 4: regular mutable struct field — load from memory (memory width)
     offset = fieldoffset(T, field_sym)
-    return _load_field_mem(bc, obj_id, offset, field_T, cranelift_type(field_T))
+    r = _load_field_mem(bc, obj_id, offset, field_T, cranelift_type(field_T))
+    # Diagnostic: trace next_byte reads (value at runtime, func+site at compile).
+    if (field_sym === :next_byte || field_sym === :lookahead_index) && haskey(ENV, "NCG_TRACE_NB")
+        tag = field_sym === :next_byte ? Int64(1) : Int64(2)
+        r = emit_call_runtime(bc, "__jl_dbg_i64", UInt32[emit_constant(bc, tag), r])
+    end
+    return r
 end
 
 # Load a struct/tuple field at `obj_id + offset` using the field's MEMORY width
@@ -2467,29 +2636,33 @@ function emit_struct_setfield(bc::BuilderCtx, args, ir)
                        bc.fctx_handle, gt_cap, cmp_one, val_id)
     end
 
-    # Cap the :ref advance so ptr_or_offset never goes past the last valid
-    # element. The compaction in __lookahead_index computes
-    #   setfield!(vec, :ref, old_ptr + delta*12)
-    # and when delta > length, the new ptr points past the buffer end.  Clamp
-    # it to max = old_ptr + (len-1)*12 so lookahead[i] always stays in bounds.
+    # Cap the :ref advance so reads via it stay within the allocation. A read is
+    # `:ref + (idx-1)*esz` with `idx <= len` (clamped in emit_memoryrefnew), so
+    # the furthest read is `:ref + (len-1)*esz`; that must be `< old_ref +
+    # capacity*esz`. Hence cap `:ref <= old_ref + (capacity-len)*esz`. This
+    # allows the LEGITIMATE compaction in __lookahead_index (where the advance
+    # delta gives exactly `:ref = old_ref + delta*esz` and `capacity-len == delta`
+    # when capacity==original len) while preventing drift advances from sending
+    # reads past the allocation (intermittent SIGSEGV). A plain capacity clamp
+    # (`capacity-1`) was WRONG — it let reads reach `capacity+len`.
     if T isa DataType && T <: Array && field_sym == :ref
         load_ptr = Libdl.dlsym(bc.lib_handle, :block_add_load)
         old_ref = ccall(load_ptr, UInt32, (Ptr{Cvoid}, UInt32, Int32, UInt32),
                         bc.fctx_handle, obj_id, Int32(fieldoffset(T, :ref)), TYPE_I64)
-        size_off = fieldoffset(T, :size)
-        len_field = ccall(load_ptr, UInt32, (Ptr{Cvoid}, UInt32, Int32, UInt32),
-                          bc.fctx_handle, obj_id, Int32(size_off), TYPE_I64)
-        one_id = emit_constant(bc, Int64(1))
+        cap_id = ccall(load_ptr, UInt32, (Ptr{Cvoid}, UInt32, Int32, UInt32),
+                       bc.fctx_handle, obj_id, Int32(24), TYPE_I64)
+        len_id = ccall(load_ptr, UInt32, (Ptr{Cvoid}, UInt32, Int32, UInt32),
+                       bc.fctx_handle, obj_id, Int32(16), TYPE_I64)
         sub_ptr = Libdl.dlsym(bc.lib_handle, :block_add_isub)
-        last_idx = ccall(sub_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
-                         bc.fctx_handle, len_field, one_id)
+        slack = ccall(sub_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
+                      bc.fctx_handle, cap_id, len_id)   # capacity - len
         elem_sz = emit_constant(bc, Int64(_elem_size(eltype(T))))
         mul_ptr = Libdl.dlsym(bc.lib_handle, :block_add_imul)
-        last_off = ccall(mul_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
-                         bc.fctx_handle, last_idx, elem_sz)
+        max_off = ccall(mul_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
+                        bc.fctx_handle, slack, elem_sz)
         iadd_ptr = Libdl.dlsym(bc.lib_handle, :block_add_iadd)
         max_ref = ccall(iadd_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
-                        bc.fctx_handle, old_ref, last_off)
+                        bc.fctx_handle, old_ref, max_off)
         icmp_ptr = Libdl.dlsym(bc.lib_handle, :block_add_icmp)
         gt_cap = ccall(icmp_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32, UInt32),
                        bc.fctx_handle, ICMP_SGT, val_id, max_ref)
@@ -2497,6 +2670,7 @@ function emit_struct_setfield(bc::BuilderCtx, args, ir)
         val_id = ccall(sel_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32, UInt32),
                        bc.fctx_handle, gt_cap, max_ref, val_id)
     end
+
 
     offset = fieldoffset(T, field_sym)
     field_T = fieldtype(T, field_sym)
@@ -2672,8 +2846,27 @@ function emit_memoryrefnew(bc::BuilderCtx, args, ir, stmt_idx)
         # MemoryRef: element addr lives at base+off+0 (ptr_or_offset).
         # Memory:    data ptr lives at base+off+8 (Memory.ptr field).
         data_field_off = is_memory ? 8 : 0
-        data_ptr_id = ccall(load_ptr, UInt32, (Ptr{Cvoid}, UInt32, Int32, UInt32),
-                            bc.fctx_handle, base_id, Int32(base_off + data_field_off), TYPE_I64)
+        # Check if base_off != 0 (stored in a struct) or == 0 (direct pointer)
+        # base_off == 0 for locally-allocated Memory (emit_memoryref_from_mem)
+        # base_off != 0 for fields loaded from structs (emit_struct_getfield)
+        if base_off != 0
+            # Vector/MemoryRef is stored as a field in a struct (e.g., ParseStream.lookahead)
+            # Load the Vector pointer FIRST, then add data_field_off.
+            # Vector{SyntaxToken} stored in ParseStream is a pointer to JuliaArrayRepr,
+            # not a MemoryRef struct. The tracked (base_id, base_off) points to where
+            # this pointer is stored, so we must load it before adding data_field_off.
+            vec_ptr_id = ccall(load_ptr, UInt32, (Ptr{Cvoid}, UInt32, Int32, UInt32),
+                                bc.fctx_handle, base_id, Int32(base_off), TYPE_I64)
+            iadd_ptr = Libdl.dlsym(bc.lib_handle, :block_add_iadd)
+            data_ptr_id = ccall(iadd_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
+                                bc.fctx_handle, vec_ptr_id, emit_constant(bc, Int64(data_field_off)))
+        else
+            # base_off == 0: Memory/MemoryRef from local allocation (emit_memoryref_from_mem)
+            # base_id already points to the JuliaArrayRepr directly
+            # Load from base_id + data_field_off
+            data_ptr_id = ccall(load_ptr, UInt32, (Ptr{Cvoid}, UInt32, Int32, UInt32),
+                                bc.fctx_handle, base_id, Int32(data_field_off), TYPE_I64)
+        end
     else
         # Untracked base (cross-boundary: callee return, PhiNode, or Case-4
         # mutable-field load). The ssa_values entry holds:
@@ -2693,10 +2886,20 @@ function emit_memoryrefnew(bc::BuilderCtx, args, ir, stmt_idx)
         #     MemoryRef path (is_memory=false).
         base_id = resolve_operand(bc, memref_val, ir)
         if is_memory
-            eight_id = emit_constant(bc, Int64(8))
-            iadd_ptr = Libdl.dlsym(bc.lib_handle, :block_add_iadd)
-            data_ptr_id = ccall(iadd_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
-                                bc.fctx_handle, base_id, eight_id)
+            if memref_val isa Core.SSAValue && memref_val in bc.host_ssas
+                # Host Memory (e.g. Dict.slots from a const global): layout is
+                # [length@0][ptr@8 → &data]; the data lives at the address HELD
+                # in ptr@8, so dereference: data_ptr = load(base+8).
+                load_ptr = Libdl.dlsym(bc.lib_handle, :block_add_load)
+                data_ptr_id = ccall(load_ptr, UInt32, (Ptr{Cvoid}, UInt32, Int32, UInt32),
+                                    bc.fctx_handle, base_id, Int32(8), TYPE_I64)
+            else
+                # Compiled Memory (emit_memorynew): data inline at base+8.
+                eight_id = emit_constant(bc, Int64(8))
+                iadd_ptr = Libdl.dlsym(bc.lib_handle, :block_add_iadd)
+                data_ptr_id = ccall(iadd_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
+                                    bc.fctx_handle, base_id, eight_id)
+            end
         else
             data_ptr_id = base_id
         end
@@ -2704,18 +2907,38 @@ function emit_memoryrefnew(bc::BuilderCtx, args, ir, stmt_idx)
 
     # Compute element offset: (idx - 1) * elem_size
     idx_id = resolve_operand(bc, idx_val, ir)
-    # Bounds safety: clamp idx to len (prevent OOB reads into zero-initialised
-    # buffer slots that the deep parse descent drifts past). This matches Wasm's
-    # array.get OOB-trap semantics without trapping — reading the last buffered
-    # element (typically the EOF sentinel) is safer than derefing zero/garbage.
-    if tracked !== nothing
+    # Bounds safety: clamp idx to :size@16 to prevent OOB reads (the lookahead
+    # drift past the buffer). BUT skip the clamp when this memoryrefnew's result
+    # feeds a setfield!(:ref, …) — that is the LEGITIMATE compaction in
+    # __lookahead_index (parse_stream.jl:441-453), which does setfield!(:size,
+    # len-delta) FIRST then memoryrefnew(ref, delta+1) to advance :ref by delta
+    # (delta > 0.9*len). A length clamp there would read the already-reduced
+    # len-delta and cap delta+1 down to len-delta (2*delta > len-1), freezing
+    # :ref at an early slot → lookahead[i] returns the first token → parse_unary
+    # bumps next_byte backward → negative byte_span → SIGILL on 4+-operand
+    # chains. The compaction's advance is in-bounds of the ORIGINAL buffer
+    # (delta+1 <= original len), so it must not be clamped.
+    feeds_ref_setfield = false
+    this_ssa = Core.SSAValue(stmt_idx)
+    for s in ir.stmts
+        st = s[:stmt]
+        # setfield!(obj, :ref, value) -> args = [setfield!, obj, :ref, value]
+        if st isa Expr && st.head == :call && length(st.args) >= 4 &&
+           st.args[1] isa Core.GlobalRef && st.args[1].name === :setfield! &&
+           st.args[3] isa QuoteNode && st.args[3].value === :ref &&
+           st.args[4] === this_ssa
+            feeds_ref_setfield = true
+            break
+        end
+    end
+    if tracked !== nothing && !feeds_ref_setfield
         load_ptr = Libdl.dlsym(bc.lib_handle, :block_add_load)
+        len_base_id = (base_off != 0) ? vec_ptr_id : base_id
         len_id = ccall(load_ptr, UInt32, (Ptr{Cvoid}, UInt32, Int32, UInt32),
-                       bc.fctx_handle, base_id, Int32(base_off + 16), TYPE_I64)
+                       bc.fctx_handle, len_base_id, Int32(16), TYPE_I64)
         one_id = emit_constant(bc, Int64(1))
         icmp_ptr = Libdl.dlsym(bc.lib_handle, :block_add_icmp)
         sel_ptr = Libdl.dlsym(bc.lib_handle, :block_add_select)
-        # Ensure len >= 1 and clamp idx to len.
         lt_one = ccall(icmp_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32, UInt32),
                        bc.fctx_handle, ICMP_SLT, len_id, one_id)
         len_id = ccall(sel_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32, UInt32),
@@ -2725,6 +2948,7 @@ function emit_memoryrefnew(bc::BuilderCtx, args, ir, stmt_idx)
         idx_id = ccall(sel_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32, UInt32),
                        bc.fctx_handle, gt_len, len_id, idx_id)
     end
+
     one_id = emit_constant(bc, Int64(1))
     sub_ptr = Libdl.dlsym(bc.lib_handle, :block_add_isub)
     idx_0_id = ccall(sub_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
@@ -2792,8 +3016,14 @@ function emit_memoryrefget(bc::BuilderCtx, args, ir)
                    bc.fctx_handle, base_id, Int32(base_off), mem_width)
     if mem_width != elem_type_enum && elem_type_enum != TYPE_PTR && mem_width != TYPE_PTR
         ext_ptr = Libdl.dlsym(bc.lib_handle, :block_add_uextend)
-        return ccall(ext_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
+        loaded = ccall(ext_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
                      bc.fctx_handle, loaded, elem_type_enum)
+    end
+    # Diagnostic (NCG_TRACE_PEEK): wrap the loaded element pointer in a
+    # non-DCEable __jl_dbg_i64 call (returns its arg) so the loaded lookahead
+    # slot pointer is printed. Only for heap-pointer elements (tokens, nodes).
+    if haskey(ENV, "NCG_TRACE_PEEK") && elem_type_enum == TYPE_PTR
+        loaded = emit_call_runtime(bc, "__jl_dbg_i64", UInt32[emit_constant(bc, Int64(3)), loaded])
     end
     return loaded
 end
@@ -3113,6 +3343,11 @@ function _declare_imports(bc::BuilderCtx)
     memcpy_args = UInt32[TYPE_PTR, TYPE_PTR, TYPE_I64]
     ccall(declare_ptr, Cint, (Ptr{Cvoid}, Ptr{UInt8}, UInt32, Ptr{UInt32}, Csize_t),
           bc.builder_handle, "__jl_memcpy", TYPE_PTR, memcpy_args, length(memcpy_args))
+    # Diagnostic: __jl_dbg_i64(tag: i64, v: i64) -> i64 — prints tag+v, returns v
+    # (returning v makes the call non-DCEable, so mid-block traces survive opt).
+    dbg_args = UInt32[TYPE_I64, TYPE_I64]
+    ccall(declare_ptr, Cint, (Ptr{Cvoid}, Ptr{UInt8}, UInt32, Ptr{UInt32}, Csize_t),
+          bc.builder_handle, "__jl_dbg_i64", TYPE_I64, dbg_args, length(dbg_args))
 end
 
 function emit_call_runtime(bc::BuilderCtx, func_name::String, arg_ids::Vector{UInt32})

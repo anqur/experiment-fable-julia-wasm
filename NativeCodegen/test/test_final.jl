@@ -1018,12 +1018,12 @@ const WEB_CORPUS = [
 
             comp = compile_native(parse_into, Tuple{String}; name="parse_into")
             rm(comp.so_path)
-            # # TODO: Uncomment when parse! runs end-to-end
-            # host = parse_into("1 + 2")
-            # native_result = NativeCodegen.compile_and_call(
-            #     parse_into, Int64, Tuple{String}, "1 + 2"; name="parse_into")
-            # @test native_result == host
-            println("✅ (compiles ~160 callees; runtime blocked — see CLAUDE.md / parse! runtime unblockers memory)")
+            # parse_into now runs end-to-end for simple expressions (GC disabled).
+            host = parse_into("1 + 2")
+            native_result = NativeCodegen.compile_and_call(
+                parse_into, Int64, Tuple{String}, "1 + 2"; name="parse_into_rt")
+            @test native_result == host
+            println("✅ (compiles ~160 callees; parse_into runtime for \"1 + 2\" = $native_result)")
         catch e
             if e isa InterruptException; rethrow(); end
             println("❌ ", sprint(showerror, e))
