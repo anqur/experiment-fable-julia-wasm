@@ -244,6 +244,40 @@ legacy `GCHeader` layout and are never returned to Julia.
     The `parse_into` full pipeline also works: `parse_into("1 + 2")`→5 ✅.
     WEB_CORPUS (kind/haschildren on GreenNode): 6/6 ✅.  Flag-op tests pass.
     Simple expressions, assignments, 1–3 arg calls, and binary ops all work.
+  - **FIXED (2026-07-17) — function-typed arg widening dropped resword bodies
+    (the module/function/struct WEB_CORPUS bug).** The overlay interpreter widens
+    function values (e.g. parse_block's `down=parse_public`) to abstract
+    `Function` in the `:invoke` MethodInstance. parse_block (compiled generic,
+    `down::Function`) then calls `parse_block_inner` via a `:call` GlobalRef;
+    `emit_globalref` had no handler for a callable GlobalRef, threw "Unsupported
+    GlobalRef: ...parse_block_inner", and the call was sentinel'd + DCE'd — so
+    parse_block became emit-only (it emitted `block` without parsing the body).
+    For `module A\nend` this left the body-separator trivia unconsumed and
+    `bump_closing_token` errored on the NewlineWs (+1 node). Two-part fix in
+    `builder_emit.jl`: (1) `_respecialize_on_funargs` — at each `:invoke`, if a
+    `Function`-typed param is passed a compile-time-constant function, rebuild
+    the signature with `typeof(that_function)` and `Core.Compiler.specialize_method`
+    the SAME method on it, recovering the concrete type the overlay interp lost;
+    (2) `_emit_recursive_globalcall` — a callable GlobalRef in a `:call`
+    (`parse_block_inner`) resolves like a `:invoke` (resolve MI, declare, emit
+    cross-function call) instead of erroring. After this, `module A\nend`→9,
+    `function f(a::Int,b)\n return a*b-2.5e3\nend`→33, `struct Point{T<:Real}…end`→25
+    all match host (was +1 / −2 / −1). eDSL suite unchanged (89 ✅ / 3 pre-existing ❌).
+  - **FIXED (2026-07-17) — 3+ postfix statements separated by newlines hit a
+    runtime boundscheck (the try/catch/finally WEB_CORPUS case).** The last
+    WEB_CORPUS snippet SIGILLed in `__throw_boundserror_indices`. Root cause: the
+    `:size` store clamp in `emit_struct_setfield` (for Array `:size`) capped the
+    stored value at **≥1** (added to keep the lookahead buffer's EOF sentinel
+    during compaction). But `position_pool` legitimately drains to size 0 via
+    `pop!`; the clamp made `isempty(position_pool)` never see 0, so
+    `acquire_positions` popped a stale slot instead of returning a fresh
+    `Vector{ParseStreamPosition}()` → OOB on the 3rd postfix statement (when the
+    pool had been drained). Fix: clamp `:size` at **≥0** (not ≥1). A size of 0 is
+    valid for non-lookahead Vectors; the lookahead buffer never legitimately
+    empties, so its size stays ≥1 in practice and compaction still works
+    (5-operand chains still parse, 19==19). After this, the try/catch/finally
+    snippet → 32, `foo()\nbar()\nbaz()` → 15, `x[1]\ny[2]\nz[3]` → 18, all match
+    host. **All 6 WEB_CORPUS now pass.**
   - **FIXED — `parse_RtoL` `lookahead_index` hoisting (Cranelift fence).** The
     egraph hoisted `getfield(stream, :lookahead_index)` across self-recursive
     `:invoke` calls, reading a stale value of 1 while `next_byte` was current.
@@ -276,15 +310,14 @@ legacy `GCHeader` layout and are never returned to Julia.
   - **ABI hazard (NOT the parse! bug):** host-constructed `ParseStream`/
     `Vector{SyntaxToken}` crashes native (host stores SyntaxToken inline, native
     assumes heap pointers). The real `parse!` constructs its stream inside native.
-  - **REMAINING: function/struct/module/try definitions** (expressions with 15+
-    output nodes). `parse_resword` → `bump_closing_token` → `#untokenize#7`
-    (kwcall wrapper for `untokenize`) SEGVs at runtime probing host-Dict Memory
-    objects (`_nonunique_kind_names`). The `host_ssas` tracking was added in a
-    prior session but may not propagate through the kwcall wrapper, or the
-    host-Memory access pattern in `#untokenize#7` differs from what's tracked.
-    Fix options: (a) extend `host_ssas` tracking to the kwcall wrapper,
-    (b) a non-DCEable sentinel for runtime Kinds (needs stack-slot store/load
-    or a runtime function — new builder ops), (c) a native-side `untokenize` table.
+  - **(Mostly FIXED 2026-07-17; see the function-typed-arg fix above.)**
+    function/struct/module definitions now parse with correct counts. The
+    remaining failure is the try/catch/finally snippet, which needs 3+ call
+    statements separated by newlines — see the "3+ call statements" REMAINING
+    bullet above. (The earlier `#untokenize#7` / `_nonunique_kind_names` theory
+    was a misdiagnosis: bump_closing_token's error path was a *symptom* of the
+    body never being parsed, not the cause. The cause was parse_block_inner
+    being dropped — fixed.)
 - **Sub-word array element load width:** `cranelift_type(Bool)` returns `TYPE_I32`
   (Bool occupies an i32 register per the shared `scalar_repr` convention), but in
   a `Vector{Bool}` each element is 1 byte in memory. `emit_memoryrefget` must load

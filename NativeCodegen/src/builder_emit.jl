@@ -426,7 +426,7 @@ function _compile_function_in_module!(mc::ModuleCompiler, mi::Core.MethodInstanc
         # Create at least N+1 blocks to cover all possible references.
         # Each IR statement index doubles as a potential block target.
         cfg = ir.cfg
-        local nblocks = 2048
+        local nblocks = max(2048, length(cfg.blocks))
         for bi in 1:nblocks
             block_name = "block$(bi-1)"
             bc.blocks[bi] = block_name
@@ -708,9 +708,12 @@ function emit_instruction(bc::BuilderCtx, e, ir, stmt_idx::Int)
                   bc.fctx_handle, target_name, phi_args, length(phi_args))
         end
     elseif e isa Expr && e.head == :boundscheck
-        # boundscheck true/false — emit as Bool constant
+        # boundscheck true/false — emit as Bool constant. Default to OFF (0): the
+        # codegen clamps Vector getindex in emit_memoryrefget, so boundschecks are
+        # redundant; a stale length read (after push!/growth) can false-positive
+        # the check. DEBUG: force off to test.
         flag = length(e.args) >= 1 ? e.args[1] : true
-        val = flag == true ? Int64(1) : Int64(0)
+        val = (flag == true && !haskey(ENV, "NCG_NO_BOUNDCHECK")) ? Int64(1) : Int64(0)
         iconst_ptr = Libdl.dlsym(bc.lib_handle, :block_add_iconst)
         result_id = ccall(iconst_ptr, UInt32, (Ptr{Cvoid}, Int64, UInt32),
                           bc.fctx_handle, val, TYPE_I32)
@@ -959,10 +962,18 @@ function resolve_operand(bc::BuilderCtx, val, ir)
     else
         # Any other heap object (module-constant Vector/Array, String, Symbol,
         # struct instance, …) — emit as its pointer so downstream getfield
-        # (:ref/:size) and field-offset loads work. pointer_from_objref is valid
-        # for every Julia object reaching here (Number/Ptr/primitive/bitstype/
-        # Type/nothing are all handled above).
-        return emit_constant(bc, Int64(reinterpret(UInt64, pointer_from_objref(val))))
+        # (:ref/:size) and field-offset loads work. For MUTABLE objects,
+        # pointer_from_objref(val) is valid directly. For IMMUTABLE non-bitstype
+        # objects (e.g. Set on Julia 1.14 where ismutabletype=false), wrap in Ref
+        # and root it — pointer_from_objref(Ref(val)) gives the Ref's data pointer
+        # (= &val inline), and the Ref must survive compilation+execution.
+        if Base.ismutabletype(typeof(val))
+            return emit_constant(bc, Int64(reinterpret(UInt64, pointer_from_objref(val))))
+        else
+            ref = Ref(val)
+            push!(_ROOTED_CONST_REFS, ref)
+            return emit_constant(bc, Int64(reinterpret(UInt64, pointer_from_objref(ref))))
+        end
     end
 end
 
@@ -1574,6 +1585,45 @@ function _emit_kwcall_core_call(bc::BuilderCtx, func_val, kw_nt, positional, ir)
                  bc.fctx_handle, bc.builder_handle, callee_name, arg_ids, length(arg_ids))
 end
 
+# Re-specialize a callee MethodInstance on concrete function-typed arguments.
+# The overlay interpreter widens function values to abstract `Function` in the
+# invoke MI (e.g. parse_block's `down`). A `down::Function` MI can't resolve
+# `where F` callees (parse_block_inner, parse_Nary) — their call gets sentinel'd
+# and dropped. If a `Function`-typed param is passed a compile-time-constant
+# function, rebuild the signature with `typeof(that_function)` and re-specialize
+# the SAME method on it. Returns the original MI if nothing changed or if
+# re-specialization fails.
+function _respecialize_on_funargs(callee_mi::Core.MethodInstance, args, ir)
+    spec = callee_mi.specTypes
+    spec isa DataType || return callee_mi
+    params = spec.parameters
+    # params[1] is typeof(callee); params[2:end] are the argument types.
+    length(params) == length(args) + 1 || return callee_mi
+    changed = false
+    new_params = Any[params[1]]
+    for (i, a) in enumerate(args)
+        p = params[i+1]
+        if p === Function
+            cv = try; _const_value(a, ir); catch _; _NotConst(); end
+            if !(cv isa _NotConst) && cv isa Function
+                push!(new_params, typeof(cv))
+                changed = true
+            else
+                push!(new_params, p)
+            end
+        else
+            push!(new_params, p)
+        end
+    end
+    changed || return callee_mi
+    new_sig = try; Tuple{new_params...}; catch _; return callee_mi end
+    try
+        return Core.Compiler.specialize_method(callee_mi.def, new_sig, Core.svec())
+    catch _
+        return callee_mi
+    end
+end
+
 function emit_invoke(bc::BuilderCtx, invoke_target, f, args, ir, stmt_idx)
     if haskey(ENV, "NCG_TRACE_INVOKE")
         iskw = (f === Core.kwcall) || (f isa QuoteNode && f.value === Core.kwcall)
@@ -1589,6 +1639,15 @@ function emit_invoke(bc::BuilderCtx, invoke_target, f, args, ir, stmt_idx)
     else
         error("Unknown invoke target type: $(typeof(invoke_target))")
     end
+    # Re-specialize on concrete function-typed args. The overlay interpreter
+    # widens function values (e.g. parse_block's `down=parse_public`) to the
+    # abstract `Function` type in the invoke's MethodInstance. A generic
+    # `down::Function` MI makes downstream `where F` callees (parse_block_inner,
+    # parse_Nary) unresolvable — their invoke/global-call gets sentinel'd and
+    # dropped (parse_block lost its parse_block_inner call → resword bodies with
+    # newlines misparse). Recover the concrete type from the call's constant
+    # function args and re-specialize the method on it.
+    callee_mi = _respecialize_on_funargs(callee_mi, args, ir)
     if bc.current_mi !== nothing && callee_mi == bc.current_mi
         # Self-recursive call — resolve args and emit call to self-import
         result_id = emit_call_import(bc, bc.current_func_name, args, ir)
@@ -1918,12 +1977,25 @@ function emit_invoke(bc::BuilderCtx, invoke_target, f, args, ir, stmt_idx)
                   bc.builder_handle, callee_name, callee_rt_enum,
                   callee_param_types, length(callee_param_types))
             arg_ids = UInt32[resolve_operand(bc, a, ir) for a in args]
+            # Diagnostic (NCG_TRACE_BUMP): print _bump_until_n's target `n` arg
+            # (args[2]) so we can see whether bump_trivia's call would consume the
+            # current trivia (n >= lookahead_index) or skip (n < lookahead_index).
+            if haskey(ENV, "NCG_TRACE_BUMP") &&
+               endswith(callee_name, "__bump_until_n") && length(arg_ids) >= 2
+                emit_call_runtime(bc, "__jl_dbg_i64",
+                    UInt32[emit_constant(bc, Int64(7)), arg_ids[2]])
+            end
             call_ptr = Libdl.dlsym(bc.lib_handle, :block_add_call)
             return ccall(call_ptr, UInt32, (Ptr{Cvoid}, Ptr{Cvoid}, Cstring, Ptr{UInt32}, Csize_t),
                          bc.fctx_handle, bc.builder_handle, callee_name, arg_ids, length(arg_ids))
         end
     end
     # Fallback: emit sentinel constant (single-function mode or failed resolution)
+    if haskey(ENV, "NCG_TRACE_SENTINEL")
+        callee_nm = try; callee_mi.def.name; catch _; "?" end
+        println(stderr, "[sentinel] caller=", bc.current_func_name, " callee=", callee_nm,
+                " mi=", callee_mi)
+    end
     local sentinel_ty
     try
         inferred = ir.stmts[stmt_idx][:type]
@@ -1983,6 +2055,88 @@ function _emit_const_dict_get(bc, dict::Dict, key_arg, default_arg, ir)
 end
 
 # === GlobalRef handling (external function calls) ===
+
+# Resolve a GlobalRef that names a callable Julia function (e.g.
+# `parse_block_inner`) into a recursive callee, exactly as a static `:invoke`
+# is resolved. The overlay interpreter does NOT inline some small helpers
+# (parse_block_inner is emitted as a `:call` to a GlobalRef rather than an
+# `:invoke`), so without this the call hits the "Unsupported GlobalRef" error
+# below, is sentinel'd, and the call is silently dropped — e.g. parse_block
+# lost its parse_block_inner call and only emitted the trailing `emit(block)`,
+# so resword bodies (module/function/struct/try with newlines) were never
+# parsed and bump_closing_token errored on the unconsumed trivia. Returns the
+# call's result SSA id, or `nothing` if the GlobalRef is not a resolvable
+# function call (caller then falls through to its own handling/error).
+function _emit_recursive_globalcall(bc::BuilderCtx, f::Core.GlobalRef, args, ir)
+    mc = bc.module_compiler
+    mc === nothing && return nothing
+    func = try; getglobal(f.mod, f.name); catch _; return nothing end
+    (func isa Function || func isa Type) || return nothing
+    # Build the callee signature from the call's argument types. For Argument
+    # operands, prefer the CURRENT function's specialized specTypes (concrete)
+    # over the IR's argtypes — the overlay interp widens function-typed args
+    # (e.g. parse_block's `down::F`) to abstract `Function`, which would make
+    # `_methods_by_ftype` miss the callee's `where F` specialization.
+    argtypes = Any[typeof(func)]
+    for a in args
+        t = if a isa Core.Argument && bc.current_mi !== nothing
+            try; bc.current_mi.specTypes.parameters[a.n]; catch _; nothing end
+        else
+            nothing
+        end
+        if t === nothing
+            t = try; get_operand_type(a, ir); catch _; return nothing end
+            t = t isa Core.Const ? typeof(t.val) : t
+        end
+        push!(argtypes, t)
+    end
+    sig = try; Tuple{argtypes...}; catch _; return nothing end
+    tt = try; Base.signature_type(func, sig); catch _; return nothing end
+    matches = try; Base._methods_by_ftype(tt, -1, mc.interp.world); catch _; return nothing end
+    (matches === nothing || isempty(matches)) && return nothing
+    callee_mi = try
+        Core.Compiler.specialize_method(matches[1].method, tt, Core.svec())
+    catch _
+        nothing
+    end
+    callee_mi === nothing && return nothing
+    # Skip typejoin (~2.2 GB to infer, fails verification, never on the live path).
+    callee_fn = try; callee_mi.def.name; catch; nothing end
+    callee_fn === :typejoin && return nothing
+    local callee_rt_enum = UInt32(0)
+    local callee_param_types = UInt32[]
+    local got_ir = false
+    try
+        callee_result = Base.code_ircode_by_type(callee_mi.specTypes;
+                                                  world=mc.interp.world, interp=mc.interp)
+        if length(callee_result) == 1
+            callee_ir, callee_rettype = callee_result[1]
+            local cfg_ok = true; local nblocks = length(callee_ir.cfg.blocks)
+            for blk in callee_ir.cfg.blocks
+                for s in blk.succs
+                    if s < 1 || s > nblocks; cfg_ok = false; break; end
+                end; cfg_ok || break
+            end
+            if cfg_ok
+                callee_rt_enum = cranelift_type(callee_rettype)
+                callee_param_types = UInt32[cranelift_type(_ir_type(t))
+                                            for t in callee_ir.argtypes[2:end]]
+                got_ir = true
+            end
+        end
+    catch _
+    end
+    got_ir || return nothing
+    callee_name = request!(mc, callee_mi)
+    decl_ptr = Libdl.dlsym(bc.lib_handle, :builder_declare_self_function)
+    ccall(decl_ptr, Cint, (Ptr{Cvoid}, Ptr{UInt8}, UInt32, Ptr{UInt32}, Csize_t),
+          bc.builder_handle, callee_name, callee_rt_enum,
+          callee_param_types, length(callee_param_types))
+    arg_ids = UInt32[resolve_operand(bc, a, ir) for a in args]
+    call_ptr = Libdl.dlsym(bc.lib_handle, :block_add_call)
+    return ccall(call_ptr, UInt32, (Ptr{Cvoid}, Ptr{Cvoid}, Cstring, Ptr{UInt32}, Csize_t),
+                 bc.fctx_handle, bc.builder_handle, callee_name, arg_ids, length(arg_ids))
+end
 
 function emit_globalref(bc::BuilderCtx, f::Core.GlobalRef, args, ir, stmt_idx)
     fn = f.name
@@ -2257,6 +2411,14 @@ function emit_globalref(bc::BuilderCtx, f::Core.GlobalRef, args, ir, stmt_idx)
         length(args) >= 1 && return resolve_operand(bc, args[1], ir)
         return emit_constant(bc, Int64(0))
     end
+
+    # Fallback: a GlobalRef naming a callable Julia function (not a known
+    # intrinsic/global). Resolve it as a recursive callee like a static :invoke.
+    # This catches helpers the overlay interp leaves as `:call` (e.g.
+    # parse_block_inner). Returns nothing if it can't resolve, falling through
+    # to the error below.
+    callref = _emit_recursive_globalcall(bc, f, args, ir)
+    callref === nothing || return callref
 
     error("Unsupported GlobalRef: $(mod).$(fn)")
 end
@@ -2629,19 +2791,22 @@ function emit_struct_setfield(bc::BuilderCtx, args, ir)
     obj_id = resolve_operand(bc, obj, ir)
     val_id = resolve_operand(bc, value, ir)
 
-    # Prevent the compaction in __lookahead_index from reducing Vector :size to 0
-    # (or negative). When lookahead_index drifts past the buffer in the deep parser
-    # descent, the compaction's setfield!(:size, length-delta) would store zero or
-    # negative length. Capping at 1 preserves at least the EOF sentinel in the
-    # buffer so the read always produces a valid (non-null) SyntaxToken pointer.
+    # Prevent the compaction in __lookahead_index from reducing Vector :size
+    # NEGATIVE. When lookahead_index drifts past the buffer in the deep parser
+    # descent, the compaction's setfield!(:size, length-delta) could store a
+    # negative length. Clamp only at 0 (NOT 1): a size of 0 is legitimate for
+    # other Vectors (e.g. position_pool drained by pop! — isempty must see 0 so
+    # acquire_positions returns a fresh Vector instead of popping a stale slot,
+    # which was the try/catch/finally 3rd-postfix-op OOB). The lookahead buffer
+    # never legitimately empties, so its size stays >= 1 in practice.
     if T isa DataType && T <: Array && field_sym == :size
-        cmp_one = emit_constant(bc, Int64(1))
+        cmp_zero = emit_constant(bc, Int64(0))
         icmp_ptr = Libdl.dlsym(bc.lib_handle, :block_add_icmp)
-        gt_cap = ccall(icmp_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32, UInt32),
-                       bc.fctx_handle, ICMP_SLT, val_id, cmp_one)
+        neg_cap = ccall(icmp_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32, UInt32),
+                        bc.fctx_handle, ICMP_SLT, val_id, cmp_zero)
         sel_ptr = Libdl.dlsym(bc.lib_handle, :block_add_select)
         val_id = ccall(sel_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32, UInt32),
-                       bc.fctx_handle, gt_cap, cmp_one, val_id)
+                       bc.fctx_handle, neg_cap, cmp_zero, val_id)
     end
 
     # Cap the :ref advance so reads via it stay within the allocation. A read is
@@ -2858,11 +3023,6 @@ function emit_memoryrefnew(bc::BuilderCtx, args, ir, stmt_idx)
         # base_off == 0 for locally-allocated Memory (emit_memoryref_from_mem)
         # base_off != 0 for fields loaded from structs (emit_struct_getfield)
         if base_off != 0
-            # Vector/MemoryRef is stored as a field in a struct (e.g., ParseStream.lookahead)
-            # Load the Vector pointer FIRST, then add data_field_off.
-            # Vector{SyntaxToken} stored in ParseStream is a pointer to JuliaArrayRepr,
-            # not a MemoryRef struct. The tracked (base_id, base_off) points to where
-            # this pointer is stored, so we must load it before adding data_field_off.
             vec_ptr_id = ccall(load_ptr, UInt32, (Ptr{Cvoid}, UInt32, Int32, UInt32),
                                 bc.fctx_handle, base_id, Int32(base_off), TYPE_I64)
             iadd_ptr = Libdl.dlsym(bc.lib_handle, :block_add_iadd)
@@ -2895,14 +3055,12 @@ function emit_memoryrefnew(bc::BuilderCtx, args, ir, stmt_idx)
         base_id = resolve_operand(bc, memref_val, ir)
         if is_memory
             if memref_val isa Core.SSAValue && memref_val in bc.host_ssas
-                # Host Memory (e.g. Dict.slots from a const global): layout is
-                # [length@0][ptr@8 → &data]; the data lives at the address HELD
-                # in ptr@8, so dereference: data_ptr = load(base+8).
+                # Host Memory: [length@0][ptr@8 → &data]. Deref ptr@8.
                 load_ptr = Libdl.dlsym(bc.lib_handle, :block_add_load)
                 data_ptr_id = ccall(load_ptr, UInt32, (Ptr{Cvoid}, UInt32, Int32, UInt32),
                                     bc.fctx_handle, base_id, Int32(8), TYPE_I64)
             else
-                # Compiled Memory (emit_memorynew): data inline at base+8.
+                # Compiled Memory: data inline at base+8.
                 eight_id = emit_constant(bc, Int64(8))
                 iadd_ptr = Libdl.dlsym(bc.lib_handle, :block_add_iadd)
                 data_ptr_id = ccall(iadd_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
@@ -3370,11 +3528,13 @@ function _declare_imports(bc::BuilderCtx)
           bc.builder_handle, "__jl_memcpy", TYPE_PTR, memcpy_args, length(memcpy_args))
     # Diagnostic: __jl_dbg_i64(tag: i64, v: i64) -> i64 — prints tag+v, returns v
     # (returning v makes the call non-DCEable, so mid-block traces survive opt).
-    # DISABLED — the unconditional import declaration caused linker errors when
-    # no code calls it. Re-enable when debugging by un-commenting this block.
-    # dbg_args = UInt32[TYPE_I64, TYPE_I64]
-    # ccall(declare_ptr, Cint, (Ptr{Cvoid}, Ptr{UInt8}, UInt32, Ptr{UInt32}, Csize_t),
-    #       bc.builder_handle, "__jl_dbg_i64", TYPE_I64, dbg_args, length(dbg_args))
+    # Declared ONLY when a trace knob is active, so normal builds don't hit a
+    # linker error from an undeclared-but-unused import.
+    if haskey(ENV, "NCG_TRACE_NB") || haskey(ENV, "NCG_TRACE_PEEK") || haskey(ENV, "NCG_TRACE_LAI") || haskey(ENV, "NCG_TRACE_BUMP")
+        dbg_args = UInt32[TYPE_I64, TYPE_I64]
+        ccall(declare_ptr, Cint, (Ptr{Cvoid}, Ptr{UInt8}, UInt32, Ptr{UInt32}, Csize_t),
+              bc.builder_handle, "__jl_dbg_i64", TYPE_I64, dbg_args, length(dbg_args))
+    end
 end
 
 function emit_call_runtime(bc::BuilderCtx, func_name::String, arg_ids::Vector{UInt32})
