@@ -1850,7 +1850,6 @@ function emit_invoke(bc::BuilderCtx, invoke_target, f, args, ir, stmt_idx)
 
     # untokenize(Kind) → Union{String, Nothing} — resolve at compile time
     if fn_name == :untokenize && length(args) >= 1
-        op = args[1]
         local kind_val, str
         if op isa Core.SSAValue
             kind_val = try
@@ -3302,9 +3301,26 @@ function emit_foreigncall(bc::BuilderCtx, e::Expr, ir, stmt_idx)
 end
 
 function emit_memoryrefunset(bc::BuilderCtx, args, ir)
-    # No-op: the compaction's nulling (memoryrefunset!) destroys the EOF sentinel
-    # element when delta > length, causing segfault-at-0. Skipping it preserves
-    # the last valid token so the parser can detect end-of-file and terminate.
+    # Stores zero at the MemoryRef address (GC safety for reference types).
+    memref_val = args[1]
+    tracked = (memref_val isa Core.SSAValue && haskey(bc.ref_tracking, memref_val)) ?
+              bc.ref_tracking[memref_val] : nothing
+    base_id, base_off, elem_type_enum = if tracked !== nothing
+        b_id, b_off, memref_T = tracked
+        eT = memref_T isa DataType && length(memref_T.parameters) >= 2 ?
+             memref_T.parameters[2] : Int64
+        (b_id, b_off, cranelift_type(eT))
+    else
+        memref_T = get_operand_type(memref_val, ir)
+        memref_T = memref_T isa Core.Const ? memref_T.val : memref_T
+        eT = memref_T isa DataType && length(memref_T.parameters) >= 2 ?
+             memref_T.parameters[2] : Int64
+        (resolve_operand(bc, memref_val, ir), 0, cranelift_type(eT))
+    end
+    zero_id = emit_constant(bc, Int64(0))
+    store_ptr = Libdl.dlsym(bc.lib_handle, :block_add_store)
+    ccall(store_ptr, Cvoid, (Ptr{Cvoid}, UInt32, Int32, UInt32, UInt32),
+          bc.fctx_handle, base_id, Int32(base_off), zero_id, elem_type_enum)
     return nothing
 end
 
