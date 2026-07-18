@@ -13,7 +13,7 @@ function simple_control(s::String)
 end
 
 println("Generating CLIF for simple_control:")
-interp = NativeCodegen.WasmCodegen.WasmInterp()
+interp = NativeCodegen.NCGInterp()
 clif = NativeCodegen.compile_to_clif(interp, simple_control, Tuple{String})
 
 println("CLIF output:")

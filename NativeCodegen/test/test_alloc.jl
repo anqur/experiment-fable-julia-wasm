@@ -40,7 +40,7 @@ end
 
 # Check IR to confirm :new is actually emitted (vs optimized away)
 print("  new_sum_ir ... ")
-interp = WasmCodegen.WasmInterp()
+interp = NCGInterp()
 tt = Base.signature_type(sf_new_sum, Tuple{Int64,Int64})
 matches = Base._methods_by_ftype(tt, -1, interp.world)
 mi = Core.Compiler.specialize_method(matches[1].method, tt, Core.svec())

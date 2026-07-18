@@ -1,11 +1,11 @@
 using NativeCodegen
-using NativeCodegen: WasmInterp
+using NativeCodegen: NCGInterp
 
 function alloc_array()::Vector{Int64}
     return Int64[1, 2, 3, 4]
 end
 
-interp = WasmInterp()
+interp = NCGInterp()
 tt = Base.signature_type(alloc_array, Tuple{})
 matches = Base._methods_by_ftype(tt, -1, interp.world)
 mi = Core.Compiler.specialize_method(matches[1].method, tt, Core.svec())

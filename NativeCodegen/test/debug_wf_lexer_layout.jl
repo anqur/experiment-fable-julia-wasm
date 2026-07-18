@@ -1,7 +1,7 @@
-using NativeCodegen: CC, WasmInterp
+using NativeCodegen: CC, NCGInterp
 import Base.JuliaSyntax as JS
 
-const INTERP = WasmInterp()
+const INTERP = NCGInterp()
 
 # Dereference io+0 directly (avoid pointer_from_objref which fails on Memory).
 io = IOBuffer(b"hello")

@@ -1,7 +1,7 @@
 # Debug IR for array allocation + access
 # Usage: julia +nightly --project=. NativeCodegen/test/debug_alloc_ir.jl
 
-using WasmCodegen: WasmInterp
+using NativeCodegen: NCGInterp
 
 function ar_alloc(n::Int64)
     a = Vector{Int64}(undef, n)
@@ -9,7 +9,7 @@ function ar_alloc(n::Int64)
     @inbounds return a[1]
 end
 
-interp = WasmInterp()
+interp = NCGInterp()
 tt = Base.signature_type(ar_alloc, Tuple{Int64})
 matches = Base._methods_by_ftype(tt, -1, interp.world)
 mi = Core.Compiler.specialize_method(matches[1].method, tt, Core.svec())

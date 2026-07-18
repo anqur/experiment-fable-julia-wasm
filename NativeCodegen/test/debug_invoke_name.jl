@@ -9,7 +9,7 @@ function string_eq(s1::String, s2::String)
     return s1 == s2
 end
 
-interp = NativeCodegen.WasmCodegen.WasmInterp()
+interp = NativeCodegen.NCGInterp()
 tt = Base.signature_type(string_eq, Tuple{String, String})
 matches = Base._methods_by_ftype(tt, -1, interp.world)
 

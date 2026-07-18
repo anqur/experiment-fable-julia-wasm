@@ -14,7 +14,7 @@ function test_simple_if(a::Int)
 end
 
 try
-    interp = NativeCodegen.WasmCodegen.WasmInterp()
+    interp = NativeCodegen.NCGInterp()
 
     # First check CLIF generation
     clif = NativeCodegen.compile_to_clif(interp, test_simple_if, Tuple{Int})

@@ -2,7 +2,7 @@
 # This avoids the complex %new/store path
 # Usage: julia +nightly --project=. NativeCodegen/test/debug_call_raw.jl
 
-using WasmCodegen: WasmInterp
+using NativeCodegen: NCGInterp
 using NativeCodegen
 
 # Function that calls ncodeunits (which invokes string length load)
@@ -16,7 +16,7 @@ function alloc_vec(n::Int64)
 end
 
 # Get the IR
-interp = WasmInterp()
+interp = NCGInterp()
 tt = Base.signature_type(alloc_vec, Tuple{Int64})
 matches = Base._methods_by_ftype(tt, -1, interp.world)
 mi = Core.Compiler.specialize_method(matches[1].method, tt, Core.svec())

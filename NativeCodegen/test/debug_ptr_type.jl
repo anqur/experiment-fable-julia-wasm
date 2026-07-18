@@ -17,7 +17,7 @@ for T in types_to_test
 end
 
 println("\n=== Testing scalar_repr (should return nothing for tuples) ===")
-using WasmCodegen: scalar_repr
+using NativeCodegen: scalar_repr
 
 for T in types_to_test
     result = scalar_repr(T)

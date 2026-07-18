@@ -1,9 +1,9 @@
 using NativeCodegen
-using NativeCodegen: WasmInterp
+using NativeCodegen: NCGInterp
 
 function dump_cfg(f, argtypes, label)
     println("\n========== ", label, " ==========")
-    interp = WasmInterp()
+    interp = NCGInterp()
     tt = Base.signature_type(f, argtypes)
     m = Base._methods_by_ftype(tt, -1, interp.world)
     mi = Core.Compiler.specialize_method(m[1].method, tt, Core.svec())

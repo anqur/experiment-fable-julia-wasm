@@ -9,7 +9,7 @@ end
 
 println("=== Debugging Invoke Argument Structure ===")
 
-interp = NativeCodegen.WasmCodegen.WasmInterp()
+interp = NativeCodegen.NCGInterp()
 tt = Base.signature_type(string_length_test, Tuple{String})
 matches = Base._methods_by_ftype(tt, -1, interp.world)
 

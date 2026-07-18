@@ -9,7 +9,7 @@ function working_sizeof(s::String)
 end
 
 println("Working sizeof function:")
-interp = NativeCodegen.WasmCodegen.WasmInterp()
+interp = NativeCodegen.NCGInterp()
 clif1 = NativeCodegen.compile_to_clif(interp, working_sizeof, Tuple{String})
 println(clif1)
 

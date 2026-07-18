@@ -1,6 +1,6 @@
-using NativeCodegen: WasmInterp
+using NativeCodegen: NCGInterp
 import Base.JuliaSyntax as JS
-interp = WasmInterp()
+interp = NCGInterp()
 tt = Base.signature_type(JS.parse!, Tuple{JS.ParseStream})
 ms = Base._methods_by_ftype(tt, -1, interp.world)
 mi0 = Core.Compiler.specialize_method(ms[1].method, tt, Core.svec())

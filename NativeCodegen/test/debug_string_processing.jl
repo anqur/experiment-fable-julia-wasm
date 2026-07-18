@@ -16,7 +16,7 @@ end
 
 println("\nGenerating CLIF for process_string:")
 try
-    interp = NativeCodegen.WasmCodegen.WasmInterp()
+    interp = NativeCodegen.NCGInterp()
     clif = NativeCodegen.compile_to_clif(interp, process_string, Tuple{String})
     println(clif)
 catch e

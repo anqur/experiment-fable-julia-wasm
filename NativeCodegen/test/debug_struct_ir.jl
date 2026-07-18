@@ -1,7 +1,7 @@
 # Explore struct-related IR patterns under WasmInterp
 # Usage: julia +nightly --project=. NativeCodegen/test/debug_struct_ir.jl
 
-using WasmCodegen: WasmInterp, scalar_repr
+using NativeCodegen: NCGInterp, scalar_repr
 using NativeCodegen
 
 # === Struct definitions ===
@@ -19,7 +19,7 @@ end
 # === Helper: inspect IR for a function ===
 
 function inspect_ir(f, argtypes)
-    interp = WasmInterp()
+    interp = NCGInterp()
     tt = Base.signature_type(f, argtypes)
     matches = Base._methods_by_ftype(tt, -1, interp.world)
     mi = Core.Compiler.specialize_method(matches[1].method, tt, Core.svec())

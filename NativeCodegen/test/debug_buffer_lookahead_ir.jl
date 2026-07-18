@@ -1,5 +1,5 @@
 using NativeCodegen
-using NativeCodegen: WasmInterp, compile_native, CompileError
+using NativeCodegen: NCGInterp, compile_native, CompileError
 import JuliaSyntax
 import JuliaSyntax.Tokenize: next_token
 import JuliaSyntax: ParseStream
@@ -8,7 +8,7 @@ const JLexer = JuliaSyntax.Tokenize.Lexer{IOBuffer}
 
 function dump_ir(f, argtypes, label)
     println("--- ", label, " ---")
-    interp = WasmInterp()
+    interp = NCGInterp()
     tt = Base.signature_type(f, argtypes)
     m = Base._methods_by_ftype(tt, -1, interp.world)
     isempty(m) && (println("  (no method found)"); return)
@@ -23,7 +23,7 @@ function dump_ir(f, argtypes, label)
     return ir, rt
 end
 
-interp = WasmInterp()
+interp = NCGInterp()
 
 println("\n========== __lookahead_index overlay IR ==========")
 dump_ir(JuliaSyntax.__lookahead_index, Tuple{ParseStream, Int, Bool}, "__lookahead_index(ParseStream, Int, Bool)")

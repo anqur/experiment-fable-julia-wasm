@@ -1,14 +1,14 @@
 # Trace the memoryref tracking to debug :not_atomic issue
 # Usage: julia +nightly --project=. NativeCodegen/test/debug_trace_memref.jl
 
-using WasmCodegen: WasmInterp
+using NativeCodegen: NCGInterp
 
 function ar_inb_get(a::Vector{Int64},i::Int64)
     @inbounds r = a[i]
     return r
 end
 
-interp = WasmInterp()
+interp = NCGInterp()
 tt = Base.signature_type(ar_inb_get, Tuple{Vector{Int64}, Int64})
 matches = Base._methods_by_ftype(tt, -1, interp.world)
 mi = Core.Compiler.specialize_method(matches[1].method, tt, Core.svec())

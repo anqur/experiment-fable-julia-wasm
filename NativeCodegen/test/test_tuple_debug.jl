@@ -1,7 +1,7 @@
 # Debug tuple expression structure
 
 using NativeCodegen
-using NativeCodegen: WasmInterp
+using NativeCodegen: NCGInterp
 
 function test_tuple_debug()
     return (1, 2)
@@ -9,7 +9,7 @@ end
 
 println("Investigating tuple expression structure...")
 try
-    interp = WasmInterp()
+    interp = NCGInterp()
     tt = Base.signature_type(test_tuple_debug, Tuple{})
     matches = Base._methods_by_ftype(tt, -1, interp.world)
     mi = Core.Compiler.specialize_method(matches[1].method, tt, Core.svec())

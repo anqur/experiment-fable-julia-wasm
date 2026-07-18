@@ -2,28 +2,25 @@
     NativeCodegen
 
 Translator from Julia's optimized SSA IR (`IRCode`) to native machine code via
-Cranelift. Reuses WasmCodegen's frontend.
+Cranelift. A standalone native-codegen project — no Wasm dependency.
 """
 module NativeCodegen
 
 using Libdl
-using WasmCodegen: WasmCodegen, WasmInterp, CompileError
-const ScalarRepr = WasmCodegen.ScalarRepr
-const _SCALAR_REPRS = WasmCodegen._SCALAR_REPRS
-const scalar_repr = WasmCodegen.scalar_repr
-const isghost = WasmCodegen.isghost
-const ghost_instance = WasmCodegen.ghost_instance
-const wasm_valtype = WasmCodegen.wasm_valtype
-const valkind_sym = WasmCodegen.valkind_sym
-const from_wire = WasmCodegen.from_wire
-const to_wire = WasmCodegen.to_wire
-const INTERCEPTS = WasmCodegen.INTERCEPTS
-const EXTERNREF_TYPES = WasmCodegen.EXTERNREF_TYPES
-const register_externref_type! = WasmCodegen.register_externref_type!
-const register_import_intercept! = WasmCodegen.register_import_intercept!
+using UnicodeNext
+
+# === Target-agnostic frontend (formerly WasmCodegen) ===
+
+"""Raised when a Julia construct has no native translation (yet)."""
+struct CompileError <: Exception
+    msg::String
+end
+Base.showerror(io::IO, e::CompileError) = print(io, "CompileError: ", e.msg)
+
 const CC = Core.Compiler
 
 include("reprs.jl")
+include("charmap.jl")
 include("interp.jl")
 include("intrinsics.jl")
 include("builder_emit.jl")
@@ -84,7 +81,7 @@ function _debug_artifact(target_dir, lib_name)
 end
 
 function compile_native(f, argtypes::Type{<:Tuple}; name::String="entry")
-    interp = WasmInterp()
+    interp = NCGInterp()
     symbol = ENTRY_SYMBOL_PREFIX * name
     temp_obj = tempname() * ".o"
     emit_module_via_builder(interp, f, argtypes; name=symbol, output_path=temp_obj)
@@ -253,6 +250,6 @@ function compile_and_call(f, rettype::Type, argtypes::Type{<:Tuple}, args...; na
     return result
 end
 
-export compile_native, native_callable, native_callable_from_so, compile_and_call, NativeCompilation, CompileError
+export compile_native, native_callable, native_callable_from_so, compile_and_call, NativeCompilation, CompileError, NCGInterp
 
 end # module NativeCodegen

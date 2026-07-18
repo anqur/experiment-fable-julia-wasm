@@ -1,10 +1,10 @@
 using NativeCodegen
-using NativeCodegen: WasmInterp
+using NativeCodegen: NCGInterp
 
 # Minimal pop! to debug
 popone(a::Vector{Int64}) = pop!(a)
 
-interp = WasmInterp()
+interp = NCGInterp()
 tt = Base.signature_type(popone, Tuple{Vector{Int64}})
 m = Base._methods_by_ftype(tt, -1, interp.world)
 mi = Core.Compiler.specialize_method(m[1].method, tt, Core.svec())

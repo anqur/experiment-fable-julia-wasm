@@ -1,14 +1,14 @@
 # Verify that ObjectModule can declare imported functions and call them
 # Usage: julia +nightly --project=. NativeCodegen/test/debug_array_alloc.jl
 
-using WasmCodegen: WasmInterp
+using NativeCodegen: NCGInterp
 
 # Check what IR array allocation generates
 function make_array(n::Int64)
     return Vector{Int64}(undef, n)
 end
 
-interp = WasmInterp()
+interp = NCGInterp()
 tt = Base.signature_type(make_array, Tuple{Int64})
 matches = Base._methods_by_ftype(tt, -1, interp.world)
 mi = Core.Compiler.specialize_method(matches[1].method, tt, Core.svec())

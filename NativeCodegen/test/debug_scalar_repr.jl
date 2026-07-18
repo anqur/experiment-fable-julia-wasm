@@ -1,7 +1,7 @@
 # Debug scalar_repr issues
 
 using NativeCodegen
-using WasmCodegen: scalar_repr
+using NativeCodegen: scalar_repr
 
 println("=== Testing scalar_repr on common types ===")
 

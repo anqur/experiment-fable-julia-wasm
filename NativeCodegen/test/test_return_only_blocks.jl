@@ -57,7 +57,7 @@ end
 
 println("\nTest 3: Direct constant returns")
 try
-    interp = NativeCodegen.WasmCodegen.WasmInterp()
+    interp = NativeCodegen.NCGInterp()
     clif = NativeCodegen.compile_to_clif(interp, test_const_returns, Tuple{Int})
     println("Generated CLIF:")
     println(clif)

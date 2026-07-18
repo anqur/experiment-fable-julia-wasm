@@ -1,12 +1,12 @@
 # Probe2: Broader JuliaSyntax compilation coverage
 # Tests: varargs, loops, recursion, string/array construction, pointer ops, continue
 using NativeCodegen
-using NativeCodegen: WasmInterp, CompileError
+using NativeCodegen: NCGInterp, CompileError
 import JuliaSyntax
 
 function dump_ir(f, argtypes, label)
     println("--- ", label, " ---")
-    interp = WasmInterp()
+    interp = NCGInterp()
     tt = Base.signature_type(f, argtypes)
     m = Base._methods_by_ftype(tt, -1, interp.world)
     isempty(m) && (println("  (no method found)"); return nothing, nothing)

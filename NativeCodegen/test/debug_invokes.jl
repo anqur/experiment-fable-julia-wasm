@@ -11,7 +11,7 @@ end
 
 println("1. isempty(String):")
 try
-    interp = NativeCodegen.WasmCodegen.WasmInterp()
+    interp = NativeCodegen.NCGInterp()
     clif = NativeCodegen.compile_to_clif(interp, string_isempty, Tuple{String})
     println(clif)
 catch e
@@ -25,7 +25,7 @@ end
 
 println("\n2. first(String):")
 try
-    interp = NativeCodegen.WasmCodegen.WasmInterp()
+    interp = NativeCodegen.NCGInterp()
     clif = NativeCodegen.compile_to_clif(interp, string_first, Tuple{String})
     println(clif)
 catch e
@@ -39,7 +39,7 @@ end
 
 println("\n3. last(String):")
 try
-    interp = NativeCodegen.WasmCodegen.WasmInterp()
+    interp = NativeCodegen.NCGInterp()
     clif = NativeCodegen.compile_to_clif(interp, string_last, Tuple{String})
     println(clif)
 catch e

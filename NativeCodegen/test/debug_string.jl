@@ -10,7 +10,7 @@ function string_sizeof_test(s::String)
 end
 
 println("\n1. Testing sizeof(String):")
-interp = NativeCodegen.WasmCodegen.WasmInterp()
+interp = NativeCodegen.NCGInterp()
 try
     clif = NativeCodegen.compile_to_clif(interp, string_sizeof_test, Tuple{String})
     println("Generated CLIF:")

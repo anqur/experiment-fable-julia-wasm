@@ -1,7 +1,7 @@
 # Dump IR for conversion + float-math + bit-op intrinsics to confirm arg order.
 # Usage: julia +nightly --project=. NativeCodegen/test/debug_conv_ir.jl
 
-using WasmCodegen: WasmInterp
+using NativeCodegen: NCGInterp
 
 function sitofp_demo(x::Int64)::Float64; return Float64(x); end
 function uitofp_demo(x::UInt64)::Float64; return Float64(x); end
@@ -19,7 +19,7 @@ function flipsign_demo(x::Int64, y::Int64)::Int64; return flipsign(x, y); end
 function absint_demo(x::Int64)::Int64; return abs(x); end
 
 function dump_ir(f, argtypes, label)
-    interp = WasmInterp()
+    interp = NCGInterp()
     tt = Base.signature_type(f, argtypes)
     matches = Base._methods_by_ftype(tt, -1, interp.world)
     mi = Core.Compiler.specialize_method(matches[1].method, tt, Core.svec())

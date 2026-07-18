@@ -6,7 +6,7 @@ using Core.Compiler
 println("=== Getting optimized IR for peek_token ===")
 
 # Use the NativeCodegen overlay interpreter
-overlay = NativeCodegen.WasmInterp.NativeOverlayInterpreter()
+overlay = NativeCodegen.NCGInterp()
 
 # Get the method instance for peek_token(ParseStream, Int)
 sig = Tuple{typeof(JS.peek_token), JS.ParseStream, Int}

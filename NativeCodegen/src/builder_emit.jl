@@ -1,8 +1,6 @@
 # eDSL builder emitter for Julia IRCode → Cranelift IR via Rust FFI
 # Direct Cranelift emission: each FFI call immediately emits one instruction.
 
-using WasmCodegen: ScalarRepr, scalar_repr, isghost, wasm_valtype
-
 # === Type enums (must match Rust builder.rs) ===
 const TYPE_I32 = UInt32(0)
 const TYPE_I64 = UInt32(1)
@@ -83,8 +81,8 @@ function cranelift_type(T)
     _is_heap_struct(T) && return TYPE_PTR
     r = try scalar_repr(T) catch _; nothing end
     if r !== nothing
-        return r.vt == WasmCodegen.I64 ? TYPE_I64 : r.vt == WasmCodegen.I32 ? TYPE_I32 :
-               r.vt == WasmCodegen.F64 ? TYPE_F64 : TYPE_F32
+        return r.vt == I64 ? TYPE_I64 : r.vt == I32 ? TYPE_I32 :
+               r.vt == F64 ? TYPE_F64 : TYPE_F32
     end
     # Bitstypes: map to Cranelift type by sizeof
     if T isa DataType && isbitstype(T)
@@ -524,14 +522,14 @@ end
 
 mutable struct ModuleCompiler
     bc::BuilderCtx                    # shared BuilderCtx (one ObjectModule)
-    interp::WasmInterp                # shared interpreter for inference
+    interp::NCGInterp                # shared interpreter for inference
     worklist::Vector{Core.MethodInstance}  # pending functions (FIFO)
     status::Dict{Core.MethodInstance, Symbol}  # :pending / :compiled / :failed
     callee_names::Dict{Core.MethodInstance, String}  # MI → Cranelift func name
     compiled_count::Int               # counter for generating unique names
 end
 
-function ModuleCompiler(bc::BuilderCtx, interp::WasmInterp)
+function ModuleCompiler(bc::BuilderCtx, interp::NCGInterp)
     ModuleCompiler(bc, interp,
                    Core.MethodInstance[],
                    Dict{Core.MethodInstance, Symbol}(),
@@ -562,7 +560,7 @@ _ir_type(t::Type) = t
 # Compiles the ENTIRE transitive call graph of `f` into one ObjectModule.
 # Mirrors WasmCodegen's compile_wasm worklist loop (compiler.jl lines 2160-2189).
 
-function emit_module_via_builder(interp::WasmInterp, f, argtypes::Type{<:Tuple};
+function emit_module_via_builder(interp::NCGInterp, f, argtypes::Type{<:Tuple};
                                   name::String="entry", output_path::String=tempname()*".o")
     # Specialize the entry-point function
     tt = Base.signature_type(f, argtypes)

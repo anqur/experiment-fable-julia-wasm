@@ -1,4 +1,4 @@
-using NativeCodegen: compile_native, native_callable_from_so, WasmInterp
+using NativeCodegen: compile_native, native_callable_from_so, NCGInterp
 import Base.JuliaSyntax.Tokenize: _kw_hash
 
 # Minimal: index a host Memory{UInt8}

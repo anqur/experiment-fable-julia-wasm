@@ -10,7 +10,7 @@ end
 
 println("\nGenerating CLIF for simple_string_field:")
 try
-    interp = NativeCodegen.WasmCodegen.WasmInterp()
+    interp = NativeCodegen.NCGInterp()
     clif = NativeCodegen.compile_to_clif(interp, simple_string_field, Tuple{String})
     println(clif)
 catch e

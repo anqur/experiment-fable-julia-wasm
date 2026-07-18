@@ -1,7 +1,7 @@
-using NativeCodegen: WasmInterp
+using NativeCodegen: NCGInterp
 import Base.JuliaSyntax as JS
 
-interp = WasmInterp()
+interp = NCGInterp()
 
 function dump_full(f, argtypes, label)
     println("\n===== ", label, " :: ", argtypes, " =====")

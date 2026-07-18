@@ -1,7 +1,7 @@
-using NativeCodegen: WasmInterp
+using NativeCodegen: NCGInterp
 import Base.JuliaSyntax as JS
 
-interp = WasmInterp()
+interp = NCGInterp()
 const SITES = Function[]
 const SEEN = Set{Core.MethodInstance}()
 

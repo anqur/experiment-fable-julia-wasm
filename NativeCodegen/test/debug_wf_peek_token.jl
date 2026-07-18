@@ -1,8 +1,8 @@
 # Probe to get Julia IR of Base.JuliaSyntax.peek_token
-using NativeCodegen: CC, WasmInterp
+using NativeCodegen: CC, NCGInterp
 import Base.JuliaSyntax as JS
 
-const INTERP = WasmInterp()
+const INTERP = NCGInterp()
 
 # First, let's get the ParseStream type
 ps_type = JS.ParseStream

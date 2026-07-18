@@ -12,7 +12,7 @@ end
 println("Testing codeunit(String, Int):")
 try
     # First check the CLIF generation
-    interp = NativeCodegen.WasmCodegen.WasmInterp()
+    interp = NativeCodegen.NCGInterp()
     clif = NativeCodegen.compile_to_clif(interp, string_codeunit, Tuple{String, Int})
     println("Generated CLIF:")
     println(clif)

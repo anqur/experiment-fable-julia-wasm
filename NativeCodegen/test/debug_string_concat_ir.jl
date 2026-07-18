@@ -2,7 +2,7 @@
 # This script dumps the complete IRCode for various string operations
 
 using NativeCodegen
-using NativeCodegen: WasmInterp
+using NativeCodegen: NCGInterp
 using Core.Compiler
 
 println("=" ^ 80)
@@ -16,7 +16,7 @@ function dump_ir(func, argtypes::Type, name::String)
     println("Signature: $argtypes")
     println("=" ^ 80)
     
-    interp = WasmInterp()
+    interp = NCGInterp()
     tt = Base.signature_type(func, argtypes)
     
     try

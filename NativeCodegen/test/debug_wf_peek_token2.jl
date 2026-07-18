@@ -1,7 +1,7 @@
 # Probe to understand SyntaxToken and peek_token IR
-using NativeCodegen: CC, WasmInterp
+using NativeCodegen: CC, NCGInterp
 
-const INTERP = WasmInterp()
+const INTERP = NCGInterp()
 
 import Base.JuliaSyntax as JS
 

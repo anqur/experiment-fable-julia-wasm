@@ -16,7 +16,7 @@ end
 
 println("Test 1: Integer if/else")
 try
-    interp = NativeCodegen.WasmCodegen.WasmInterp()
+    interp = NativeCodegen.NCGInterp()
     clif = NativeCodegen.compile_to_clif(interp, test_int_if, Tuple{Int})
     println("Generated CLIF:")
     println(clif)
@@ -42,7 +42,7 @@ end
 
 println("\nTest 2: Arithmetic if/else")
 try
-    interp = NativeCodegen.WasmCodegen.WasmInterp()
+    interp = NativeCodegen.NCGInterp()
     clif = NativeCodegen.compile_to_clif(interp, test_arith_if, Tuple{Int})
     println("Generated CLIF:")
     println(clif)

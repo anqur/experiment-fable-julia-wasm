@@ -1,112 +1,137 @@
-# Julia → WebAssembly (WasmGC backend)
+# Julia → Native Codegen
 
-A layered stack for compiling Julia to WebAssembly using wasm's GC proposal,
-with wasmtime as the reference execution engine and the browser as the
-ultimate target.
+An ahead-of-time native compiler for Julia: compiles Julia functions through
+Cranelift's programmatic eDSL, links them with a pure-Rust runtime, and
+produces a **standalone `.so`** — callable from Rust (or any C-FFI consumer)
+with zero Julia dependency.
 
-**Live demos**, compiled from Julia's optimized IR and running entirely
-client-side:
-- the `JuliaSyntax.Tokenize` lexer, tokenizing as you type:
-  **<https://kenoaistaging.github.io/experiment-fable-julia-wasm/>**
-- the complete `JuliaSyntax.jl` parser with a live parse tree (Monaco
-  editor, nested node boxes, synced outline):
-  **<https://kenoaistaging.github.io/experiment-fable-julia-wasm/parser.html>**
+The generated `.so` is self-contained: it carries its own GC arena, type-tag
+registry, string/const bytes in `.rodata`, and keyword/operator `Dict` tables
+rebuilt at runtime — none of the Julia-heap-pointer immediates that would tether
+it to the compiling process.
+
+**Live demo:** the real `Base.JuliaSyntax` parser compiles to a `.so` and runs
+from pure Rust, matching the host:
+
+```bash
+cargo run -- examples/native_demo -- lib.so "1 + 2"   # → 7  (GreenNode count)
+```
+
+## Architecture
+
+```
+Julia source
+  → NCGInterp (overlay AbstractInterpreter)
+  → optimized Julia IRCode
+  → NativeCodegen/builder_emit.jl (IRCode → Cranelift eDSL)
+  → ccall → native-builder (Rust cdylib)
+  → Cranelift ObjectModule → .o
+  → Julia's lld + libnative_backend.a → standalone .so
+  → Libdl / pure-Rust dlopen → callable
+```
 
 ## Packages
 
-| Package | Purpose |
+| Component | Role |
 |---|---|
-| `WasmTools/` | Pure-Julia reader/writer for wasm binaries. Full wasm 3.0: WasmGC (struct/array/ref types, rec groups, subtyping), function references, tail calls, exception handling, bulk memory, multi-memory. Byte-stable round trips; fuzzed against `wasm-tools smith`. Zero dependencies. |
-| `WasmtimeRunner/` | Embeds [wasmtime](https://wasmtime.dev) via `Wasmtime_jll` (pinned to v45): load/validate/instantiate modules, call exports, define host functions backed by Julia callables, bind Julia values into wasm as `externref`. Traps and engine errors surface as Julia exceptions. |
-| `WasmCodegen/` | Translator from Julia's optimized SSA IR to wasm. Engine-agnostic (depends only on WasmTools + vendored UnicodeNext). Untranslatable callees become *offload imports* — host functions calling back into native Julia — so partial programs run end-to-end while the compiler grows. |
-| `JSRuntime/` | Browser-runtime types. `JSString` is a JS-native string (`externref`) whose operations compile to the [js-string builtins](https://github.com/WebAssembly/js-string-builtins) (`"wasm:js-string"` imports) — near-native JS string ops in the browser; the same modules run under wasmtime with the package's native UTF-16 implementations bound as imports. |
+| `NativeCodegen/` | Julia frontend: overlay interpreter, IR→Cranelift emitter, `.so` linkage |
+| `native-builder/` | Rust `cdylib`: owns Cranelift `ObjectModule` + `FunctionBuilder`, exposes eDSL emission through FFI |
+| `native-backend/` | Rust `staticlib`: pure-Rust GC (bump arena), strings, exceptions, arrays, type-tag registry, const-`Dict`/`Symbol` rebuild |
 
 ## Quick start
 
-```julia
-# julia --project=.   (the top-level environment devs all three packages)
-using WasmCodegen, WasmtimeRunner
+### Prerequisites
 
-fib(n::Int64) = n <= 1 ? n : fib(n - 1) + fib(n - 2)
-comp = compile_wasm(fib, Tuple{Int64})     # comp.bytes is the wasm binary
+- Julia nightly (`julia +nightly`) — the overlay interpreter needs `Core.Compiler.InferenceCache`
+- Rust 1.80+
 
-eng = Engine(); store = Store(eng)
-inst = instantiate(store, CompiledModule(eng, comp.bytes))
-inst["fib"](20)                            # 6765, computed inside wasmtime
+### Build
+
+```bash
+cd native-backend && cargo build && cd ..
+cd native-builder  && cargo build && cd ..
 ```
 
-The same bytes run on V8: `julia --project=. examples/node_differential.jl`
-checks native Julia, wasmtime, and Node against each other.
+### Compile and run
+
+```julia
+# julia +nightly --project=.
+using NativeCodegen
+
+add64(x::Int64, y::Int64) = x + y
+comp = compile_native(add64, Tuple{Int64, Int64})
+nf = native_callable_from_so(comp, Int64, Int64, Int64)
+nf(3, 4)  # → 7
+```
+
+### Standalone pure-Rust demo
+
+```bash
+# Compile the JuliaSyntax parser to /tmp/ncg_parse.so
+julia +nightly --project=. NativeCodegen/test/debug_standalone_parse.jl
+
+# Run from pure Rust — no Julia loaded
+cd examples/native_demo && cargo build
+cargo run -- /tmp/ncg_parse.so "1 + 2"          # → 7
+cargo run -- /tmp/ncg_parse.so "a + b + c + d"  # → 15
+```
+
+The demo builds its `String` argument with the `.so`'s own `__jl_string_from_raw`
+helper, calls the compiled `parse_into` entry, and prints the GreenNode count.
+Zero `jl_` undefined symbols (`nm -u`). The `.so` is a genuine standalone
+artifact.
 
 ## What the compiler supports
 
-- all Julia scalars (sub-word integers with a sign-correct i32 discipline,
-  `Char` as raw bits, arbitrary primitive types), full arithmetic with Julia's
-  exact semantics: total shifts, checked overflow tuples, bit ops, conversions
-- arbitrary control flow (dispatcher-loop lowering, any CFG), recursion and
-  mutual recursion across `:invoke` edges
-- **WasmGC**: structs/tuples → GC structs (packed i8/i16 fields), mutable
-  identity (`===` is `ref.eq`), `Memory{T}`/`Vector` → GC arrays (`push!` and
-  `copy` compile with zero offloads), `Union{Nothing,T}` → nullable refs,
-  general small unions of concrete types → `anyref` with per-type boxes
-- **wasm-resident strings**: `String` is a GC byte array (the WIT array+size
-  model, with GC instead of linear memory) — `codeunit`/`ncodeunits`/`==`/
-  `sizeof` are in-wasm array ops, literals live in passive data segments, and
-  `Int128` is a `{lo,hi}` struct. At the boundary strings externalize
-  (`extern.convert_any`); hosts read/build them via exported `__str_*`
-  accessors
-- **try/catch/finally via wasm-EH**: per-block `try_table` routed to the
-  innermost handler; `÷0`, overflow, bounds errors, and explicit throws are
-  catchable inside `try`
-- **overlay interpreter**: a custom `AbstractInterpreter` replaces
-  pointer-based Base primitives before inlining — memcpy/memset/memcmp
-  patterns become `array.copy`/loops, and unicode classification
-  (`category_code`, identifier predicates, grapheme breaks)
-  compiles in-wasm via vendored [UnicodeNext](https://github.com/c42f/UnicodeNext.jl)
-- **host constants**: Symbol literals become imported `externref` globals;
-  string/mutable constant tables (`Dict`, `Vector`, `Memory`) materialize as
-  wasm globals via a start function, large tables as data segments
-- **offloading**: callees with scalar/externref/String boundaries (including
-  `Union{Nothing,scalar}` returns) become `"julia"` imports bound to native
-  thunks — `parse`, `string(n, base=16)`, `exp`/`sin`/`log` run with one or
-  two leaf offloads
+- **All Julia scalars** — sub-word integers with sign-correct i32 discipline,
+  `Char` as raw bits, arbitrary primitive types; full arithmetic with Julia's
+  exact semantics: total shifts, checked overflow pairs, bit ops, conversions,
+  floats.
+- **Arbitrary control flow** — dispatcher-loop lowering, any CFG, recursion and
+  mutual recursion across `:invoke` edges.
+- **Structs, tuples, arrays** — mutable and immutable struct allocation,
+  `Memory{T}`/`Vector`, `push!`/`resize!`/`grow`, in-bounds access, `NamedTuple`.
+- **Strings** — `codeunit`/`ncodeunits`/`sizeof`/`length`, concatenation, string
+  literals via `.rodata` + `__jl_string_from_raw`.
+- **Dicts and Symbols** — const `Dict{K,V}` (keyword/precedence tables) rebuilt
+  at runtime from `.rodata` slots/keys/vals; `Symbol` interned by name for `===`
+  identity.
+- **Checked arithmetic** — `checked_sadd_int`/`checked_srem_int`/etc. materialize
+  as value+flag pairs; loop-carried `a % b` feeds phi nodes correctly.
+- **Overlay interpreter** (`NCGInterp`) — a custom `AbstractInterpreter` replaces
+  pointer-based Base primitives with loop implementations before inlining:
+  `codeunit`/`ncodeunits`, `fill!`, hash lookup via linear scan, unicode
+  classification via vendored UnicodeNext, `memcpy` substitutes.
 
-Not yet: binding the caught exception value (`catch e` with `e` used),
-exception propagation across compiled-function call boundaries, `Any`-typed
-values, dynamic dispatch, closures as values, RadixSort internals (default
-`sort!`; `InsertionSort` compiles).
+Not yet: exception handling, `Any`-typed values, dynamic dispatch, closures,
+`Union` returns across FFI.
 
-## Showcase: the JuliaSyntax lexer
+## Standalone `.so` — how it works
 
-`examples/lexer/` compiles the real `JuliaSyntax.Tokenize` lexer (no manual
-porting) into a 1.1MB module with **two** host imports: the token sink and
-`===` on Symbol constants (source text lives in wasm as a GC byte array).
-Token streams match the native lexer exactly across unicode operators,
-interpolated/triple strings, all numeric literal forms, and malformed input —
-verified under wasmtime (`examples/lexer/run_wasmtime.jl`) and V8
-(`examples/web/test_node.mjs`). Rebuild the web demo with
-`examples/lexer/build_web.jl`.
+The compiler used to bake Julia-heap addresses into `.text` as immediate
+constants (`mov x0,#imm; movk; ret`), so the `.so` only worked in the same
+Julia process. The fix resolves every value at **runtime inside the `.so`**:
 
-`examples/parser/` goes further: the complete `JuliaSyntax.jl`
-recursive-descent parser (error recovery and token validation included)
-streams its native (token, range) events out of wasm; the green parse tree is
-a host-side reconstruction (`examples/web/parser.html`). Matches native
-event-for-event on a 46-input corpus and on JuliaSyntax's own `parser.jl`
-under both wasmtime and V8.
+| Value | Runtime mechanism |
+|---|---|
+| type pointers / `nothing` sentinel | `__jl_type_tag(id)` — `TYPE_TABLE` registry |
+| `String` literals | `.rodata` bytes + `__jl_string_from_raw` |
+| `Vector{bits}` tables | `.rodata` elements + `__jl_array_alias_rodata` |
+| `Dict{K,V}` tables | `.rodata` slots/keys/vals + `__jl_dict_from_rodata` |
+| `Symbol` | `.rodata` name + `__jl_intern_symbol` (interned `===`) |
+| `>8-byte bitstypes` / `VersionNumber` / `NamedTuple` | `.rodata` bytes + `__jl_bytes_dup` |
+
+Const rebuilds are memoized by `.rodata` address (`RODATA_CACHE`) so each const
+is built once per parse, not per use. `__jl_gc_reset` clears the arena and all
+caches between inputs.
 
 ## Testing
 
-Differential testing at every layer: `WasmTools` round-trips byte-stably and
-is fuzzed against `wasm-tools smith`; `WasmCodegen`'s harness runs every
-corpus function natively and in wasmtime (values must `isequal`, Julia
-exceptions must become traps/exceptions); `examples/node_differential.jl`
-repeats the comparison on V8. Run a package's suite directly:
-`julia --project=. WasmCodegen/test/runtests.jl`.
+```bash
+# Core regression suite (93 ✅ / 0 ❌)
+julia +nightly --project=. NativeCodegen/test/test_edsl_approach.jl
 
-## Toolchain notes
-
-- `Wasmtime_jll` is compat-pinned to v45, matching the ABI contracts verified
-  in `WasmtimeRunner/src/abi.jl`; `ENV["WASMTIME_LIB"]` overrides.
-- Tests use the `wasm-tools` binary if present at `tools/wasm-tools-dist/`
-  (release v1.251.0) and skip external validation otherwise; `tools/` also
-  carries the wasmtime v45 C headers for ABI probes (see `CLAUDE.md`).
+# Rust builds
+cd native-backend && cargo build
+cd native-builder  && cargo build
+```

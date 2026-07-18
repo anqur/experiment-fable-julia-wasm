@@ -1,5 +1,5 @@
-using NativeCodegen: WasmInterp
-interp = WasmInterp()
+using NativeCodegen: NCGInterp
+interp = NCGInterp()
 println("===== Core.throw_inexacterror IR =====")
 tt = Base.signature_type(Core.throw_inexacterror,
                          Tuple{Symbol, Type, Int64})

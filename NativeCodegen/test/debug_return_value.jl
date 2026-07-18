@@ -10,7 +10,7 @@ function string_length_field(s::String)
     return l
 end
 
-interp = NativeCodegen.WasmCodegen.WasmInterp()
+interp = NativeCodegen.NCGInterp()
 tt = Base.signature_type(string_length_field, Tuple{String})
 matches = Base._methods_by_ftype(tt, -1, interp.world)
 

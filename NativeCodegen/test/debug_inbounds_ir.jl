@@ -1,10 +1,10 @@
 # Explore @inbounds and simpler array access patterns
 # Usage: julia +nightly --project=. NativeCodegen/test/debug_inbounds_ir.jl
 
-using WasmCodegen: WasmInterp
+using NativeCodegen: NCGInterp
 
 function inspect_ir(f, argtypes)
-    interp = WasmInterp()
+    interp = NCGInterp()
     tt = Base.signature_type(f, argtypes)
     matches = Base._methods_by_ftype(tt, -1, interp.world)
     mi = Core.Compiler.specialize_method(matches[1].method, tt, Core.svec())

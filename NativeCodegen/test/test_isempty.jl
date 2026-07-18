@@ -12,7 +12,7 @@ end
 println("Testing isempty(String):")
 try
     # First check the CLIF generation
-    interp = NativeCodegen.WasmCodegen.WasmInterp()
+    interp = NativeCodegen.NCGInterp()
     clif = NativeCodegen.compile_to_clif(interp, string_isempty, Tuple{String})
     println("Generated CLIF:")
     println(clif)

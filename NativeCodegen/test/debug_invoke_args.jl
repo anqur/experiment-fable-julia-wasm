@@ -9,7 +9,7 @@ function string_isempty(s::String)
     return isempty(s)
 end
 
-interp = NativeCodegen.WasmCodegen.WasmInterp()
+interp = NativeCodegen.NCGInterp()
 tt = Base.signature_type(string_isempty, Tuple{String})
 matches = Base._methods_by_ftype(tt, -1, interp.world)
 

@@ -7,7 +7,7 @@ function make_string()
 end
 
 println("Checking CLIF for constant string return:")
-interp = NativeCodegen.WasmCodegen.WasmInterp()
+interp = NativeCodegen.NCGInterp()
 try
     clif = NativeCodegen.compile_to_clif(interp, make_string, Tuple{})
     println(clif)

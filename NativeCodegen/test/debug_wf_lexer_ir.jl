@@ -1,6 +1,6 @@
-using NativeCodegen: CC, WasmInterp
+using NativeCodegen: CC, NCGInterp
 import Base.JuliaSyntax as JS
-const INTERP = WasmInterp()
+const INTERP = NCGInterp()
 
 f = JS._buffer_lookahead_tokens
 tt = Base.signature_type(f, Tuple{Any, Any})

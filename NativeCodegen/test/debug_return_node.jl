@@ -9,7 +9,7 @@ function simple_string_field(s::String)
     return getfield(s, :length)
 end
 
-interp = NativeCodegen.WasmCodegen.WasmInterp()
+interp = NativeCodegen.NCGInterp()
 tt = Base.signature_type(simple_string_field, Tuple{String})
 matches = Base._methods_by_ftype(tt, -1, interp.world)
 

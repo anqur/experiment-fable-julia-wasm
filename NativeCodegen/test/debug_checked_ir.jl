@@ -1,7 +1,7 @@
 # Dump IR for checked-arithmetic intrinsics to confirm the ssapair + getfield shape.
 # Usage: julia +nightly --project=. NativeCodegen/test/debug_checked_ir.jl
 
-using WasmCodegen: WasmInterp
+using NativeCodegen: NCGInterp
 
 # Base.Checked entrypoints → checked_{s,u}{add,sub,mul}_int.
 csadd(a::Int64, b::Int64)  = Base.Checked.add(a, b)
@@ -16,7 +16,7 @@ csi32(a::Int32, b::Int32) = Base.Checked.add(a, b)
 raw_csa(a::Int64, b::Int64) = Core.Intrinsics.checked_sadd_int(a, b)
 
 function dump_ir(f, argtypes, label)
-    interp = WasmInterp()
+    interp = NCGInterp()
     tt = Base.signature_type(f, argtypes)
     matches = Base._methods_by_ftype(tt, -1, interp.world)
     mi = Core.Compiler.specialize_method(matches[1].method, tt, Core.svec())

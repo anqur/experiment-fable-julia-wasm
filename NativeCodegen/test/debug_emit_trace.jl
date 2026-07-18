@@ -1,5 +1,5 @@
 using NativeCodegen
-using NativeCodegen: WasmInterp, BuilderCtx, emit_instruction, emit_call_runtime
+using NativeCodegen: NCGInterp, BuilderCtx, emit_instruction, emit_call_runtime
 
 # Monkey-patch emit_instruction to trace memoryrefnew and memoryrefget
 const ORIG_EMIT_INSTRUCTION = emit_instruction

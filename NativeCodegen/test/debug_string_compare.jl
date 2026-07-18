@@ -9,7 +9,7 @@ function string_eq(s1::String, s2::String)
 end
 
 println("Generating CLIF for string_eq:")
-interp = NativeCodegen.WasmCodegen.WasmInterp()
+interp = NativeCodegen.NCGInterp()
 try
     clif = NativeCodegen.compile_to_clif(interp, string_eq, Tuple{String, String})
     println("Generated CLIF:")

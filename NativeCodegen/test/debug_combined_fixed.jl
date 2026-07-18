@@ -15,7 +15,7 @@ end
 
 println("=== Testing Fixed Combined Function ===")
 
-interp = NativeCodegen.WasmCodegen.WasmInterp()
+interp = NativeCodegen.NCGInterp()
 clif = NativeCodegen.compile_to_clif(interp, test_combined, Tuple{String})
 println("Generated CLIF:")
 println(clif)

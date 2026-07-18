@@ -12,7 +12,7 @@ end
 
 println("1. Testing isempty:")
 try
-    interp = NativeCodegen.WasmCodegen.WasmInterp()
+    interp = NativeCodegen.NCGInterp()
     comp = compile_native(test_isempty, Tuple{String})
     nf = native_callable(comp, Bool, String)
 
@@ -31,7 +31,7 @@ end
 
 println("2. Testing ncodeunits:")
 try
-    interp = NativeCodegen.WasmCodegen.WasmInterp()
+    interp = NativeCodegen.NCGInterp()
     comp = compile_native(test_ncodeunits, Tuple{String})
     nf = native_callable(comp, Int64, String)
 
@@ -50,7 +50,7 @@ end
 
 println("3. Testing lastindex:")
 try
-    interp = NativeCodegen.WasmCodegen.WasmInterp()
+    interp = NativeCodegen.NCGInterp()
     comp = compile_native(test_lastindex, Tuple{String})
     nf = native_callable(comp, Int64, String)
 
@@ -69,7 +69,7 @@ end
 
 println("4. Testing length:")
 try
-    interp = NativeCodegen.WasmCodegen.WasmInterp()
+    interp = NativeCodegen.NCGInterp()
     comp = compile_native(test_length, Tuple{String})
     nf = native_callable(comp, Int64, String)
 
@@ -88,7 +88,7 @@ end
 
 println("5. Testing codeunit (infrastructure):")
 try
-    interp = NativeCodegen.WasmCodegen.WasmInterp()
+    interp = NativeCodegen.NCGInterp()
     comp = compile_native(test_codeunit, Tuple{String, Int})
     nf = native_callable(comp, UInt8, String, Int)
 
@@ -114,7 +114,7 @@ end
 
 println("6. Testing combined operations:")
 try
-    interp = NativeCodegen.WasmCodegen.WasmInterp()
+    interp = NativeCodegen.NCGInterp()
     comp = compile_native(test_combined, Tuple{String})
     nf = native_callable(comp, Int64, String)
 

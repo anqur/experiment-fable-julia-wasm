@@ -17,7 +17,7 @@ block0(v0: i64):
 println("Test 1: Single block CLIF")
 println(clif_single_block)
 try
-    interp = NativeCodegen.WasmCodegen.WasmInterp()
+    interp = NativeCodegen.NCGInterp()
     # Try to compile this CLIF directly
     println("✓ Single block format looks valid")
 catch e
@@ -41,7 +41,7 @@ block2:
 println("\nTest 2: Two block CLIF")
 println(clif_two_blocks)
 try
-    interp = NativeCodegen.WasmCodegen.WasmInterp()
+    interp = NativeCodegen.NCGInterp()
     # Try to compile this CLIF directly
     println("✓ Two block format looks valid")
 catch e
@@ -65,7 +65,7 @@ function %test_if(i64) -> i64 {
 println("\nTest 3: Two block CLIF with indentation")
 println(clif_two_blocks_indented)
 try
-    interp = NativeCodegen.WasmCodegen.WasmInterp()
+    interp = NativeCodegen.NCGInterp()
     # Try to compile this CLIF directly
     println("✓ Two block format with indentation looks valid")
 catch e

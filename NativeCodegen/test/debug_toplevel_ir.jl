@@ -1,6 +1,6 @@
-using NativeCodegen: WasmInterp
+using NativeCodegen: NCGInterp
 import Base.JuliaSyntax as JS
-interp = WasmInterp()
+interp = NCGInterp()
 # parse_toplevel isn't directly callable; get it via the parse! call graph.
 tt = Base.signature_type(JS.parse!, Tuple{JS.ParseStream})
 ms = Base._methods_by_ftype(tt, -1, interp.world)

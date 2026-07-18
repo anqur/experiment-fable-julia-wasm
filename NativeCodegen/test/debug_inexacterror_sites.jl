@@ -1,4 +1,4 @@
-using NativeCodegen: WasmInterp
+using NativeCodegen: NCGInterp
 import Base.JuliaSyntax as JS
 
 # Statically find every throw_inexacterror call site across the parse! callees,
@@ -6,7 +6,7 @@ import Base.JuliaSyntax as JS
 # 4+-arg calls. We mirror the recursive pipeline's callee discovery minimally:
 # specialize parse!(::ParseStream) and walk the inferred call graph via code_ircode.
 
-interp = WasmInterp()
+interp = NCGInterp()
 
 # Collect IRCode for parse! and everything it (transitively) :invoke/:calls.
 # We approximate by getting IRCode for the entry and recursing through :invoke

@@ -1,10 +1,10 @@
 using NativeCodegen
-using NativeCodegen: WasmInterp, compile_native, CompileError
+using NativeCodegen: NCGInterp, compile_native, CompileError
 import JuliaSyntax
 
 function dump_ir(f, argtypes, label)
     println("--- ", label, " ---")
-    interp = WasmInterp()
+    interp = NCGInterp()
     tt = Base.signature_type(f, argtypes)
     m = Base._methods_by_ftype(tt, -1, interp.world)
     isempty(m) && (println("  (no method found)"); return)

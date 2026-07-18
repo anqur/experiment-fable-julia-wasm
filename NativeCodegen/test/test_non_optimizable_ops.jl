@@ -30,7 +30,7 @@ end
 # Test 2: Check the CLIF generation
 println("\nTest 2: Check CLIF generation")
 try
-    interp = NativeCodegen.WasmCodegen.WasmInterp()
+    interp = NativeCodegen.NCGInterp()
     clif = NativeCodegen.compile_to_clif(interp, test_meaningful_ops, Tuple{Int})
     println("Generated CLIF:")
     println(clif)

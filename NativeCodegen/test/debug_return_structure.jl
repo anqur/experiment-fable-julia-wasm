@@ -1,7 +1,7 @@
 # Debug return statement structure
 
 using NativeCodegen
-using NativeCodegen: WasmInterp
+using NativeCodegen: NCGInterp
 
 function test_tuple_return_debug()
     x = 1
@@ -11,7 +11,7 @@ end
 
 println("Investigating return structure...")
 try
-    interp = WasmInterp()
+    interp = NCGInterp()
     tt = Base.signature_type(test_tuple_return_debug, Tuple{})
     matches = Base._methods_by_ftype(tt, -1, interp.world)
     mi = Core.Compiler.specialize_method(matches[1].method, tt, Core.svec())

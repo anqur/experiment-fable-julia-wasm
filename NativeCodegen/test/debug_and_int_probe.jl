@@ -1,5 +1,5 @@
 using NativeCodegen
-using NativeCodegen: WasmInterp, compile_native, native_callable_from_so, CompileError
+using NativeCodegen: NCGInterp, compile_native, native_callable_from_so, CompileError
 import Base.JuliaSyntax as JS
 
 _head_bits(h::JS.SyntaxHead) =

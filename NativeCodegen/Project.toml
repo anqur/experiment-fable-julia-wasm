@@ -5,13 +5,13 @@ version = "0.1.0"
 
 [deps]
 Libdl = "8f399da3-3557-5675-b5ff-fb832c97cbdb"
-WasmCodegen = "2a3016f4-244f-4553-97d3-d07103519a17"
+UnicodeNext = "7b9d9d2f-29eb-4111-b31d-f1cfc33d1412"
 
 [compat]
 julia = "1.14"
 
 [sources]
-WasmCodegen = {path = "../WasmCodegen"}
+UnicodeNext = {path = "../vendor/UnicodeNext"}
 
 [extras]
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"

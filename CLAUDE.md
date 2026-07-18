@@ -1,16 +1,11 @@
-# Julia → WasmGC + Native Codegen
+# Julia → Native Codegen
 
-Monorepo that compiles Julia through two targets:
+Native-ahead-of-time compiler for Julia: compiles Julia functions through
+Cranelift's programmatic eDSL (`ObjectModule` + `FunctionBuilder`) and links
+them with a pure-Rust runtime (`native-backend`) into a standalone `.so` —
+callable from pure Rust (or any C-FFI consumer) with zero Julia dependency.
 
-- **Wasm:** `WasmTools` (binary format), `WasmtimeRunner` (wasmtime C API),
-  `WasmCodegen` (IRCode → WasmGC), and `JSRuntime` (browser-runtime types).
-- **Native:** `NativeCodegen` (Julia frontend → eDSL FFI), `native-builder`
-  (Cranelift ObjectModule → `.o`), and `native-backend` (Rust runtime static
-  library), linked by Julia's lld into a standalone `.so`.
-
-**CLIF text is abandoned.** Native compilation exclusively uses Cranelift's
-programmatic eDSL (`ObjectModule` and `FunctionBuilder`); never add CLIF
-serialization or parsing.
+**CLIF text is abandoned.** Never add CLIF serialization or parsing.
 
 ## Environment
 
@@ -85,20 +80,20 @@ Julia source
   checks this after linking; `nm -u out.so | grep jl_` must be empty. libc/libm
   symbols are legitimate unresolved host-process dependencies.
 
-### Reused WasmCodegen pieces
+### Shared frontend facilities
 
-Do not rebuild target-agnostic frontend facilities. `NativeCodegen.jl` imports:
+These target-agnostic facilities live in `NativeCodegen/src/` (formerly in the now-removed WasmCodegen):
 
 | Facility | Source | Use |
 |---|---|---|
-| `WasmInterp` | `WasmCodegen/src/interp.jl` | Overlay `AbstractInterpreter` replacing pointer primitives with loop implementations |
-| `ScalarRepr`, `_SCALAR_REPRS` | `WasmCodegen/src/reprs.jl` | Julia type → wire-width representation |
-| `scalar_repr`, `isghost`, `ghost_instance` | `WasmCodegen/src/reprs.jl` | Representation/type queries |
-| `from_wire`, `to_wire` | `WasmCodegen/src/reprs.jl` | Julia ↔ wire conversion |
-| `CompileError` | `WasmCodegen/src/WasmCodegen.jl` | Unsupported-lowering error |
+| `NCGInterp` | `NativeCodegen/src/interp.jl` | Overlay `AbstractInterpreter` replacing pointer primitives with loop implementations |
+| `ScalarRepr`, `_SCALAR_REPRS` | `NativeCodegen/src/reprs.jl` | Julia type → wire-width representation |
+| `scalar_repr`, `isghost`, `ghost_instance` | `NativeCodegen/src/reprs.jl` | Representation/type queries |
+| `from_wire`, `to_wire` | `NativeCodegen/src/reprs.jl` | Julia ↔ wire conversion |
+| `CompileError` | `NativeCodegen/src/NativeCodegen.jl` | Unsupported-lowering error |
 | `CC` | Julia compiler internals | `Core.Compiler` alias |
 
-The shared `WASM_MT` overlay table also provides loop-based replacements for
+The `NCG_MT` overlay table also provides loop-based replacements for
 pointer-dependent Base operations such as `codeunit`, `ncodeunits`, copying,
 `fill!`, hash lookup, and `findnext`.
 
@@ -211,8 +206,8 @@ functions for `.so` byte/IR inspection.
 
 ## Adding native features
 
-1. Reuse a WasmCodegen facility if it already implements the target-independent
-   part; do not duplicate it.
+1. Reuse an existing facility in `NativeCodegen/src/` if it already implements the
+   target-independent part; do not duplicate it.
 2. For IR lowering, add the handler in `builder_emit.jl` and the needed eDSL
    operation in `native-builder` (`builder.rs`, with an FFI wrapper in `lib.rs`).
 3. For runtime support, add a `#[no_mangle] pub unsafe extern "C" fn` to
@@ -429,16 +424,3 @@ functions for `.so` byte/IR inspection.
 - When rethrowing from emission, preserve a real terminator in the current block.
   Otherwise later block switching produces misleading invalid-block/no-terminator
   verifier errors; use `NCG_TRACE_RETHROW` to identify the original exception.
-
-## Wasm conventions
-
-- Correctness requires differential tests in `WasmCodegen/test/runtests.jl`
-  (`@difftest` cases). Unsupported lowering must raise `CompileError`, never
-  silently approximate behavior.
-- `WasmTools` must satisfy byte-identical `encode(decode(bytes))` for binaries it
-  produces.
-- `Int8`/`Int16` and unsigned counterparts occupy i32; renormalize after
-  arithmetic with the Wasm `emit_norm!` convention.
-- WasmGC strings are `{bytes::(array mut i8)}` and use `__str_*` accessors.
-  `JSRuntime.JSString` is an engine-resident `externref` lowered through
-  `wasm:js-string` imports.
