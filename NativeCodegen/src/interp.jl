@@ -32,10 +32,10 @@ CC.method_table(interp::NCGInterp) = CC.OverlayMethodTable(interp.world, NCG_MT)
 # so we replace them with pure-Julia backed by charmap.jl + vendored UnicodeNext.
 
 Base.Experimental.@overlay NCG_MT Base.is_id_start_char(c::Char) =
-    wasm_id_start_char(UInt32(c))
+    ncg_id_start_char(UInt32(c))
 
 Base.Experimental.@overlay NCG_MT Base.is_id_char(c::Char) =
-    wasm_id_char(UInt32(c))
+    ncg_id_char(UInt32(c))
 
 Base.Experimental.@overlay NCG_MT Base.Unicode.category_code(c::Char) =
     Int32(Base.ismalformed(c) ? 31 : UnicodeNext.category_code(UInt32(c)))

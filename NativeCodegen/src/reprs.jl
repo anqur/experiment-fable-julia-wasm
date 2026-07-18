@@ -90,7 +90,7 @@ end
 The value type carrying values of Julia type `T`, `nothing` for ghosts.
 Throws `CompileError` for unsupported types.
 """
-function wasm_valtype(@nospecialize T)
+function ncg_valtype(@nospecialize T)
     isghost(T) && return nothing
     r = scalar_repr(T)
     r === nothing && throw(CompileError("unsupported Julia type $T"))

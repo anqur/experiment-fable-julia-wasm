@@ -77,7 +77,7 @@ function _is_wc_cat_id_start(wc::UInt32, cat::Int32)
             (wc >= 0x1D7CE && wc <= 0x1D7E1))  # 𝟎-𝟗, 𝟘-𝟡
 end
 
-function wasm_id_start_char(wc::UInt32)
+function ncg_id_start_char(wc::UInt32)
     (wc >= UInt32('A') && wc <= UInt32('Z')) && return true
     (wc >= UInt32('a') && wc <= UInt32('z')) && return true
     wc == UInt32('_') && return true
@@ -86,7 +86,7 @@ function wasm_id_start_char(wc::UInt32)
     return _is_wc_cat_id_start(wc, Int32(UnicodeNext.category_code(wc)))
 end
 
-function wasm_id_char(wc::UInt32)
+function ncg_id_char(wc::UInt32)
     (wc >= UInt32('A') && wc <= UInt32('Z')) && return true
     (wc >= UInt32('a') && wc <= UInt32('z')) && return true
     (wc >= UInt32('0') && wc <= UInt32('9')) && return true

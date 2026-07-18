@@ -9,8 +9,8 @@ callable from pure Rust (or any C-FFI consumer) with zero Julia dependency.
 
 ## Environment
 
-- Native codegen requires **Julia nightly** (`julia +nightly`): the shared
-  WasmCodegen interpreter needs `Core.Compiler.InferenceCache`, which is absent
+- Native codegen requires **Julia nightly** (`julia +nightly`): the overlay
+  interpreter (`NCGInterp`) needs `Core.Compiler.InferenceCache`, which is absent
   from Julia 1.12 stable.
 - `native-backend` requires Rust 1.80+.
 - Set `export JULIA_DEPOT_PATH=$HOME/.julia`; `/workspace` does not exist on
@@ -36,8 +36,8 @@ win.
 ### Tests and local development
 
 - **Never use inline `julia -e` for exploratory tests.** Create descriptive `.jl`
-  files under `NativeCodegen/test/` or `WasmCodegen/test/`. Permanent native tests
-  belong in `test_edsl_approach.jl` or another `test_*.jl` file.
+  files under `NativeCodegen/test/`. Permanent native tests belong in
+  `test_edsl_approach.jl` or another `test_*.jl` file.
 - Rust `cargo test` is not wired. Validate Rust changes with `cargo build`, then
   run the relevant Julia-side tests.
 - Failed native tests must be **commented out** with `# TODO:` and their root
@@ -63,8 +63,8 @@ win.
 
 ```text
 Julia source
-  → WasmInterp (shared; do not rebuild)
-  → optimized Julia IRCode (shared; do not rebuild)
+  → NCGInterp (overlay interpreter)
+  → optimized Julia IRCode
   → NativeCodegen/builder_emit.jl
   → ccall → native-builder shared library
   → Cranelift ObjectModule → .o
@@ -82,20 +82,25 @@ Julia source
 
 ### Shared frontend facilities
 
-These target-agnostic facilities live in `NativeCodegen/src/` (formerly in the now-removed WasmCodegen):
+These target-agnostic facilities live in `NativeCodegen/src/`:
 
 | Facility | Source | Use |
 |---|---|---|
-| `NCGInterp` | `NativeCodegen/src/interp.jl` | Overlay `AbstractInterpreter` replacing pointer primitives with loop implementations |
-| `ScalarRepr`, `_SCALAR_REPRS` | `NativeCodegen/src/reprs.jl` | Julia type → wire-width representation |
+| `NCGInterp` | `NativeCodegen/src/interp.jl` | Overlay `AbstractInterpreter`; the `NCG_MT` table replaces C-call-backed Base primitives (utf8proc, memcmp, memset, objectid) with pure-Julia equivalents that the emitter can lower |
+| `ScalarRepr`, `_SCALAR_REPRS` | `NativeCodegen/src/reprs.jl` | Julia type → value representation |
 | `scalar_repr`, `isghost`, `ghost_instance` | `NativeCodegen/src/reprs.jl` | Representation/type queries |
 | `from_wire`, `to_wire` | `NativeCodegen/src/reprs.jl` | Julia ↔ wire conversion |
 | `CompileError` | `NativeCodegen/src/NativeCodegen.jl` | Unsupported-lowering error |
 | `CC` | Julia compiler internals | `Core.Compiler` alias |
 
-The `NCG_MT` overlay table also provides loop-based replacements for
-pointer-dependent Base operations such as `codeunit`, `ncodeunits`, copying,
-`fill!`, hash lookup, and `findnext`.
+The `NCG_MT` overlay table is minimal — operations the emitter handles natively
+(`ncodeunits`, `codeunit`, `sizeof`, `push!`, `resize!`, `unsafe_copyto!`,
+scalar arithmetic) do NOT go through overlays. Only these C-call-backed Base
+functions are overlaid: Unicode classification (`is_id_start_char`, `is_id_char`,
+`category_code`, `isgraphemebreak!` — backed by `charmap.jl` and vendored
+`UnicodeNext`), Dict lookup (`ht_keyindex` → linear scan), string equality
+(`_str_egal`), `fill!` (loop), `findnext` (loop), `unsafe_wrap(Vector{UInt8},String)`
+(loop), and the strtod/strtof float-parsing bridge.
 
 ## Source layout
 
@@ -103,8 +108,7 @@ pointer-dependent Base operations such as `codeunit`, `ncodeunits`, copying,
 |---|---|
 | `NativeCodegen/src/NativeCodegen.jl` | Module entry, compilation/linking entry points, callable ABI dispatch |
 | `NativeCodegen/src/builder_emit.jl` | IRCode → eDSL emitter, SSA/control-flow/invoke/MemoryRef lowering |
-| `NativeCodegen/src/clif_types.jl` | Native type-mapping helpers retained by the eDSL emitter |
-| `NativeCodegen/src/interp.jl` / `reprs.jl` / `intrinsics.jl` | Intercepts, Wasm representation re-exports, intrinsic sets |
+| `NativeCodegen/src/interp.jl` / `reprs.jl` / `charmap.jl` | Overlay interpreter + minimal stubs, value representation, Unicode char tables |
 | `native-builder/src/builder.rs` | ObjectModule, persistent `FunctionBuilder`, instruction emission |
 | `native-builder/src/lib.rs` / `linker.rs` | FFI entry points and Julia-lld linking/post-link checks |
 | `native-builder/src/runtime.rs` | Builder-side runtime declarations |
@@ -128,10 +132,6 @@ julia +nightly --project=. NativeCodegen/test/debug_jlsyntax_probe.jl
 # CLIF must not return.
 find . -name "*.clif" -type f
 ```
-
-The Wasm target uses `julia --project=.`, external validation from
-`tools/wasm-tools-dist/wasm-tools`, and vendored wasmtime v45 C headers in
-`tools/wasmtime-c-api/` for ABI probes.
 
 ## Julia object-layout notes
 
