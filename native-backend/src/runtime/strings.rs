@@ -10,6 +10,52 @@
 
 const STRING_TYPE_TAG: u32 = 1;  // legacy: for __jl_string_new (internal use only)
 
+/// Build a standalone, Julia-compatible String from raw UTF-8 bytes. Used both
+/// to intern string literals (whose bytes live in the .so's .rodata, carried via
+/// builder_declare_data) AND as the demo entry-point's argument builder. Layout
+/// matches compiled readers: [type_ptr(8)][length i64(8)][bytes][nul], data-ptr
+/// points at the length field (offset 0 = length, offset 8 = bytes). The type
+/// tag is __jl_type_tag(STRING_ID) — registered to the real pointer_from_objref(String)
+/// in-process so unsafe_pointer_to_objref works; a runtime default standalone.
+#[no_mangle]
+pub unsafe extern "C" fn __jl_string_from_raw(data: *const u8, len: i32) -> *mut u8 {
+    if data.is_null() || len < 0 {
+        return std::ptr::null_mut();
+    }
+    let n = len as usize;
+    let type_ptr = crate::runtime::gc::__jl_type_tag(crate::runtime::gc::STRING_TYPE_ID);
+    let s = crate::runtime::gc::rust_alloc_string(n, type_ptr);
+    if s.is_null() {
+        return std::ptr::null_mut();
+    }
+    // rust_alloc_string set length@0 and a NUL terminator; copy bytes to offset 8.
+    std::ptr::copy_nonoverlapping(data, s.add(8), n);
+    s
+}
+
+/// Memoized twin of `__jl_string_from_raw` for string LITERALS (whose bytes live
+/// in the .so's .rodata): build the String once per parse, keyed by the rodata
+/// address, so repeated literal uses share one object. `__jl_string_from_raw`
+/// stays non-memoized for the demo's heap-buffer arg (and any caller that reuses
+/// buffers), avoiding stale-cache entries.
+#[no_mangle]
+pub unsafe extern "C" fn __jl_string_cached(data: *const u8, len: i32) -> *mut u8 {
+    if data.is_null() || len < 0 {
+        return std::ptr::null_mut();
+    }
+    let key = data as usize;
+    crate::runtime::gc::get_or_build_rodata(key, || {
+        let n = len as usize;
+        let type_ptr = crate::runtime::gc::__jl_type_tag(crate::runtime::gc::STRING_TYPE_ID);
+        let s = crate::runtime::gc::rust_alloc_string(n, type_ptr);
+        if s.is_null() {
+            return std::ptr::null_mut();
+        }
+        std::ptr::copy_nonoverlapping(data, s.add(8), n);
+        s
+    })
+}
+
 /// Concatenate two Julia Strings into a new String.
 /// `a`/`b` are String pointers (past the type tag): length (i64) at offset 0,
 /// inline char data at offset 8.  `string_type_ptr` is pointer_from_objref(String),

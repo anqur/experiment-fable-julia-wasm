@@ -97,6 +97,55 @@ pub extern "C" fn block_add_call(
     }
 }
 
+// --- Data-section emission (string literals, const tables live in the .so) ---
+
+/// Declare a byte-blob data symbol in the module. `writable=0` → .rodata,
+/// `writable=1` → .data (for lazy fixup). Idempotent on repeated names.
+#[no_mangle]
+pub extern "C" fn builder_declare_data(
+    ctx: *mut BuilderContext, name: *const c_char, writable: u32,
+) -> c_int {
+    if ctx.is_null() || name.is_null() { return -1; }
+    unsafe {
+        let nm = CStr::from_ptr(name).to_str().unwrap_or("data");
+        match (*ctx).declare_data(nm, writable != 0) {
+            Ok(()) => 0,
+            Err(e) => { eprintln!("[native-builder] {}", e); -1 }
+        }
+    }
+}
+
+/// Define a previously-declared data symbol's bytes. Must be called after
+/// builder_declare_data and before builder_finalize.
+#[no_mangle]
+pub extern "C" fn builder_define_data(
+    ctx: *mut BuilderContext, name: *const c_char, bytes: *const u8, len: usize,
+) -> c_int {
+    if ctx.is_null() || name.is_null() || (len > 0 && bytes.is_null()) { return -1; }
+    unsafe {
+        let nm = CStr::from_ptr(name).to_str().unwrap_or("data");
+        let slice = if len == 0 { &[][..] } else { std::slice::from_raw_parts(bytes, len) };
+        match (*ctx).define_data(nm, slice) {
+            Ok(()) => 0,
+            Err(e) => { eprintln!("[native-builder] {}", e); -1 }
+        }
+    }
+}
+
+/// Materialize the runtime address of a declared data symbol as an i64 value
+/// (PC-relative/GOT relocation, resolved at load — not a baked host pointer).
+/// Block-scoped: emit fresh per block (same dominance rule as iconst).
+#[no_mangle]
+pub extern "C" fn block_add_symbol_value(
+    fctx: *mut FunctionCtx, ctx: *mut BuilderContext, name: *const c_char,
+) -> u32 {
+    if fctx.is_null() || ctx.is_null() || name.is_null() { return 0; }
+    unsafe {
+        let nm = CStr::from_ptr(name).to_str().unwrap_or("");
+        (*fctx).emit_symbol_value((*ctx).module_mut(), &(*ctx).data, nm)
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn function_add_block(fctx: *mut FunctionCtx, name: *const c_char) {
     if fctx.is_null() || name.is_null() { return; }

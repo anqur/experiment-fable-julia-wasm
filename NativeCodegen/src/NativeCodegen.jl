@@ -204,9 +204,32 @@ function native_callable(comp::NativeCompilation, rettype, argtypes::Type...)
     return ((args...) -> _gcall(ptr, rettype, AT, args...))
 end
 
+# Register the real Julia datatype pointer for every TypeID the compiler used, so
+# in-process object returns stay correct. The type-tag registry stopped baking
+# pointer_from_objref(T) into the .so (it resolves tags at runtime via
+# __jl_type_tag); without registration the tag would be a runtime default BSS
+# address, which breaks Julia's unsafe_pointer_to_objref (it reads the header tag
+# as a jl_datatype_t*) and _gcall's nothing comparison. In-process we register
+# the real pointer so both work as before. Standalone hosts (pure Rust) skip this.
+function _register_types!(lib::Ptr{Cvoid})
+    reg = Libdl.dlsym(lib, :__jl_register_type)
+    reg === C_NULL && return nothing
+    for (T, id) in _TYPE_IDS
+        try
+            ptr = reinterpret(Ptr{Cvoid}, pointer_from_objref(T))
+            ccall(reg, Cvoid, (UInt32, Ptr{Cvoid}), id, ptr)
+        catch
+            # A type that doesn't support pointer_from_objref: leave its runtime
+            # default (distinct BSS address). Only equality-compared anyway.
+        end
+    end
+    return nothing
+end
+
 # Direct .so loading from Julia (no Rust needed for testing)
 function native_callable_from_so(comp::NativeCompilation, rettype::Type, argtypes::Type...)
     lib = Libdl.dlopen(comp.so_path, Libdl.RTLD_LAZY | Libdl.RTLD_GLOBAL)
+    _register_types!(lib)
     func_ptr = Libdl.dlsym(lib, comp.func_name)
 
     # AT = declared arg-type tuple (Tuple{} for the 0-arg case). One uniform
@@ -223,6 +246,7 @@ end
 function compile_and_call(f, rettype::Type, argtypes::Type{<:Tuple}, args...; name::String="entry")
     comp = compile_native(f, argtypes; name=name)
     lib = Libdl.dlopen(comp.so_path)
+    _register_types!(lib)
     func = Libdl.dlsym(lib, comp.func_name)
     result = _gcall(func, rettype, argtypes, args...)
     Libdl.dlclose(lib)

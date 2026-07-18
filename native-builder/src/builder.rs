@@ -9,7 +9,7 @@ use cranelift_codegen::isa::CallConv;
 use cranelift_codegen::settings::Configurable;
 use cranelift_codegen::Context;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
-use cranelift_module::{FuncId, Linkage, Module};
+use cranelift_module::{FuncId, Linkage, Module, DataId, DataDescription};
 use cranelift_object::{ObjectBuilder, ObjectModule};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -485,6 +485,28 @@ impl FunctionCtx {
         id
     }
 
+    /// Materialize the runtime address of a declared data symbol (a byte blob
+    /// in the .so's .rodata/.data) as an i64 value. PC-relative/GOT relocation
+    /// resolved at load — NOT a baked host pointer. Used so string literals and
+    /// const tables live in the .so itself. Like iconst, the value is block-scoped
+    /// (Cranelift SSA dominance): emit fresh per block.
+    pub fn emit_symbol_value(
+        &mut self, module: &mut ObjectModule,
+        data: &HashMap<String, DataId>, name: &str,
+    ) -> u32 {
+        let data_id = *data.get(name).unwrap_or_else(|| panic!("data not declared: {}", name));
+        let curr = self.current_block;
+        let result = {
+            let fb = self.fb();
+            if fb.current_block() != Some(curr) { fb.switch_to_block(curr); }
+            let gv = module.declare_data_in_func(data_id, &mut fb.func);
+            fb.ins().symbol_value(types::I64, gv)
+        };
+        let id = v2u(result);
+        self.ssa_values.insert(id, result);
+        id
+    }
+
     pub fn finalize_ctx(&mut self) -> Result<(), String> {
         // Guarantee a valid entry block. A block only enters the layout when an
         // instruction is emitted into it (frontend's ensure_inserted_block →
@@ -538,6 +560,7 @@ pub struct BuilderContext {
     pub(crate) funcs: Vec<Box<FunctionCtx>>,
     pub(crate) imports: HashMap<String, FuncId>,
     pub(crate) self_imports: HashMap<String, FuncId>,
+    pub(crate) data: HashMap<String, DataId>,
     call_conv: CallConv,
     done: bool,
 }
@@ -560,7 +583,7 @@ impl BuilderContext {
         let lcn = Box::new(cranelift_module::default_libcall_names());
         let ob = ObjectBuilder::new(isa, "obj", lcn).expect("ObjBuilder");
         let module = ObjectModule::new(ob);
-        BuilderContext { module: Some(module), funcs: Vec::new(), imports: HashMap::new(), self_imports: HashMap::new(), call_conv, done: false }
+        BuilderContext { module: Some(module), funcs: Vec::new(), imports: HashMap::new(), self_imports: HashMap::new(), data: HashMap::new(), call_conv, done: false }
     }
 
     pub fn add_function(&mut self, n: &str, rt: u32, pts: &[u32]) -> Option<*mut FunctionCtx> {
@@ -601,6 +624,33 @@ impl BuilderContext {
             .map_err(|e| format!("declare self-function {}: {}", name, e))?;
         self.imports.insert(name.to_string(), fid);
         self.self_imports.insert(name.to_string(), fid);
+        Ok(())
+    }
+
+    /// Declare a data object (a byte blob living in the final .so's .rodata or
+    /// .data). Used to carry string-literal bytes and const tables so the .so no
+    /// longer bakes Julia-heap pointers to them. `writable=false` → .rodata
+    /// (read-only); `true` → .data (for lazy type-tag fixup). Local linkage: the
+    /// blob is only referenced within this module (via symbol_value).
+    pub fn declare_data(&mut self, name: &str, writable: bool) -> Result<(), String> {
+        if self.data.contains_key(name) { return Ok(()); }
+        let did = self.module.as_mut().unwrap()
+            .declare_data(name, Linkage::Local, writable, false)
+            .map_err(|e| format!("declare data {}: {}", name, e))?;
+        self.data.insert(name.to_string(), did);
+        Ok(())
+    }
+
+    /// Define a previously-declared data object's contents. Must be called before
+    /// finalize() (which calls module.finish()). Idempotent redefinition is an
+    /// error in Cranelift — callers declare+define once per name.
+    pub fn define_data(&mut self, name: &str, bytes: &[u8]) -> Result<(), String> {
+        let did = *self.data.get(name)
+            .ok_or_else(|| format!("define data {}: not declared", name))?;
+        let mut dd = DataDescription::new();
+        dd.define(bytes.into());
+        self.module.as_mut().unwrap().define_data(did, &dd)
+            .map_err(|e| format!("define data {}: {}", name, e))?;
         Ok(())
     }
 

@@ -157,6 +157,58 @@ pointer + length + bytes; arrays are type pointer + `JuliaArrayRepr`; structs an
 tuples are type pointer + fields. Internal temporary Memory objects may use the
 legacy `GCHeader` layout and are never returned to Julia.
 
+## Standalone `.so` — the no-baked-pointer invariant
+
+The emitted `.so` MUST be independent of the Julia process that compiled it, so
+`examples/native_demo` can `cargo run -- lib.so "1 + 2"` from pure Rust (no Julia
+loaded). The hazard is **baked Julia-heap pointer immediates** in `.text`
+(`mov x0,#imm; movk; ret`): these only resolve in the compiling process and
+SIGSEGV elsewhere. `linker.rs::verify_no_julia_symbols` does NOT catch them (it
+sees only *undefined-symbol* refs, and `nm -u` shows zero `jl_` even for a
+fully-baked `.so`). The real guard is **emit-time**: every heap value is
+resolved at runtime inside the `.so`, never baked. The emit-time guard is
+`_trace_bake` in `builder_emit.jl` (set `NCG_STRICT_BAKE=1` to turn any remaining
+bake into a `CompileError`); the end-to-end guard is the pure-Rust demo.
+
+Mechanisms (runtime symbols in `native-backend/src/runtime/gc.rs`/`strings.rs`,
+all linked statically into the `.so`):
+
+- **Type tags / `nothing` sentinel** — `__jl_type_tag(id)`/`__jl_nothing_tag()`
+  over a `TYPE_TABLE` of distinct addresses. The Julia dispatcher
+  (`NativeCodegen.jl::_register_types!`) overwrites each id with the real
+  `pointer_from_objref(T)` in-process, so `unsafe_pointer_to_objref` and
+  `_gcall`'s nothing comparison stay correct; standalone hosts use the BSS
+  defaults (fine — type tags are only equality-compared, never dereferenced as a
+  real `jl_datatype_t`). Every type-pointer site routes through `_emit_type_tag`.
+- **String / Symbol / bitstype / Vector{bits} / Dict / NamedTuple / struct
+  literals** — their bytes live in the `.so` as Cranelift data symbols
+  (`builder_declare_data`/`define_data`, referenced via `symbol_value`); runtime
+  helpers rebuild the object in the arena: `__jl_string_from_raw`,
+  `__jl_bytes_dup`, `__jl_array_alias_rodata`, `__jl_dict_from_rodata` (rebuilds
+  the Julia-layout hash table from slots/keys/vals, with String elements rebuilt
+  per-slot), `__jl_intern_symbol` (interns by name ⇒ `===` identity).
+
+- **Const memoization** — these rodata-sourced builders are wrapped by
+  `get_or_build_rodata(key=rodata_addr, …)` over a thread-local `RODATA_CACHE`, so
+  each const is built ONCE per parse (not per use — the emitter can't CSE across
+  blocks; Cranelift dominance). `__jl_string_cached` is the memoized twin of
+  `__jl_string_from_raw` (string literals); the demo's arg keeps the non-memoized
+  `__jl_string_from_raw` (heap buffer, must not be cached). **`__jl_gc_reset`
+  clears `RODATA_CACHE` and `SYM_INTERN`** — the cached objects are arena-allocated
+  and would dangle after reset (a latent UAF for multi-input-per-process callers).
+- **Checked-arithmetic direct value** — `emit_checked_pair` returns the value id
+  (recorded in `ssa_values`) when the stmt type is NOT a `Tuple` (inference
+  simplified `a%b` to its bare value, used directly as a loop phi); it returns
+  `nothing` (pair read via `ssa_pairs`/`getfield`) only for the `Tuple` case.
+  Without this, loop-carried `a,b=b,a%b` (gcd) hits "SSA value %N not found".
+
+The demo's `String` argument is built by the `.so`'s own `__jl_string_from_raw`;
+the entry returns an `Int64` (GreenNode count) that Rust prints directly. Probe:
+`NativeCodegen/test/debug_standalone_parse.jl` compiles `parse_into` to a fixed
+`.so`; `debug_standalone_so.jl`/`debug_standalone_disasm.jl` compile smaller
+functions for `.so` byte/IR inspection.
+
+
 ## Adding native features
 
 1. Reuse a WasmCodegen facility if it already implements the target-independent

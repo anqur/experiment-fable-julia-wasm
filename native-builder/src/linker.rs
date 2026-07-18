@@ -93,6 +93,13 @@ pub fn link_object_to_so(user_object: &Path, runtime_lib: &Path, so_path: &Path)
 /// lists undefined symbols; we grep for `jl_` (lowercase, matches
 /// `_jl_alloc_string`, `_jl_array_grow_end`, etc.).  The `.so` may have
 /// undefined libSystem/libc symbols — those are legitimate.
+///
+/// CAVEAT: this only catches *undefined-symbol references*. It does NOT catch
+/// baked Julia-heap pointer *immediates* (mov/movk constants in .text) — those
+/// are the real standalone-dependency hazard and are guarded at EMIT time
+/// (NativeCodegen/src/builder_emit.jl `_trace_bake` / `NCG_STRICT_BAKE`), not
+/// here. The end-to-end guard is the pure-Rust standalone demo
+/// (examples/native_demo) loading the .so without Julia present.
 fn verify_no_julia_symbols(so_path: &Path) -> Result<(), String> {
     let output = Command::new("nm")
         .arg("-u")

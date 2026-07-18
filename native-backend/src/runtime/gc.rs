@@ -77,6 +77,12 @@ thread_local! {
 #[no_mangle]
 pub unsafe extern "C" fn __jl_gc_reset() {
     ARENA.with(|a| a.borrow_mut().reset());
+    // Cached const objects (Symbols via SYM_INTERN, rodata-memoized literals/
+    // tables via RODATA_CACHE) are arena-allocated, so they dangle after the
+    // reset. Clear both caches: this bounds memoized state to one parse and
+    // fixes a latent use-after-free for multi-input-per-process callers.
+    SYM_INTERN.with(|t| t.borrow_mut().clear());
+    RODATA_CACHE.with(|c| c.borrow_mut().clear());
 }
 /// Return total bytes allocated through the bump arena since the last reset.
 #[no_mangle]
@@ -87,6 +93,79 @@ pub unsafe extern "C" fn __jl_gc_usage() -> i64 {
 /// Raw bump-alloc: returns `size` bytes with `align`-byte alignment.
 fn bump_alloc(size: usize, align: usize) -> *mut u8 {
     ARENA.with(|a| a.borrow_mut().bump(size, align))
+}
+
+// Per-parse cache of const objects keyed by their .rodata address, so each const
+// is built ONCE per parse (not per use — the emitter can't CSE across blocks due
+// to Cranelift SSA dominance). Objects are arena-allocated; __jl_gc_reset clears
+// this so stale pointers never survive a reset. Keyed by the rodata `data`
+// pointer each builder receives (stable within the .so image).
+thread_local! {
+    static RODATA_CACHE: std::cell::RefCell<std::collections::HashMap<usize, *mut u8>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+#[inline]
+pub(crate) fn get_or_build_rodata(key: usize, builder: impl FnOnce() -> *mut u8) -> *mut u8 {
+    RODATA_CACHE.with(|c| {
+        if let Some(&p) = c.borrow().get(&key) {
+            return p;
+        }
+        let p = builder();
+        c.borrow_mut().insert(key, p);
+        p
+    })
+}
+
+/// Build a read-only Julia-compatible array wrapper whose element data lives in
+/// the .so's .rodata (a const table baked via builder_declare_data). `data` points
+/// at the rodata element bytes; we allocate only the small Vector wrapper
+/// (JuliaGCHeader + JuliaArrayRepr) in the arena and point elem_ptr at the rodata.
+/// Read-only: length/getindex work; mutation (grow/push!) is unsupported on rodata.
+#[no_mangle]
+pub unsafe extern "C" fn __jl_array_alias_rodata(
+    data: *mut u8, len: i64, _elem_size: i64, type_id: u32,
+) -> *mut u8 {
+    if data.is_null() {
+        return std::ptr::null_mut();
+    }
+    let key = data as usize;
+    get_or_build_rodata(key, || {
+        let n = len.max(0) as i64;
+        let type_ptr = __jl_type_tag(type_id);
+        let struct_total = JULIA_HEADER_SIZE + ARRAY_REPR_SIZE;
+        let alloc = bump_alloc(struct_total, 16);
+        if alloc.is_null() {
+            unreachable!("oom");
+        }
+        *(alloc as *mut *mut u8) = type_ptr; // Vector's header type tag
+        let arr = alloc.add(JULIA_HEADER_SIZE) as *mut JuliaArrayRepr;
+        (*arr).elem_ptr = data;                          // → rodata (read-only)
+        (*arr).mem_obj = alloc.add(JULIA_HEADER_SIZE);   // self (no separate Memory)
+        (*arr).length = n;
+        (*arr).capacity = n;
+        alloc.add(JULIA_HEADER_SIZE)
+    })
+}
+/// and return its address. Used for >8-byte bitstype constants (e.g. RawGreenNode)
+/// and other flat-data constants so their bytes live in the .so — no baked
+/// Julia-heap pointer. Bitstypes have value semantics, so a fresh copy per use
+/// is correct (=== compares by content).
+#[no_mangle]
+pub unsafe extern "C" fn __jl_bytes_dup(src: *const u8, len: i64) -> *mut u8 {
+    if src.is_null() || len <= 0 {
+        return std::ptr::null_mut();
+    }
+    let key = src as usize;
+    get_or_build_rodata(key, || {
+        let n = len as usize;
+        let dst = bump_alloc(n, 16);
+        if dst.is_null() {
+            unreachable!("oom");
+        }
+        std::ptr::copy_nonoverlapping(src, dst, n);
+        dst
+    })
 }
 
 // Julia-compatible object header: starts with type pointer (jl_datatype_t*)
@@ -106,6 +185,181 @@ pub struct GCHeader {
 
 pub const HEADER_SIZE: usize = std::mem::size_of::<GCHeader>();
 pub const JULIA_HEADER_SIZE: usize = std::mem::size_of::<JuliaGCHeader>();
+
+// === Standalone type-tag registry ===
+//
+// Every Julia type the compiler references is identified by a stable integer
+// TypeID (assigned in builder_emit.jl::_type_id). __jl_type_tag(id) returns a
+// unique address used as the object-header type tag AND as the isa/typeof
+// comparison constant. Type tags are ONLY equality-compared — never
+// dereferenced as a real jl_datatype_t — so any stable unique address works.
+//
+// Default (standalone host, no Julia): each ID maps to a distinct BSS address
+// (the slot's own address), so allocator-stores and isa/typeof-compares agree
+// without any Julia runtime present.
+//
+// In-process override: the Julia dispatcher calls __jl_register_type with
+// pointer_from_objref(T) for each type, so the tag IS the real jl_datatype_t*
+// and Julia's unsafe_pointer_to_objref (which reads the header tag) and _gcall's
+// nothing comparison keep working unchanged. Reserved IDs: 0=Nothing,1=String,
+// 2=Symbol,3=Any.
+pub const TYPE_TABLE_SIZE: usize = 4096;
+static mut TYPE_TABLE: [*mut u8; TYPE_TABLE_SIZE] = [core::ptr::null_mut(); TYPE_TABLE_SIZE];
+
+// Reserved TypeIDs — MUST match builder_emit.jl (_STRING_TYPE_ID etc.).
+pub const NOTHING_TYPE_ID: u32 = 0;
+pub const STRING_TYPE_ID: u32 = 1;
+pub const SYMBOL_TYPE_ID: u32 = 2;
+pub const ANY_TYPE_ID: u32 = 3;
+
+#[inline]
+unsafe fn type_slot(idx: usize) -> *mut *mut u8 {
+    // Raw-pointer access avoids creating a &mut to a `static mut` (the
+    // static_mut_refs lint). Each slot holds the runtime-resolved type tag.
+    (core::ptr::addr_of_mut!(TYPE_TABLE) as *mut *mut u8).add(idx)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn __jl_type_tag(id: u32) -> *mut u8 {
+    let idx = (id as usize).min(TYPE_TABLE_SIZE - 1);
+    let slot = type_slot(idx);
+    let p = *slot;
+    if p.is_null() {
+        // Lazy default: a distinct stable address (the slot's own address).
+        *slot = slot as *mut u8;
+        return *slot;
+    }
+    p
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn __jl_nothing_tag() -> *mut u8 {
+    __jl_type_tag(0)
+}
+
+/// Host override: record the real Julia datatype pointer for a TypeID. Called by
+/// the Julia dispatcher after dlopen so in-process object returns stay correct.
+/// Standalone hosts never call this; tags remain distinct BSS addresses.
+#[no_mangle]
+pub unsafe extern "C" fn __jl_register_type(id: u32, type_ptr: *mut u8) {
+    let idx = (id as usize).min(TYPE_TABLE_SIZE - 1);
+    *type_slot(idx) = type_ptr;
+}
+
+// Symbol interning table (name bytes → stable Symbol address). Symbols compare by
+// identity (===), so every use of the same name must return the SAME address —
+// hence a per-process intern table, not a per-use allocation.
+thread_local! {
+    static SYM_INTERN: std::cell::RefCell<Vec<(Vec<u8>, *mut u8)>> =
+        std::cell::RefCell::new(Vec::new());
+}
+
+/// Build/look up a standalone Symbol from its name bytes (.rodata). Layout matches
+/// Julia's jl_sym_t data (past the type tag): hash@0 (placeholder 0 — Symbol hash
+/// reads are rare in the parser hot path), inline null-terminated name@8. Interned
+/// by name so `:foo === :foo` holds across uses.
+#[no_mangle]
+pub unsafe extern "C" fn __jl_intern_symbol(name: *const u8, len: i32) -> *mut u8 {
+    let n = (len.max(0)) as usize;
+    let nb: Vec<u8> = if n == 0 || name.is_null() {
+        Vec::new()
+    } else {
+        std::slice::from_raw_parts(name, n).to_vec()
+    };
+    let existing = SYM_INTERN.with(|t| {
+        t.borrow().iter().find(|(v, _)| *v == nb).map(|(_, p)| *p)
+    });
+    if let Some(p) = existing {
+        return p;
+    }
+    let type_ptr = __jl_type_tag(SYMBOL_TYPE_ID);
+    let total = 8 /*type tag*/ + 8 /*hash*/ + n + 1 /*nul*/;
+    let alloc = bump_alloc(total, 16);
+    if alloc.is_null() { unreachable!("oom"); }
+    *(alloc as *mut *mut u8) = type_ptr;        // header type tag
+    *(alloc.add(8) as *mut i64) = 0;            // hash placeholder
+    let name_dst = alloc.add(16);
+    if n > 0 && !name.is_null() {
+        std::ptr::copy_nonoverlapping(name, name_dst, n);
+    }
+    *name_dst.add(n) = 0;                        // null terminator
+    let sym = alloc.add(8); // past type tag → &hash@0, name@8
+    SYM_INTERN.with(|t| t.borrow_mut().push((nb, sym)));
+    sym
+}
+
+/// Build a standalone, Julia-layout-compatible Dict from three .rodata byte
+/// blobs (slots/keys/vals) carried in the .so. The const Dict{K,V} is serialized
+/// verbatim: the getindex traverses the existing hash table (slot occupancy +
+/// key placement baked into slots/keys/vals), so a faithful byte copy parses
+/// identically. Dict layout (verified via fieldoffset probes): a 64-byte mutable
+/// struct whose slots/keys/vals fields are POINTERS to 16-byte Memory objects
+/// {length@0, data_ptr@8}, plus ndel/count/age/idxfloor/maxprobe scalars.
+/// Bits-element Dicts only (K,V bits); String-keyed/valued Dicts need per-element
+/// String serialization (not handled here).
+#[no_mangle]
+pub unsafe extern "C" fn __jl_dict_from_rodata(
+    slots_data: *const u8, keys_data: *const u8, vals_data: *const u8,
+    nslots: i64, keys_is_str: i32, vals_is_str: i32,
+    ndel: i64, count: i64, idxfloor: i64, maxprobe: i64,
+    type_id: u32,
+) -> *mut u8 {
+    get_or_build_rodata(slots_data as usize, || {
+    let type_ptr = __jl_type_tag(type_id);
+    // Bits-element Memory: [length@0 = nslots, data_ptr@8 → rodata (read-only)].
+    let mk_mem = |data: *const u8| -> *mut u8 {
+        let m = bump_alloc(16, 16);
+        if m.is_null() { unreachable!("oom"); }
+        *(m as *mut i64) = nslots;
+        *(m.add(8) as *mut *const u8) = data;
+        m
+    };
+    // String-element Memory: build each element via __jl_string_from_raw from a
+    // .rodata sequence of (len:i32, bytes[len]) per slot, write the resulting
+    // String ptrs into an arena array. Empty slots serialize len=0 → empty String
+    // (never read by the getindex, which only reads filled slots).
+    let build_str_mem = |seq: *const u8| -> *mut u8 {
+        let arr = bump_alloc((nslots as usize) * 8, 16);
+        if arr.is_null() { unreachable!("oom"); }
+        let mut p = seq;
+        for i in 0..(nslots as usize) {
+            let len = if p.is_null() { 0i32 } else { *(p as *const i32) };
+            let len = len.max(0);
+            let bytes = if len == 0 { std::ptr::null() } else { p.add(4) };
+            let s = crate::runtime::strings::__jl_string_from_raw(bytes, len);
+            *((arr.add(i * 8)) as *mut *mut u8) = s;
+            if !p.is_null() { p = p.add(4 + len as usize); }
+        }
+        let m = bump_alloc(16, 16);
+        if m.is_null() { unreachable!("oom"); }
+        *(m as *mut i64) = nslots;
+        *(m.add(8) as *mut *mut u8) = arr;
+        m
+    };
+    let slots_mem = mk_mem(slots_data);
+    let keys_mem = if keys_is_str != 0 { build_str_mem(keys_data) } else { mk_mem(keys_data) };
+    let vals_mem = if vals_is_str != 0 { build_str_mem(vals_data) } else { mk_mem(vals_data) };
+    if std::env::var("NCG_TRACE_DICT").is_ok() {
+        eprintln!("[dict] nslots={} count={} keys_is_str={} vals_is_str={} slots[0..4]={:?}",
+            nslots, count, keys_is_str, vals_is_str,
+            if slots_data.is_null() { Vec::new() } else {
+                (0..(nslots as usize).min(4)).map(|i| *slots_data.add(i)).collect::<Vec<u8>>()
+            });
+    }
+    // Dict struct: header(type tag) + 64 bytes.
+    let dict = __jl_gc_alloc_julia(type_ptr, 64);
+    if dict.is_null() { unreachable!("oom"); }
+    *(dict.add(0) as *mut *mut u8) = slots_mem;   // :slots → Memory{UInt8}
+    *(dict.add(8) as *mut *mut u8) = keys_mem;    // :keys  → Memory{K}
+    *(dict.add(16) as *mut *mut u8) = vals_mem;   // :vals  → Memory{V}
+    *(dict.add(24) as *mut i64) = ndel;
+    *(dict.add(32) as *mut i64) = count;
+    *(dict.add(40) as *mut i64) = 0;              // :age
+    *(dict.add(48) as *mut i64) = idxfloor;
+    *(dict.add(56) as *mut i64) = maxprobe;
+    dict
+    })
+}
 
 #[no_mangle]
 pub unsafe extern "C" fn __jl_gc_alloc(type_tag: u32, data_size: u32) -> *mut u8 {

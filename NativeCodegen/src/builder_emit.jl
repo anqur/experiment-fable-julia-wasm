@@ -13,13 +13,6 @@ const TYPE_I8  = UInt32(5)
 const TYPE_I16 = UInt32(6)
 const TYPE_VOID = UInt32(7)  # void return (maps to None → no return type)
 
-# GC root for compile-time constant bitstype/NamedTuple values emitted as heap
-# pointers (pointer_from_objref(Ref(val))). The Ref is created during emission;
-# without rooting it the GC can reclaim it before the compiled .so runs, leaving
-# a dangling pointer (a folded `RawGreenNode(...)` const stored into a vector
-# then read back as 0 / SIGSEGV). Entries live for the Julia session.
-const _ROOTED_CONST_REFS = Any[]
-
 # Reverse lookup: Core.IntrinsicFunction => name Symbol.
 # `ccall(:jl_intrinsic_name, ...)` returns "invalid" for almost every intrinsic
 # on current Julia nightly, which would make the name-based dispatch in
@@ -204,6 +197,252 @@ function get_nothing_tag()
         @warn "Failed to compute nothing tag, isnothing may be broken" exception = e
     end
     return tag
+end
+
+# === Standalone type-tag registry (replaces every baked pointer_from_objref(T)) ===
+#
+# Type tags (object-header type pointer, isa/typeof comparison constant, and the
+# nothing sentinel) MUST NOT be baked as Julia-heap addresses — that makes the
+# .so valid only in the compiling Julia process. Instead each type gets a stable
+# integer TypeID, and the tag is resolved at RUNTIME via __jl_type_tag(id) inside
+# the .so. The Julia dispatcher registers pointer_from_objref(T) per-id in-process
+# (NativeCodegen.jl) so unsafe_pointer_to_objref/_gcall keep working; standalone
+# hosts use the runtime's default distinct BSS addresses. Type tags are only
+# equality-compared, never dereferenced as a real jl_datatype_t.
+const _NOTHING_TYPE_ID = UInt32(0)
+const _STRING_TYPE_ID  = UInt32(1)
+const _SYMBOL_TYPE_ID  = UInt32(2)
+const _ANY_TYPE_ID     = UInt32(3)
+const _TYPE_IDS = IdDict{Any,UInt32}(
+    Nothing => _NOTHING_TYPE_ID,
+    String  => _STRING_TYPE_ID,
+    Symbol  => _SYMBOL_TYPE_ID,
+    Any     => _ANY_TYPE_ID,
+)
+const _NEXT_TYPE_ID = Ref{UInt32}(16)
+
+# Stable integer TypeID for T (reserved builtins + lazily-assigned user types).
+# Also the source of truth the dispatcher iterates to register real type ptrs.
+function _type_id(T)
+    id = get(_TYPE_IDS, T, nothing)
+    id === nothing || return id
+    id = _NEXT_TYPE_ID[]
+    _NEXT_TYPE_ID[] += 1
+    _TYPE_IDS[T] = id
+    return id
+end
+
+# Emit a runtime-resolved type tag for T: iconst(TypeID) then __jl_type_tag(id).
+# Drop-in replacement for `type_ptr = pointer_from_objref(T); emit_constant(...)`.
+# (No BuilderCtx annotation: the struct is defined further down in this file.)
+function _emit_type_tag(bc, T)
+    id = _type_id(T)
+    iconst_ptr = Libdl.dlsym(bc.lib_handle, :block_add_iconst)
+    id_id = ccall(iconst_ptr, UInt32, (Ptr{Cvoid}, Int64, UInt32),
+                  bc.fctx_handle, Int64(id), TYPE_I32)
+    return emit_call_runtime(bc, "__jl_type_tag", UInt32[id_id])
+end
+
+const _NEXT_LIT_ID = Ref{Int}(1)
+
+# Debug-only: log every baked heap-pointer constant with its type + address, so
+# standalone crashes can be correlated to the offending category-D site. Enable
+# via NCG_TRACE_BAKE=1.
+# Central guard for the standalone invariant: a baked Julia-heap pointer constant
+# makes the .so valid only in the compiling Julia process. The reachable sites
+# (NamedTuple, mutable struct, unhandled heap object) are dead paths for the
+# current parser, so this is non-fatal by default — it logs the type so any new
+# live bake is visible. Set NCG_STRICT_BAKE=1 to turn remaining bakes into a
+# CompileError (use to enforce zero bakes for a known-standalone entry point).
+function _trace_bake(val)
+    T = string(typeof(val))
+    if haskey(ENV, "NCG_STRICT_BAKE")
+        throw(CompileError("baked Julia-heap pointer (standalone violation): $T — route through a runtime-resolved helper"))
+    end
+    haskey(ENV, "NCG_TRACE_BAKE") || return val
+    try
+        ptr = reinterpret(UInt64, pointer_from_objref(val))
+        @info "BAKE" T=T ptr=string("0x", string(ptr; base=16)) summary=summary(val)
+    catch
+        @warn "BAKE-trace-failed" T=T
+    end
+    return val
+end
+
+# Emit a standalone Symbol: carry its name bytes in the .so (.rodata) and intern
+# at runtime via __jl_intern_symbol (stable address per name ⇒ === identity).
+function _emit_symbol_const(bc, val)
+    name = String(val)
+    bytes = Vector{UInt8}(codeunits(name))
+    n = length(bytes)
+    push!(bytes, 0x00)  # NUL terminator
+    addr_id = _emit_rodata(bc, bytes)
+    len_id = emit_constant(bc, Int32(n))
+    return emit_call_runtime(bc, "__jl_intern_symbol", UInt32[addr_id, len_id])
+end
+
+# Emit a standalone string literal: carry its UTF-8 bytes in the .so as a
+# .rodata blob (builder_declare_data/define_data), then build the Julia-compatible
+# String at runtime via __jl_string_from_raw — so NO Julia-heap pointer is baked.
+# Replaces the old `pointer_from_objref(val)` for AbstractString literals.
+function _emit_string_literal(bc, val::AbstractString)
+    bytes = Vector{UInt8}(codeunits(val))
+    n = length(bytes)
+    push!(bytes, 0x00)  # NUL terminator
+    sym = "__jl_lit_$(_NEXT_LIT_ID[])"
+    _NEXT_LIT_ID[] += 1
+    decl = Libdl.dlsym(bc.lib_handle, :builder_declare_data)
+    defn = Libdl.dlsym(bc.lib_handle, :builder_define_data)
+    # writable=false → .rodata (read-only literal bytes).
+    ccall(decl, Cint, (Ptr{Cvoid}, Ptr{UInt8}, UInt32),
+          bc.builder_handle, sym, UInt32(0))
+    ccall(defn, Cint, (Ptr{Cvoid}, Ptr{UInt8}, Ptr{UInt8}, Csize_t),
+          bc.builder_handle, sym, bytes, length(bytes))
+    symval = Libdl.dlsym(bc.lib_handle, :block_add_symbol_value)
+    addr_id = ccall(symval, UInt32, (Ptr{Cvoid}, Ptr{Cvoid}, Ptr{UInt8}),
+                    bc.fctx_handle, bc.builder_handle, sym)
+    len_id = emit_constant(bc, Int32(n))
+    return emit_call_runtime(bc, "__jl_string_cached", UInt32[addr_id, len_id])
+end
+
+# Emit a standalone >8-byte bitstype constant (e.g. RawGreenNode=12B): carry its
+# raw bytes in the .so (.rodata) and dup them into a 16-aligned arena slot at
+# runtime via __jl_bytes_dup — no baked Julia-heap pointer. Bitstypes have value
+# semantics, so a fresh copy per use is correct (=== compares by content). The
+# arena copy is 16-aligned, so multi-byte field loads at any offset are safe.
+function _emit_bitstype_const(bc, val)
+    T = typeof(val)
+    n = sizeof(T)
+    r = Ref(val)
+    bytes = GC.@preserve r begin
+        copy(unsafe_wrap(Vector{UInt8}, reinterpret(Ptr{UInt8}, pointer_from_objref(r)), n))
+    end
+    sym = "__jl_bs_$(_NEXT_LIT_ID[])"
+    _NEXT_LIT_ID[] += 1
+    decl = Libdl.dlsym(bc.lib_handle, :builder_declare_data)
+    defn = Libdl.dlsym(bc.lib_handle, :builder_define_data)
+    ccall(decl, Cint, (Ptr{Cvoid}, Ptr{UInt8}, UInt32), bc.builder_handle, sym, UInt32(0))
+    ccall(defn, Cint, (Ptr{Cvoid}, Ptr{UInt8}, Ptr{UInt8}, Csize_t),
+          bc.builder_handle, sym, bytes, n)
+    symval = Libdl.dlsym(bc.lib_handle, :block_add_symbol_value)
+    addr_id = ccall(symval, UInt32, (Ptr{Cvoid}, Ptr{Cvoid}, Ptr{UInt8}),
+                    bc.fctx_handle, bc.builder_handle, sym)
+    len_id = emit_constant(bc, Int64(n))
+    return emit_call_runtime(bc, "__jl_bytes_dup", UInt32[addr_id, len_id])
+end
+
+# Emit a standalone const Array with bits elements (Vector{Bool}/Vector{Int64}/…):
+# carry the element bytes in the .so (.rodata) and build a read-only alias wrapper
+# at runtime via __jl_array_alias_rodata — no baked Julia-heap pointer. Read-only
+# (length/getindex); mutation unsupported on rodata. Non-bits-element arrays fall
+# back to the baked path (their elements may contain pointers).
+function _emit_array_const(bc, val)
+    T = eltype(val)
+    es = sizeof(T)
+    n = length(val)
+    nbytes = es * n
+    bytes = GC.@preserve val begin
+        copy(unsafe_wrap(Vector{UInt8}, reinterpret(Ptr{UInt8}, pointer(val)), nbytes))
+    end
+    sym = "__jl_arr_$(_NEXT_LIT_ID[])"
+    _NEXT_LIT_ID[] += 1
+    decl = Libdl.dlsym(bc.lib_handle, :builder_declare_data)
+    defn = Libdl.dlsym(bc.lib_handle, :builder_define_data)
+    ccall(decl, Cint, (Ptr{Cvoid}, Ptr{UInt8}, UInt32), bc.builder_handle, sym, UInt32(0))
+    ccall(defn, Cint, (Ptr{Cvoid}, Ptr{UInt8}, Ptr{UInt8}, Csize_t),
+          bc.builder_handle, sym, bytes, nbytes)
+    symval = Libdl.dlsym(bc.lib_handle, :block_add_symbol_value)
+    addr_id = ccall(symval, UInt32, (Ptr{Cvoid}, Ptr{Cvoid}, Ptr{UInt8}),
+                    bc.fctx_handle, bc.builder_handle, sym)
+    len_id = emit_constant(bc, Int64(n))
+    es_id = emit_constant(bc, Int64(es))
+    iconst_ptr = Libdl.dlsym(bc.lib_handle, :block_add_iconst)
+    tid_id = ccall(iconst_ptr, UInt32, (Ptr{Cvoid}, Int64, UInt32),
+                   bc.fctx_handle, Int64(_type_id(typeof(val))), TYPE_I32)
+    return emit_call_runtime(bc, "__jl_array_alias_rodata",
+                             UInt32[addr_id, len_id, es_id, tid_id])
+end
+
+# Emit a read-only byte blob in the .so (.rodata) and return the SSA id of its
+# runtime address (PC-relative symbol_value — not a baked host pointer). Shared
+# by string/bitstype/array/dict const lowering.
+function _emit_rodata(bc, bytes::Vector{UInt8})
+    sym = "__jl_ro_$(_NEXT_LIT_ID[])"
+    _NEXT_LIT_ID[] += 1
+    decl = Libdl.dlsym(bc.lib_handle, :builder_declare_data)
+    defn = Libdl.dlsym(bc.lib_handle, :builder_define_data)
+    ccall(decl, Cint, (Ptr{Cvoid}, Ptr{UInt8}, UInt32), bc.builder_handle, sym, UInt32(0))
+    ccall(defn, Cint, (Ptr{Cvoid}, Ptr{UInt8}, Ptr{UInt8}, Csize_t),
+          bc.builder_handle, sym, bytes, length(bytes))
+    symval = Libdl.dlsym(bc.lib_handle, :block_add_symbol_value)
+    return ccall(symval, UInt32, (Ptr{Cvoid}, Ptr{Cvoid}, Ptr{UInt8}),
+                 bc.fctx_handle, bc.builder_handle, sym)
+end
+
+# Dict element type supported by _emit_dict_const: bits (verbatim) or String
+# (rebuilt per-slot via __jl_string_from_raw).
+_dict_elem_ok(T) = isbitstype(T) || T === String
+
+# Serialize a String-element Dict array (Memory{String}) per-slot as a sequence
+# of (len:i32, bytes) — only for filled slots (slot byte bit 7 set); empty slots
+# emit len=0. The runtime rebuilds each String via __jl_string_from_raw.
+function _serialize_str_dict_elems(mem, slots_mem, nslots)
+    buf = UInt8[]
+    for i in 1:nslots
+        if (slots_mem[i] & 0x80) != 0
+            s = mem[i]
+            b = codeunits(s)
+            append!(buf, reinterpret(UInt8, [Int32(length(b))]))
+            append!(buf, b)
+        else
+            append!(buf, reinterpret(UInt8, [Int32(0)]))
+        end
+    end
+    buf
+end
+
+# Emit a standalone const Dict{K,V} (K,V bits or String): serialize slots/keys/
+# vals to .rodata and rebuild the Julia-layout Dict at runtime via
+# __jl_dict_from_rodata. Bits elements are copied verbatim; String elements are
+# rebuilt per-slot. The getindex traverses the existing hash table faithfully.
+function _emit_dict_const(bc, val)
+    K = keytype(val); V = valtype(val)
+    kstr = K === String; vstr = V === String
+    nslots = length(getfield(val, :slots))
+    sm = getfield(val, :slots)
+    slots_bytes = GC.@preserve val begin
+        copy(unsafe_wrap(Vector{UInt8}, reinterpret(Ptr{UInt8}, pointer(sm)), nslots))
+    end
+    if kstr
+        keys_bytes = _serialize_str_dict_elems(getfield(val, :keys), sm, nslots)
+    else
+        keys_bytes = GC.@preserve val begin
+            copy(unsafe_wrap(Vector{UInt8}, reinterpret(Ptr{UInt8}, pointer(getfield(val, :keys))), nslots * sizeof(K)))
+        end
+    end
+    if vstr
+        vals_bytes = _serialize_str_dict_elems(getfield(val, :vals), sm, nslots)
+    else
+        vals_bytes = GC.@preserve val begin
+            copy(unsafe_wrap(Vector{UInt8}, reinterpret(Ptr{UInt8}, pointer(getfield(val, :vals))), nslots * sizeof(V)))
+        end
+    end
+    slots_addr = _emit_rodata(bc, slots_bytes)
+    keys_addr = _emit_rodata(bc, keys_bytes)
+    vals_addr = _emit_rodata(bc, vals_bytes)
+    nslots_id = emit_constant(bc, Int64(nslots))
+    kis_id = emit_constant(bc, Int32(kstr ? 1 : 0))
+    vis_id = emit_constant(bc, Int32(vstr ? 1 : 0))
+    ndel_id = emit_constant(bc, Int64(getfield(val, :ndel)))
+    count_id = emit_constant(bc, Int64(getfield(val, :count)))
+    idxfloor_id = emit_constant(bc, Int64(getfield(val, :idxfloor)))
+    maxprobe_id = emit_constant(bc, Int64(getfield(val, :maxprobe)))
+    iconst_ptr = Libdl.dlsym(bc.lib_handle, :block_add_iconst)
+    tid_id = ccall(iconst_ptr, UInt32, (Ptr{Cvoid}, Int64, UInt32),
+                   bc.fctx_handle, Int64(_type_id(typeof(val))), TYPE_I32)
+    return emit_call_runtime(bc, "__jl_dict_from_rodata",
+        UInt32[slots_addr, keys_addr, vals_addr, nslots_id, kis_id, vis_id,
+               ndel_id, count_id, idxfloor_id, maxprobe_id, tid_id])
 end
 
 mutable struct BuilderCtx
@@ -874,13 +1113,10 @@ function resolve_operand(bc::BuilderCtx, val, ir)
         # Create constant each time (caching causes cross-block dominance issues)
         return emit_constant(bc, val)
     elseif val === nothing || isghost(typeof(val))
-        # nothing in union fields has a specific tag (0x103 in Julia v1.x), not 0x0.
-        # Use get_nothing_tag() so comparisons with union-field values work correctly.
-        # The tag is a tagged sentinel specific to the current Julia session's heap.
-        nothing_tag = get_nothing_tag()
-        iconst_ptr = Libdl.dlsym(bc.lib_handle, :block_add_iconst)
-        return ccall(iconst_ptr, UInt32, (Ptr{Cvoid}, Int64, UInt32),
-                   bc.fctx_handle, Int64(nothing_tag), TYPE_PTR)
+        # nothing in union fields is a tagged sentinel, not 0x0. Resolve it at
+        # runtime via the standalone type-tag registry (__jl_type_tag(NOTHING))
+        # so it matches isa/isnothing compares and is not baked from the host heap.
+        return _emit_type_tag(bc, Nothing)
     elseif val isa Bool
         iconst_ptr = Libdl.dlsym(bc.lib_handle, :block_add_iconst)
         return ccall(iconst_ptr, UInt32, (Ptr{Cvoid}, Int64, UInt32),
@@ -889,14 +1125,15 @@ function resolve_operand(bc::BuilderCtx, val, ir)
         # Handle tuple constants by emitting tuple creation
         args = [Core.Const(v) for v in val]
         return emit_core_tuple(bc, args, ir)
-    elseif val isa AbstractString || val isa Symbol
-        # String/Symbol literal: emit its object pointer as a constant. The
-        # value is already a real Julia object; it round-trips back via
-        # unsafe_pointer_to_objref on return.
-        iconst_ptr = Libdl.dlsym(bc.lib_handle, :block_add_iconst)
-        return ccall(iconst_ptr, UInt32, (Ptr{Cvoid}, Int64, UInt32),
-                   bc.fctx_handle, Int64(reinterpret(UInt64, pointer_from_objref(val))),
-                     TYPE_PTR)
+    elseif val isa AbstractString
+        # String literal: carry its UTF-8 bytes in the .so (.rodata) and build the
+        # String at runtime via __jl_string_from_raw — no baked Julia-heap pointer.
+        return _emit_string_literal(bc, val)
+    elseif val isa Symbol
+        # Symbol: carry its name bytes in the .so (.rodata) and intern at runtime
+        # via __jl_intern_symbol — returns a stable address per name so `===`
+        # identity holds across uses. No baked Julia-heap pointer.
+        return _emit_symbol_const(bc, val)
     elseif val === nothing
         # nothing → null pointer constant (0)
         return emit_constant(bc, Int64(0))
@@ -928,17 +1165,17 @@ function resolve_operand(bc::BuilderCtx, val, ir)
         # fallback), so push! stored 0 and a later read dereferenced null → SIGSEGV
         # (the peek_behind sorter crash).
         sz = sizeof(val)
-        if sz > 8 || typeof(val).name.name === :NamedTuple
-            ptr = try
-                pointer_from_objref(val)
-            catch _
-                # Immutable bitstype/NamedTuple: box in a Ref and ROOT it so the
-                # pointer stays valid when the compiled .so runs later.
-                ref = Ref(val)
-                push!(_ROOTED_CONST_REFS, ref)
-                pointer_from_objref(ref)
-            end
-            return emit_constant(bc, Int64(reinterpret(UInt64, ptr)))
+        if typeof(val).name.name === :NamedTuple
+            # NamedTuple (always TYPE_PTR, e.g. kwarg sorters' @NamedTuple{...}):
+            # carry its flat bytes in the .so and dup — no baked pointer. Bytes
+            # read via Ref (pointer_from_objref(val) throws for immutable NT).
+            # Fields here are bits (Bool/Kind); pointer fields would be stale.
+            return _emit_bitstype_const(bc, val)
+        elseif sz > 8
+            # >8-byte bitstype (e.g. RawGreenNode=12B): carry raw bytes in the .so
+            # (.rodata) and dup into a 16-aligned arena slot at runtime — no baked
+            # Julia-heap pointer. Value semantics ⇒ fresh copy per use is correct.
+            return _emit_bitstype_const(bc, val)
         end
         local raw::UInt64
         if sz == 8
@@ -954,11 +1191,18 @@ function resolve_operand(bc::BuilderCtx, val, ir)
         end
         return emit_constant(bc, sz <= 4 ? UInt32(raw) : raw)
     elseif val isa VersionNumber
-        # Immutable struct with pointer fields — wrap in Ref for pointer_from_objref
-        return emit_constant(bc, Int64(reinterpret(UInt64, pointer_from_objref(Ref(val)))))
+        # Immutable struct with (possibly) pointer fields: carry its flat bytes in
+        # the .so (.rodata) and dup into the arena — scalar fields (major/minor)
+        # read correctly; embedded pointer fields are stale but only matter if
+        # accessed at runtime. Fixes the baked VERSION constant crash.
+        return _emit_bitstype_const(bc, val)
     elseif val isa DataType || val isa UnionAll || val isa Union
-        # Type values — emit as pointer constant
-        return emit_constant(bc, Int64(reinterpret(UInt64, pointer_from_objref(val))))
+        # Type values: resolve at runtime via the type-tag registry (__jl_type_tag).
+        # Registered to pointer_from_objref(T) in-process (identical to the old
+        # bake, so unsafe_pointer_to_objref/typeof keep working) and a default BSS
+        # address standalone. Safe unless the type is dereferenced (T.parameters,
+        # T.name) — rare in the parser hot path.
+        return _emit_type_tag(bc, val)
     else
         # Any other heap object (module-constant Vector/Array, String, Symbol,
         # struct instance, …) — emit as its pointer so downstream getfield
@@ -967,12 +1211,23 @@ function resolve_operand(bc::BuilderCtx, val, ir)
         # objects (e.g. Set on Julia 1.14 where ismutabletype=false), wrap in Ref
         # and root it — pointer_from_objref(Ref(val)) gives the Ref's data pointer
         # (= &val inline), and the Ref must survive compilation+execution.
+        if val isa Array && isbitstype(eltype(val))
+            # Const table (Vector{Bool}/Vector{Int64}/…): carry element bytes in
+            # the .so (.rodata) and alias them — no baked Julia-heap pointer.
+            return _emit_array_const(bc, val)
+        end
+        if val isa Dict && _dict_elem_ok(keytype(val)) && _dict_elem_ok(valtype(val))
+            # Const lookup table (operator precedence / kind maps): serialize
+            # slots/keys/vals to .rodata and rebuild the Dict — no baked pointer.
+            return _emit_dict_const(bc, val)
+        end
         if Base.ismutabletype(typeof(val))
+            _trace_bake(val)
             return emit_constant(bc, Int64(reinterpret(UInt64, pointer_from_objref(val))))
         else
-            ref = Ref(val)
-            push!(_ROOTED_CONST_REFS, ref)
-            return emit_constant(bc, Int64(reinterpret(UInt64, pointer_from_objref(ref))))
+            # Immutable non-bitstype struct (e.g. Set on 1.14): carry flat bytes in
+            # the .so and dup — scalar fields read correctly.
+            return _emit_bitstype_const(bc, val)
         end
     end
 end
@@ -1001,6 +1256,16 @@ function emit_constant(bc::BuilderCtx, val)
     else
         # Any other value (Symbol, String, Vector, struct instance, …) is a heap
         # object — emit its pointer as an i64 constant.
+        if val isa Symbol
+            return _emit_symbol_const(bc, val)
+        end
+        if val isa Array && isbitstype(eltype(val))
+            return _emit_array_const(bc, val)
+        end
+        if val isa Dict && _dict_elem_ok(keytype(val)) && _dict_elem_ok(valtype(val))
+            return _emit_dict_const(bc, val)
+        end
+        _trace_bake(val)
         iconst_ptr = Libdl.dlsym(bc.lib_handle, :block_add_iconst)
         return ccall(iconst_ptr, UInt32, (Ptr{Cvoid}, Int64, UInt32),
                      bc.fctx_handle,
@@ -1430,6 +1695,12 @@ function emit_checked_pair(bc::BuilderCtx, kind::Symbol, signed::Bool, args, ir,
     sz = sizeof(val_T)
     (sz == 4 || sz == 8) ||
         throw(CompileError("checked arithmetic on $val_T (sub-word) not yet supported"))
+    # If inference simplified this stmt to its bare value type (not a Tuple pair),
+    # the result is used DIRECTLY (e.g. a loop-carried `a % b` feeding a phi) with
+    # no getfield — so the value must be recorded in ssa_values (return value,
+    # not nothing). The Tuple case keeps the pair semantics (getfield via ssa_pairs).
+    stmt_T = ir.stmts[stmt_idx][:type]
+    is_pair = stmt_T isa DataType && stmt_T <: Tuple
 
     if kind === :add
         value = _binop_id(bc, :block_add_iadd, a, b)
@@ -1457,7 +1728,7 @@ function emit_checked_pair(bc::BuilderCtx, kind::Symbol, signed::Bool, args, ir,
             # srem overflows only on typemin/-1 — same as sdiv.
             signed || (value = _binop_id(bc, :block_add_urem, a, b);
                        bc.ssa_pairs[stmt_idx] = (value, emit_constant(bc, Int32(0)));
-                       return nothing)
+                       return is_pair ? nothing : value)
             value = _binop_id(bc, :block_add_srem, a, b)
         else
             value  = _binop_id(bc, :block_add_imul, a, b)
@@ -1489,7 +1760,9 @@ function emit_checked_pair(bc::BuilderCtx, kind::Symbol, signed::Bool, args, ir,
     end
 
     bc.ssa_pairs[stmt_idx] = (value, flag)
-    return nothing   # signal emit_instruction to skip the ssa_values recording
+    # Pair case: signal emit_instruction to skip ssa_values recording (getfield
+    # reads via ssa_pairs). Bare-value case: return value so it's recorded.
+    return is_pair ? nothing : value
 end
 
 # === Invoke handling (overlay method calls) ===
@@ -1799,8 +2072,7 @@ function emit_invoke(bc::BuilderCtx, invoke_target, f, args, ir, stmt_idx)
     # :invoke of :* / :_string with ≥2 args is string concat. Left-fold binary
     # __jl_string_concat over the operands (each resolved to a String ptr).
     if (fn_name == :_string || fn_name == :*) && length(args) >= 2
-        string_type_ptr = pointer_from_objref(String)
-        string_type_ptr_id = emit_constant(bc, Int64(reinterpret(UInt64, string_type_ptr)))
+        string_type_ptr_id = _emit_type_tag(bc, String)
         acc_id = resolve_operand(bc, args[1], ir)
         for i in 2:length(args)
             nxt_id = resolve_operand(bc, args[i], ir)
@@ -1878,8 +2150,7 @@ function emit_invoke(bc::BuilderCtx, invoke_target, f, args, ir, stmt_idx)
     # not a raw null pointer (0x0).
     if fn_name == :isnothing && length(args) >= 1
         val = resolve_operand(bc, args[1], ir)
-        nothing_tag = get_nothing_tag()
-        zero = emit_constant(bc, Int64(nothing_tag))
+        zero = _emit_type_tag(bc, Nothing)
         fn_ptr = Libdl.dlsym(bc.lib_handle, :block_add_icmp)
         result = ccall(fn_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32, UInt32),
                        bc.fctx_handle, ICMP_EQ, val, zero)
@@ -1897,8 +2168,7 @@ function emit_invoke(bc::BuilderCtx, invoke_target, f, args, ir, stmt_idx)
         load_ptr = Libdl.dlsym(bc.lib_handle, :block_add_load)
         children_ptr = ccall(load_ptr, UInt32, (Ptr{Cvoid}, UInt32, Int32, UInt32),
                              bc.fctx_handle, val, Int32(offset), TYPE_PTR)
-        nothing_tag = get_nothing_tag()
-        tag_id = emit_constant(bc, Int64(nothing_tag))
+        tag_id = _emit_type_tag(bc, Nothing)
         icmp_ptr = Libdl.dlsym(bc.lib_handle, :block_add_icmp)
         result = ccall(icmp_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32, UInt32),
                        bc.fctx_handle, ICMP_NE, children_ptr, tag_id)
@@ -1925,11 +2195,9 @@ function emit_invoke(bc::BuilderCtx, invoke_target, f, args, ir, stmt_idx)
         if kind_val !== nothing
             str = getglobal(f.mod, :untokenize)(kind_val)
             if str === nothing
-                return emit_constant(bc, Int64(get_nothing_tag()))
+                return _emit_type_tag(bc, Nothing)
             end
-            iconst_ptr = Libdl.dlsym(bc.lib_handle, :block_add_iconst)
-            return ccall(iconst_ptr, UInt32, (Ptr{Cvoid}, Int64, UInt32),
-                         bc.fctx_handle, Int64(reinterpret(UInt64, pointer_from_objref(str))), TYPE_PTR)
+            return _emit_string_literal(bc, str)
         end
     end
 
@@ -2299,8 +2567,7 @@ function emit_globalref(bc::BuilderCtx, f::Core.GlobalRef, args, ir, stmt_idx)
         len_id = resolve_operand(bc, args[1], ir)
         # Allocate string with space for length + null terminator
         total_size_id = emit_constant(bc, Int32(8))  # length + data + null
-        type_ptr = pointer_from_objref(String)
-        type_ptr_id = emit_constant(bc, Int64(reinterpret(UInt64, type_ptr)))
+        type_ptr_id = _emit_type_tag(bc, String)
 
         # Call Julia-compatible allocation
         str_ptr_id = emit_call_runtime(bc, "__jl_gc_alloc_array_julia",
@@ -2385,7 +2652,7 @@ function emit_globalref(bc::BuilderCtx, f::Core.GlobalRef, args, ir, stmt_idx)
                 return emit_constant(bc, resolved)
             end
         end
-        return emit_constant(bc, Int64(reinterpret(UInt64, pointer_from_objref(Any))))
+        return _emit_type_tag(bc, Any)
     end
 
     # Dead-error-path sentinels: these Core globals appear in bounds-error /
@@ -3291,8 +3558,7 @@ function emit_isa(bc::BuilderCtx, args, ir)
 
     if target_type === Nothing
         # nothing in union fields is tagged, not raw null (0x0).
-        nothing_tag = get_nothing_tag()
-        zero_id = emit_constant(bc, Int64(nothing_tag))
+        zero_id = _emit_type_tag(bc, Nothing)
         fn_ptr = Libdl.dlsym(bc.lib_handle, :block_add_icmp)
         result = ccall(fn_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32, UInt32),
                       bc.fctx_handle, ICMP_EQ, val_id, zero_id)
@@ -3311,8 +3577,7 @@ function emit_isa(bc::BuilderCtx, args, ir)
             utypes = Base.uniontypes(ssatype)
             if length(utypes) == 2 && Nothing in utypes && target_type in utypes
                 # x is Union{Nothing, T}; isa(x, T) ⟺ x != nothing_tag
-                nothing_tag = get_nothing_tag()
-                tag_id = emit_constant(bc, Int64(nothing_tag))
+                tag_id = _emit_type_tag(bc, Nothing)
                 fn_ptr = Libdl.dlsym(bc.lib_handle, :block_add_icmp)
                 result = ccall(fn_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32, UInt32),
                               bc.fctx_handle, ICMP_NE, val_id, tag_id)
@@ -3334,8 +3599,7 @@ function emit_isa(bc::BuilderCtx, args, ir)
             # Only for unions WITHOUT Nothing (Case 2 already handles that)
             if !(Nothing in utypes) && target_type in utypes && target_type isa DataType
                 T = target_type
-                type_ptr = pointer_from_objref(T)
-                type_ptr_id = emit_constant(bc, Int64(reinterpret(UInt64, type_ptr)))
+                type_ptr_id = _emit_type_tag(bc, T)
                 # Load jl_datatype_t* tag from object header at offset 0
                 load_ptr = Libdl.dlsym(bc.lib_handle, :block_add_load)
                 loaded_tag = ccall(load_ptr, UInt32, (Ptr{Cvoid}, UInt32, Int32, UInt32),
@@ -3359,8 +3623,7 @@ function emit_isa(bc::BuilderCtx, args, ir)
     # include T <: Tuple; exclude scalar bitstypes (Int etc.) which aren't heap ptrs.
     if target_type isa DataType && isconcretetype(target_type) &&
        (target_type <: Tuple || !isbitstype(target_type))
-        type_ptr = pointer_from_objref(target_type)
-        type_ptr_id = emit_constant(bc, Int64(reinterpret(UInt64, type_ptr)))
+        type_ptr_id = _emit_type_tag(bc, target_type)
         load_ptr = Libdl.dlsym(bc.lib_handle, :block_add_load)
         loaded_tag = ccall(load_ptr, UInt32, (Ptr{Cvoid}, UInt32, Int32, UInt32),
                          bc.fctx_handle, val_id, Int32(0), TYPE_I64)
@@ -3486,6 +3749,34 @@ end
 
 function _declare_imports(bc::BuilderCtx)
     declare_ptr = Libdl.dlsym(bc.lib_handle, :builder_declare_import)
+    # __jl_type_tag(id: i32) -> ptr ; __jl_nothing_tag() -> ptr
+    # Runtime-resolved type tag / nothing sentinel (standalone type-tag registry).
+    ccall(declare_ptr, Cint, (Ptr{Cvoid}, Ptr{UInt8}, UInt32, Ptr{UInt32}, Csize_t),
+          bc.builder_handle, "__jl_type_tag", TYPE_PTR, UInt32[TYPE_I32], 1)
+    ccall(declare_ptr, Cint, (Ptr{Cvoid}, Ptr{UInt8}, UInt32, Ptr{UInt32}, Csize_t),
+          bc.builder_handle, "__jl_nothing_tag", TYPE_PTR, UInt32[], 0)
+    # __jl_intern_symbol(name: ptr, len: i32) -> ptr  (interned standalone Symbol)
+    ccall(declare_ptr, Cint, (Ptr{Cvoid}, Ptr{UInt8}, UInt32, Ptr{UInt32}, Csize_t),
+          bc.builder_handle, "__jl_intern_symbol", TYPE_PTR, UInt32[TYPE_PTR, TYPE_I32], 2)
+    # __jl_string_from_raw(data: ptr, len: i32) -> ptr  (standalone String from rodata bytes)
+    ccall(declare_ptr, Cint, (Ptr{Cvoid}, Ptr{UInt8}, UInt32, Ptr{UInt32}, Csize_t),
+          bc.builder_handle, "__jl_string_from_raw", TYPE_PTR, UInt32[TYPE_PTR, TYPE_I32], 2)
+    # __jl_string_cached(data: ptr, len: i32) -> ptr  (memoized-by-rodata-addr literal String)
+    ccall(declare_ptr, Cint, (Ptr{Cvoid}, Ptr{UInt8}, UInt32, Ptr{UInt32}, Csize_t),
+          bc.builder_handle, "__jl_string_cached", TYPE_PTR, UInt32[TYPE_PTR, TYPE_I32], 2)
+    # __jl_bytes_dup(src: ptr, len: i64) -> ptr  (rodata bytes → 16-aligned arena copy)
+    ccall(declare_ptr, Cint, (Ptr{Cvoid}, Ptr{UInt8}, UInt32, Ptr{UInt32}, Csize_t),
+          bc.builder_handle, "__jl_bytes_dup", TYPE_PTR, UInt32[TYPE_PTR, TYPE_I64], 2)
+    # __jl_array_alias_rodata(data: ptr, len: i64, elem_size: i64, type_id: i32) -> ptr
+    ccall(declare_ptr, Cint, (Ptr{Cvoid}, Ptr{UInt8}, UInt32, Ptr{UInt32}, Csize_t),
+          bc.builder_handle, "__jl_array_alias_rodata", TYPE_PTR,
+          UInt32[TYPE_PTR, TYPE_I64, TYPE_I64, TYPE_I32], 4)
+    # __jl_dict_from_rodata(slots,keys,vals:ptr, nslots:i64, keys_is_str,vals_is_str:i32,
+    #                       ndel,count,idxfloor,maxprobe:i64, type_id:i32) -> ptr
+    ccall(declare_ptr, Cint, (Ptr{Cvoid}, Ptr{UInt8}, UInt32, Ptr{UInt32}, Csize_t),
+          bc.builder_handle, "__jl_dict_from_rodata", TYPE_PTR,
+          UInt32[TYPE_PTR, TYPE_PTR, TYPE_PTR, TYPE_I64, TYPE_I32, TYPE_I32,
+                  TYPE_I64, TYPE_I64, TYPE_I64, TYPE_I64, TYPE_I32], 11)
     # __jl_gc_alloc_array(type_tag: u32, length: i32, elem_size: u32) -> *mut u8
     int32s = UInt32[TYPE_I32, TYPE_I32, TYPE_I32]
     ccall(declare_ptr, Cint, (Ptr{Cvoid}, Ptr{UInt8}, UInt32, Ptr{UInt32}, Csize_t),
@@ -3569,10 +3860,9 @@ function emit_memorynew(bc::BuilderCtx, args, ir)
 
     # Get Julia type pointer for the array type (Vector{T})
     array_T = Vector{elem_T}
-    type_ptr = pointer_from_objref(array_T)
 
     elem_size_id = emit_constant(bc, Int32(elem_size))
-    type_ptr_id = emit_constant(bc, Int64(reinterpret(UInt64, type_ptr)))
+    type_ptr_id = _emit_type_tag(bc, array_T)
 
     # Call __jl_gc_alloc_array_julia using the builder's runtime call mechanism
     # This creates Julia-compatible array layout that can be safely returned to Julia
@@ -3635,9 +3925,8 @@ function emit_core_tuple(bc::BuilderCtx, args, ir)
         total_size = cur
     end
 
-    type_ptr = pointer_from_objref(tuple_type)  # Use actual tuple type pointer
     size_id = emit_constant(bc, Int32(total_size))
-    type_ptr_id = emit_constant(bc, Int64(reinterpret(UInt64, type_ptr)))
+    type_ptr_id = _emit_type_tag(bc, tuple_type)
 
     # Call __jl_gc_alloc_julia for the memory (tuples are structs, not arrays)
     ptr_id = emit_call_runtime(bc, "__jl_gc_alloc_julia",
@@ -3776,8 +4065,7 @@ function emit_new(bc::BuilderCtx, T, field_args, ir, stmt_idx)
         else
             error("emit_new(array): memref not in ref_tracking")
         end
-        type_ptr = pointer_from_objref(T)
-        type_ptr_id = emit_constant(bc, Int64(reinterpret(UInt64, type_ptr)))
+        type_ptr_id = _emit_type_tag(bc, T)
         return emit_call_runtime(bc, "__jl_array_new_1d", UInt32[type_ptr_id, mem_ptr_id, nel_id])
     end
 
@@ -3835,12 +4123,12 @@ function emit_new(bc::BuilderCtx, T, field_args, ir, stmt_idx)
     field_ids = UInt32[resolve_operand(bc, fa, ir) for fa in field_args]
 
     # Get Julia type pointer for Julia-compatible allocation
-    type_ptr = pointer_from_objref(T)
     data_size = UInt32(sizeof(T))
 
     # Allocate using Julia-compatible runtime call
     # __jl_gc_alloc_julia(type_ptr: *mut u8, data_size: u32) -> *mut u8
-    type_ptr_id = emit_constant(bc, Int64(reinterpret(UInt64, type_ptr)))
+    # type_ptr resolved at runtime via __jl_type_tag (standalone type-tag registry)
+    type_ptr_id = _emit_type_tag(bc, T)
     size_id = emit_constant(bc, Int32(data_size))
 
     # Use the builder's runtime call mechanism
