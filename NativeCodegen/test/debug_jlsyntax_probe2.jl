@@ -2,7 +2,7 @@
 # Tests: varargs, loops, recursion, string/array construction, pointer ops, continue
 using NativeCodegen
 using NativeCodegen: NCGInterp, CompileError
-import JuliaSyntax
+import Base.JuliaSyntax as JuliaSyntax
 
 function dump_ir(f, argtypes, label)
     println("--- ", label, " ---")

@@ -1,5 +1,5 @@
 using NativeCodegen
-import JuliaSyntax
+import Base.JuliaSyntax as JuliaSyntax
 
 # Tree setup
 tree = JuliaSyntax.parsestmt(JuliaSyntax.GreenNode, "x = a + b * c + 1")

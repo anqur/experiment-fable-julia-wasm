@@ -1,8 +1,8 @@
 using NativeCodegen
 using NativeCodegen: NCGInterp, compile_native, CompileError
-import JuliaSyntax
-import JuliaSyntax.Tokenize: next_token
-import JuliaSyntax: ParseStream
+import Base.JuliaSyntax as JuliaSyntax
+import Base.JuliaSyntax.Tokenize: next_token
+import Base.JuliaSyntax: ParseStream
 
 const JLexer = JuliaSyntax.Tokenize.Lexer{IOBuffer}
 

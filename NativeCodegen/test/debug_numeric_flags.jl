@@ -1,6 +1,6 @@
 # Debug: numeric_flags ireduce validator error
 using NativeCodegen
-import JuliaSyntax
+import Base.JuliaSyntax as JuliaSyntax
 
 println("=== Debug numeric_flags ireduce issue ===\n")
 

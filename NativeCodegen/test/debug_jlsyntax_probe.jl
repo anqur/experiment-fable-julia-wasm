@@ -1,6 +1,6 @@
 using NativeCodegen
 using NativeCodegen: NCGInterp, compile_native, CompileError
-import JuliaSyntax
+import Base.JuliaSyntax as JuliaSyntax
 
 function dump_ir(f, argtypes, label)
     println("--- ", label, " ---")

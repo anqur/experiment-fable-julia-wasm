@@ -1,5 +1,5 @@
 using NativeCodegen
-import JuliaSyntax
+import Base.JuliaSyntax as JuliaSyntax
 
 # Patch icmp to add debug
 const orig_icmp = NativeCodegen.emit_icmp

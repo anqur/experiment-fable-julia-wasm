@@ -57,7 +57,7 @@ end
 
 # --- Verify _first_error isa works (but may fail on tuple indexing) ---
 println("\n--- _first_error (recursion + isa) ---")
-import JuliaSyntax
+import Base.JuliaSyntax as JuliaSyntax
 @testset "_first_error compilation" begin
     f(x) = JuliaSyntax._first_error(x)
     try

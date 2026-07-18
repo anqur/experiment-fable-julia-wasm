@@ -1,6 +1,6 @@
 # Test: continue statement and memory load in while loop
 using NativeCodegen
-import JuliaSyntax
+import Base.JuliaSyntax as JuliaSyntax
 
 println("=== Memory Load + Conditional in Loop Tests ===\n")
 

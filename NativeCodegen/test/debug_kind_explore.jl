@@ -3,7 +3,7 @@
 
 using NativeCodegen
 using Test
-import JuliaSyntax
+import Base.JuliaSyntax as JuliaSyntax
 using JuliaSyntax: Kind
 
 println("=== Kind Function Exploration ===\n")

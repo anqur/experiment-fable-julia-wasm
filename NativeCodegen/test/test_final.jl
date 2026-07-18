@@ -24,7 +24,7 @@
 using NativeCodegen
 using Test
 using Libdl
-import JuliaSyntax
+import Base.JuliaSyntax as JuliaSyntax
 
 println("=== test_final.jl: JuliaSyntax Native Codegen Beacon Tests ===\n")
 
