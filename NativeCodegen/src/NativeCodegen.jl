@@ -197,11 +197,10 @@ end
 _norm_nargs(argtypes) = (length(argtypes) == 1 && argtypes[1] === Tuple{}) ? 0 : length(argtypes)
 
 function native_callable(comp::NativeCompilation, rettype, argtypes::Type...)
-    ptr = comp.entry_ptr
-    # AT = declared arg-type tuple (Tuple{} for the 0-arg case, incl. the
-    # `(Tuple{},)` convention). One uniform closure dispatches via _gcall for any N.
-    AT = _norm_nargs(argtypes) == 0 ? Tuple{} : Tuple{argtypes...}
-    return ((args...) -> _gcall(ptr, rettype, AT, args...))
+    # NativeCompilation carries only so_path/func_name (no in-memory entry_ptr), so
+    # this opens the .so exactly like native_callable_from_so (registering type
+    # tags, then dispatching via _gcall). The lib stays open for the closure's life.
+    return native_callable_from_so(comp, rettype, argtypes...)
 end
 
 # Register the real Julia datatype pointer for every TypeID the compiler used, so

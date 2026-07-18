@@ -8,7 +8,6 @@ use std::sync::Mutex;
 
 mod builder;
 mod linker;
-mod runtime;
 
 use builder::{BuilderContext, FunctionCtx, map_icmp_cond, map_fcmp_cond, TYPE_I64};
 

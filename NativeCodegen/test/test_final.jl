@@ -984,17 +984,8 @@ const WEB_CORPUS = [
     end
 
     @testset "parse_into — native parse + native iterate (from examples/parser)" begin
-        # FULL native pipeline: ParseStream(src) → parse!(ps) → iterate ps.output.
-        # # TODO: Runtime still blocked. Progress this session (2026-07-14): the
-        # # parse_stmts/_bump_until_n stubs were removed (architecture violation),
-        # # and four codegen bugs were fixed (Union{Nothing,T} return type, entry-
-        # # block branch target, getfield Case 3b for >8-byte bitstypes, and
-        # # emit_core_tuple field offsets). parse! now COMPILES ~160 callees, and
-        # # at runtime parse_atom + the peek/bump drain loop + all leaf predicates
-        # # are correct. But the precedence-climbing chain still miscompiles:
-        # # parse_unary("1") returns 1 (should be 2) and parse_eq("1") runs away
-        # # allocating — a control-flow miscompilation not yet localized.
-        # # Uncomment the runtime block below once parse! runs end-to-end.
+        # Full native pipeline: ParseStream(src) → parse!(ps) → iterate ps.output.
+        # Works end-to-end (2026-07-18: standalone-.so fix + memoization + gcd phi).
         print("  parse_into … ")
         try
             import Base.JuliaSyntax as JS

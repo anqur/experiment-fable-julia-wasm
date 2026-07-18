@@ -24,20 +24,19 @@ using Test
     end
 end
 
-# Note: length() function support is TODO - it requires invoke support
-# @testset "String length operation" begin
-#     function string_length_test(s::String)
-#         return length(s)
-#     end
-#
-#     comp = compile_native(string_length_test, Tuple{String})
-#     nf = native_callable(comp, Int64, String)
-#
-#     @testset "basic strings" begin
-#         @test nf("hello") == 5
-#         @test nf("world") == 5
-#         @test nf("") == 0
-#     end
-# end
+@testset "String length operation" begin
+    function string_length_test(s::String)
+        return length(s)
+    end
+
+    comp = compile_native(string_length_test, Tuple{String})
+    nf = native_callable(comp, Int64, String)
+
+    @testset "basic strings" begin
+        @test nf("hello") == 5
+        @test nf("world") == 5
+        @test nf("") == 0
+    end
+end
 
 println("\n=== String operations tests completed ===")
