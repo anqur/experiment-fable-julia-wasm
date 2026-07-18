@@ -3512,25 +3512,31 @@ function emit_isa(bc::BuilderCtx, args, ir)
        haskey(bc.vararg_tuple_coll, args[1])
         # The sorter loop pushes ALL kwarg values (including defaults) into the
         # Vector, so length(vec) reflects the total kwarg count — not just the
-        # explicitly-set ones. The caller-side kwcall bypass (_emit_kwcall_core_call)
-        # handles the case where all kwargs are defaults; when that fails and we
-        # reach this targeted lowering, the Vector is always non-empty. Emit
-        # constant `true` so the function takes the "no explicit kwargs" fast path.
-        # TODO: fix the sorter to only push non-default kwarg values; then restore
-        # the length(vec)==0 check below.
-        return emit_constant(bc, Int32(1))
-        # Original check (disabled until sorter default-filtering is fixed):
-        # vec_id = bc.vararg_tuple_coll[args[1]]
-        # load_ptr = Libdl.dlsym(bc.lib_handle, :block_add_load)
-        # len_id = ccall(load_ptr, UInt32, (Ptr{Cvoid}, UInt32, Int32, UInt32),
-        #               bc.fctx_handle, vec_id, Int32(16), TYPE_I64)
-        # zero_id = emit_constant(bc, Int64(0))
-        # icmp_ptr = Libdl.dlsym(bc.lib_handle, :block_add_icmp)
-        # result = ccall(icmp_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32, UInt32),
-        #               bc.fctx_handle, ICMP_EQ, len_id, zero_id)
-        # ext_ptr = Libdl.dlsym(bc.lib_handle, :block_add_uextend)
-        # return ccall(ext_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
-        #             bc.fctx_handle, result, TYPE_I32)
+        # explicitly-set ones. The caller-side kwcall bypass paths
+        # (compile-time-constant kwarg NamedTuple in emit_invoke, and
+        # _emit_kwcall_core_call for runtime positionals with constant kwargs)
+        # handle all cases where the kwargs are compile-time-knowable; when those
+        # bypasses fail, the sorter runs with an always-non-empty Vector.
+        # `length(vec) == 0` correctly returns `false` (never an empty tuple), so
+        # the sorter always takes the full kwarg-expansion path — which appends
+        # ALL kwarg values (including defaults) as trailing args to the core
+        # method. This is correct; the "no explicit kwargs" fast path is still
+        # exercised by the caller-side bypass paths.
+        # TODO(perf): intercept the sorter's push! loop so only NON-DEFAULT kwarg
+        # values are pushed; then `length(vec)` reflects the count of EXCEPTIONALLY-
+        # set kwargs, and the fast path (no trailing kwarg args → less register
+        # pressure / simpler CFG) is reachable from the sorter body itself.
+        vec_id = bc.vararg_tuple_coll[args[1]]
+        load_ptr = Libdl.dlsym(bc.lib_handle, :block_add_load)
+        len_id = ccall(load_ptr, UInt32, (Ptr{Cvoid}, UInt32, Int32, UInt32),
+                      bc.fctx_handle, vec_id, Int32(16), TYPE_I64)
+        zero_id = emit_constant(bc, Int64(0))
+        icmp_ptr = Libdl.dlsym(bc.lib_handle, :block_add_icmp)
+        result = ccall(icmp_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32, UInt32),
+                      bc.fctx_handle, ICMP_EQ, len_id, zero_id)
+        ext_ptr = Libdl.dlsym(bc.lib_handle, :block_add_uextend)
+        return ccall(ext_ptr, UInt32, (Ptr{Cvoid}, UInt32, UInt32),
+                    bc.fctx_handle, result, TYPE_I32)
     end
 
     val_id = resolve_operand(bc, args[1], ir)
